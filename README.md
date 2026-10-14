@@ -33,17 +33,40 @@ work with API keys.
 ## Create a project
 
 ```bash
-boxen new myproj https://github.com/you/myproj.git   # or omit the URL
+boxen new <name> [git-url]
 ```
 
-This builds the project image, clones into `~/src/myproj`, signs you in
-(first project only), and runs two one-time prompts. Answer **y** to "trust
-this folder" and (first time ever) "enable Remote Control", then press
-**Ctrl+C** once the session URL/QR appears. The container then starts on its
-own and shows up in the Claude app as `myproj`.
+`<name>` is the project's name: its folder (`~/src/<name>`), its container
+(`boxen-<name>`), and the session name you'll see in the Claude app. Use
+lowercase letters, digits, `-` and `_`.
 
-Use HTTPS clone URLs: the `GH_TOKEN` in `boxen.env` authenticates git to
-github.com through the GitHub CLI.
+`[git-url]` is optional. It's the repo whose code you want in the project.
+Pick the case that matches what you have:
+
+| You have | Run | Result |
+|---|---|---|
+| A repo on GitHub | `boxen new myproj https://github.com/you/myproj.git` | Cloned into `~/src/myproj` |
+| Nothing yet (new project) | `boxen new myproj` | Empty `~/src/myproj`; `git init` and add a remote later |
+| Code already in `~/src/myproj` (e.g. copied from another machine) | `boxen new myproj` | Uses the folder as-is |
+
+boxen refuses to clone into a folder that already has files, so it never
+overwrites existing code.
+
+Use HTTPS URLs (`https://github.com/...`), not SSH (`git@github.com:...`).
+The clone runs inside the container and authenticates with the `GH_TOKEN` in
+`boxen.env` through the GitHub CLI, which is what makes private repos work.
+The containers have no SSH keys.
+
+What `boxen new` does, in order:
+
+1. Builds the project image.
+2. Clones the repo, if you gave a URL.
+3. Signs you in to Claude (first project only; every project shares the login).
+4. Runs two one-time prompts. Answer **y** to "trust this folder" and (first
+   time ever) "enable Remote Control", then press **Ctrl+C** once the session
+   URL/QR appears.
+5. Starts the container. The project shows up in the Claude app's Code tab
+   as `<name>`.
 
 ## Layout
 

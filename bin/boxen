@@ -27,8 +27,10 @@ Usage: boxen <command> [args]
 
 Setup
   setup                     First-time setup: env file, config volume, base image
-  new <name> [git-url]      Create a project (clone if url given), log in if
-                            needed, run the one-time prompts, start it
+  new <name> [git-url]      Create a project and start its container.
+                            git-url: optional HTTPS GitHub URL to clone into
+                            ~/src/<name>. Omit it for a new empty project, or
+                            when ~/src/<name> already holds your code.
 
 Day to day
   ls                        List projects and container status
@@ -141,7 +143,10 @@ EOF
 
 cmd_new() {
   local name=${1:-} url=${2:-}
-  [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]"
+  [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]  (git-url optional; HTTPS GitHub URL to clone)"
+  if [[ "$url" == git@* || "$url" == ssh://* ]]; then
+    die "use the HTTPS form of the URL (https://github.com/owner/repo.git); containers authenticate with GH_TOKEN, not SSH keys"
+  fi
   valid_name "$name"
   [[ -f "$ENV_FILE" ]] || die "run 'boxen setup' first"
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die "base image missing; run 'boxen setup'"
