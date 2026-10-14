@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# boxen: manage per-project Claude Code containers on this VM.
+#
+# Layout:
+#   <clone>/                          this repo: script, base image, templates
+#   ~/.config/boxen/boxen.env         shared secrets/env for all containers (BOXEN_HOME)
+#   ~/.config/boxen/projects/<name>/  compose.yaml + Dockerfile for one project
+#   ~/src/<name>/                     the project's repo (BOXEN_SRC)
+#   docker volume claude-config       shared ~/.claude for every container
+set -euo pipefail
+
+# The repo is wherever this script really lives (it's usually symlinked into ~/.local/bin).
+BOXEN_REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BOXEN_HOME="${BOXEN_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/boxen}"
+SRC_ROOT="${BOXEN_SRC:-$HOME/src}"
+PROJECTS_DIR="$BOXEN_HOME/projects"
+ENV_FILE="$BOXEN_HOME/boxen.env"
+BASE_IMAGE="boxen-base:latest"
+CONFIG_VOLUME="claude-config"
+
+die()  { printf 'boxen: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+Usage: boxen <command> [args]
+
+Setup
+  setup                     First-time setup: env file, config volume, base image
+  new <name> [git-url]      Create a project (clone if url given), log in if
+                            needed, run the one-time prompts, start it
+
+Day to day
+  ls                        List projects and container status
+  up|down|restart <name>    Start / stop / restart a project's container
+  logs <name> [-f]          Show the Remote Control server's output
+  shell <name>              Bash shell inside the container
+  claude <name> [args]      Interactive Claude session in the container's terminal
+  trust <name>              Re-run the one-time trust / Remote Control prompts
+
+Maintenance
+  rebuild <name>            Rebuild one project image and recreate its container
+  update                    Rebuild base (fresh Ubuntu + Claude Code), then all projects
+  rm <name>                 Remove a project's container, image and config
+                            (leaves ~/src/<name> alone)
+  self-update               git pull this boxen repo (then run 'update' to apply)
+EOF
+}
+
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9_-]*$ ]] \
+    || die "invalid project name '$1' (lowercase letters, digits, '-' and '_')"
+}
+
+proj_dir() { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
+
+require_project() {
+  [[ -n "${1:-}" ]] || die "missing project name (see 'boxen help')"
+  valid_name "$1"
+  [[ -f "$(proj_dir "$1")/compose.yaml" ]] || die "no such project: $1"
+}
+
+# docker compose scoped to one project's directory.
+dc() {
+  local name=$1; shift
+  local dir; dir=$(proj_dir "$name")
+  docker compose --project-directory "$dir" -f "$dir/compose.yaml" "$@"
+}
+
+# ---------------------------------------------------------------- setup
+
+build_base() {
+  local extra=()
+  [[ "${1:-}" == "--fresh" ]] && extra=(--pull --no-cache)
+  info "building $BASE_IMAGE"
+  docker build "${extra[@]}" -t "$BASE_IMAGE" \
+    --build-arg USERNAME="$(id -un)" \
+    --build-arg USER_UID="$(id -u)" \
+    --build-arg USER_GID="$(id -g)" \
+    "$BOXEN_REPO/base"
+}
+
+cmd_setup() {
+  command -v docker >/dev/null || die "docker not found"
+  docker compose version >/dev/null 2>&1 || die "docker compose plugin not found"
+  docker info >/dev/null 2>&1 || die "can't talk to the docker daemon (is your user in the docker group?)"
+
+  mkdir -p "$PROJECTS_DIR" "$SRC_ROOT"
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    cp "$BOXEN_REPO/templates/boxen.env" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    info "created $ENV_FILE (add your GitHub token and git identity)"
+  fi
+
+  build_base
+
+  if ! docker volume inspect "$CONFIG_VOLUME" >/dev/null 2>&1; then
+    docker volume create "$CONFIG_VOLUME" >/dev/null
+    info "created volume $CONFIG_VOLUME"
+  fi
+  # Make sure the shared config volume belongs to you, not root.
+  docker run --rm --user root -v "$CONFIG_VOLUME:/v" "$BASE_IMAGE" \
+    chown "$(id -u):$(id -g)" /v
+
+  info "setup done. Next: edit $ENV_FILE, then 'boxen new <name> [git-url]'"
+}
+
+# ------------------------------------------------------------ new project
+
+render() {
+  # $1 template, $2 name, $3 user, $4 container home, $5 source dir
+  sed -e "s|__NAME__|$2|g" -e "s|__USER__|$3|g" \
+      -e "s|__CHOME__|$4|g" -e "s|__SRC__|$5|g" "$1"
+}
+
+ensure_login() {
+  if dc "$1" run --rm --no-deps -T claude claude auth status >/dev/null 2>&1; then
+    return
+  fi
+  info "Claude isn't signed in yet. This happens once; every project shares it."
+  echo "    Open the URL it prints on any device, sign in, and paste the code back here."
+  dc "$1" run --rm --no-deps claude claude auth login
+}
+
+first_run() {
+  local name=$1
+  cat <<EOF
+
+==> One-time prompts for '$name'
+    Claude will ask you to trust this folder and, the very first time ever,
+    to enable Remote Control. Answer y to each.
+    When it shows the session URL / QR code, press Ctrl+C to continue.
+
+EOF
+  read -rp "Press Enter to start... " _
+  trap ':' INT
+  dc "$name" run --rm --no-deps claude claude remote-control --name "$name" || true
+  trap - INT
+}
+
+cmd_new() {
+  local name=${1:-} url=${2:-}
+  [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]"
+  valid_name "$name"
+  [[ -f "$ENV_FILE" ]] || die "run 'boxen setup' first"
+  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die "base image missing; run 'boxen setup'"
+
+  local pdir src user chome
+  pdir=$(proj_dir "$name")
+  src="$SRC_ROOT/$name"
+  user=$(id -un)
+  chome="/home/$user"
+
+  [[ -e "$pdir" ]] && die "project '$name' already exists ($pdir)"
+  if [[ -n "$url" && -d "$src" && -n "$(ls -A "$src")" ]]; then
+    die "$src already has files; can't clone into it (omit the url to use it as-is)"
+  fi
+
+  # Create the repo dir yourself so Docker doesn't create it root-owned.
+  mkdir -p "$src" "$pdir"
+  render "$BOXEN_REPO/templates/compose.yaml" "$name" "$user" "$chome" "$src" > "$pdir/compose.yaml"
+  render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$user" "$chome" "$src" > "$pdir/Dockerfile"
+
+  info "building image for $name"
+  dc "$name" build
+
+  if [[ -n "$url" ]]; then
+    info "cloning $url"
+    dc "$name" run --rm --no-deps claude git clone "$url" .
+  fi
+
+  ensure_login "$name"
+  first_run "$name"
+
+  info "starting $name"
+  dc "$name" up -d
+  info "done. '$name' is in the Claude app under Code. 'boxen logs $name' shows the server."
+}
+
+# -------------------------------------------------------------- day to day
+
+cmd_ls() {
+  shopt -s nullglob
+  printf '%-24s %s\n' PROJECT STATUS
+  local d n st
+  for d in "$PROJECTS_DIR"/*/; do
+    n=$(basename "$d")
+    st=$(docker inspect -f '{{.State.Status}}  (restarts: {{.RestartCount}}, up since {{.State.StartedAt}})' \
+           "boxen-$n" 2>/dev/null || echo "not created")
+    printf '%-24s %s\n' "$n" "$st"
+  done
+}
+
+cmd_up()      { require_project "${1:-}"; dc "$1" up -d; }
+cmd_down()    { require_project "${1:-}"; dc "$1" down; }
+cmd_restart() { require_project "${1:-}"; dc "$1" restart; }
+
+cmd_logs() {
+  require_project "${1:-}"
+  local n=$1; shift
+  dc "$n" logs --tail=100 "$@" claude
+}
+
+cmd_shell() {
+  require_project "${1:-}"
+  docker exec -it "boxen-$1" bash
+}
+
+cmd_claude() {
+  require_project "${1:-}"
+  local n=$1; shift
+  docker exec -it "boxen-$n" claude "$@"
+}
+
+cmd_trust() {
+  require_project "${1:-}"
+  dc "$1" down
+  first_run "$1"
+  dc "$1" up -d
+}
+
+# ------------------------------------------------------------- maintenance
+
+rebuild_one() {
+  info "rebuilding $1"
+  dc "$1" build
+  dc "$1" up -d --force-recreate
+}
+
+cmd_rebuild() {
+  require_project "${1:-}"
+  echo "Recreating the container restarts its Remote Control server;"
+  echo "sessions reconnect on their own, but a turn in progress is interrupted."
+  rebuild_one "$1"
+}
+
+cmd_update() {
+  build_base --fresh
+  shopt -s nullglob
+  local d
+  for d in "$PROJECTS_DIR"/*/; do
+    rebuild_one "$(basename "$d")"
+  done
+  info "removing dangling images"
+  docker image prune -f >/dev/null
+  info "update done"
+}
+
+cmd_rm() {
+  require_project "${1:-}"
+  local name=$1 ans
+  read -rp "Remove container, image and config for '$name'? Source in $SRC_ROOT/$name is kept. [y/N] " ans
+  [[ "$ans" == [yY] ]] || { echo "aborted"; return; }
+  dc "$name" down --rmi all
+  rm -rf "$(proj_dir "$name")"
+  info "removed '$name'. Delete $SRC_ROOT/$name yourself if you no longer want it."
+}
+
+# ------------------------------------------------------------------- main
+
+cmd=${1:-help}
+shift || true
+case "$cmd" in
+  setup)    cmd_setup "$@" ;;
+  new)      cmd_new "$@" ;;
+  ls|list)  cmd_ls ;;
+  up)       cmd_up "$@" ;;
+  down)     cmd_down "$@" ;;
+  restart)  cmd_restart "$@" ;;
+  logs)     cmd_logs "$@" ;;
+  shell)    cmd_shell "$@" ;;
+  claude)   cmd_claude "$@" ;;
+  trust)    cmd_trust "$@" ;;
+  rebuild)  cmd_rebuild "$@" ;;
+  update)   cmd_update ;;
+  rm)       cmd_rm "$@" ;;
+  self-update) git -C "$BOXEN_REPO" pull --ff-only ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
