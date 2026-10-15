@@ -173,6 +173,10 @@ cmd_setup() {
   if [[ ! -f "$ENV_FILE" ]]; then
     cp "$BOXEN_REPO/templates/boxen.env" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
+    # Containers use the VM's timezone.
+    local tz
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
+    if [[ -n "$tz" ]]; then set_env TZ "$tz"; fi
     info "created $ENV_FILE"
   fi
 
