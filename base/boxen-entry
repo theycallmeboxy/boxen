@@ -1,0 +1,18 @@
+#!/bin/sh
+# Entrypoint for boxen containers. When a terminal is attached (as on a
+# project's first start, when Claude may need to ask you to trust the folder),
+# wait briefly for it to report its size. Docker sets the size a moment after
+# the process starts, and Claude's trust dialog can't be shown without one
+# ("This terminal did not report its size").
+if [ -t 0 ]; then
+  i=0
+  while [ "$i" -lt 20 ]; do
+    case $(stty size 2>/dev/null) in
+      ""|"0 0") ;;
+      *) break ;;
+    esac
+    sleep 0.1
+    i=$((i + 1))
+  done
+fi
+exec "$@"

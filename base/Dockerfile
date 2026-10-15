@@ -61,8 +61,9 @@ COPY git-credential-boxen gh /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/git-credential-boxen /usr/local/bin/gh
 
 # `boxen resume`: continue an earlier session in the Claude app.
-COPY boxen-sessions /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/boxen-sessions
+# boxen-entry: waits for an attached terminal's size before Claude starts.
+COPY boxen-sessions boxen-entry /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/boxen-sessions /usr/local/bin/boxen-entry
 
 USER $USERNAME
 WORKDIR /home/$USERNAME
@@ -80,4 +81,5 @@ RUN git config --global init.defaultBranch main \
  && git config --global url.https://github.com/.insteadOf git@github.com: \
  && git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
 
+ENTRYPOINT ["/usr/local/bin/boxen-entry"]
 CMD ["bash"]

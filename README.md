@@ -391,7 +391,10 @@ The VM is the hard boundary. Inside it:
 - **A project doesn't show in the app:** `boxen ls`. A climbing restart count
   means the server keeps exiting; `boxen logs <name>` says why.
 - **Sign-in expired or wrong account:** `boxen login`.
-- **"Workspace not trusted" in the logs:** `boxen trust <name>`.
+- **"Workspace not trusted" in the logs:** `boxen trust <name>` and answer
+  the prompt. (Before the fix for "This terminal did not report its size",
+  that could fail for repos whose trust prompt lists warnings; run
+  `boxen self-update && boxen rebuild all` first.)
 - **Env change didn't take effect:** `boxen restart <name>` (a plain Docker
   restart doesn't re-read env files).
 - **Clone, push or `gh` fails with an auth error:** `boxen tokens <name>`
