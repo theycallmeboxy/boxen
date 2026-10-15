@@ -590,6 +590,19 @@ EOF
 
 # ------------------------------------------------------------ new project
 
+# Strip terminal control sequences (colors, cursor moves, screen clears,
+# window titles) and stray control characters, leaving readable text.
+plain_text() {
+  sed -u -E \
+      -e 's#\x1b\[[0-9;?<>=]*[ -/]*[@-~]##g' \
+      -e 's/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g' \
+      -e 's/\x1b[()*+][0-9A-Za-z]//g' \
+      -e 's/\x1b[=>78DEHMNOZc]//g' \
+      -e 's/\r/\n/g' \
+    | tr -d '\000-\010\013\014\016-\037\177' \
+    | sed -u -E '/^[[:space:]]*$/d'
+}
+
 # Escape a value for use as a sed replacement (we use | as the delimiter).
 sed_esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 
@@ -652,7 +665,7 @@ check_running() {
   st=$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "boxen-$n" 2>/dev/null) || st="missing"
   if [[ "$st" != "true 0" ]]; then
     warn "$n isn't staying up (running/restarts: $st). Last log lines:"
-    dc "$n" logs --tail=30 claude >&2 || true
+    dc "$n" logs --no-log-prefix --tail=30 claude 2>&1 | plain_text >&2 || true
     warn "fix the cause, then 'boxen up $n'. If it's a sign-in problem: 'boxen login'."
     return 1
   fi
@@ -761,7 +774,9 @@ cmd_restart() { require_project "${1:-}"; refresh_project "$1" || true; dc "$1" 
 cmd_logs() {
   require_project "${1:-}"
   local n=$1; shift
-  dc "$n" logs --tail=100 "$@" claude
+  # The server writes to a terminal, so its log is full of screen-control
+  # codes (cursor moves, clears) that would scramble yours; print the text.
+  dc "$n" logs --no-log-prefix --tail=100 "$@" claude 2>&1 | plain_text
 }
 
 cmd_shell() {
