@@ -63,9 +63,9 @@ Day to day ("all" in place of <name> means every project)
   logs <name> [-f]          Show the Remote Control server's output
   shell <name>              Bash shell inside the container
   claude <name> [args]      Interactive Claude session in the container's terminal
-  resume <name> [session]   Pick an earlier session (imported, older than the
-                            server keeps, or started in a terminal) and
-                            continue it; /remote-control puts it in the app
+  resume <name> [N]         Pick an earlier session from a numbered list and
+                            continue it in the Claude app (--stop N closes one
+                            boxen keeps; --attach N shows it here)
   trust <name>              Re-run the one-time trust / Remote Control prompts
 
 Maintenance
@@ -742,10 +742,14 @@ cmd_new() {
 
 cmd_ls() {
   printf '%-24s %s\n' PROJECT STATUS
-  local n st
+  local n st k
   while read -r n; do
     st=$(docker inspect -f '{{.State.Status}}  (restarts: {{.RestartCount}}, started {{.State.StartedAt}})' \
            "boxen-$n" 2>/dev/null) || st="not created"
+    if [[ $st == running* ]]; then
+      k=$(docker exec "boxen-$n" boxen-sessions count 2>/dev/null || true)
+      [[ -n $k && $k != 0 ]] && st+=", $k session(s) kept by boxen"
+    fi
     printf '%-24s %s\n' "$n" "$st"
   done < <(projects)
 }
@@ -771,27 +775,16 @@ cmd_claude() {
   docker exec -it "boxen-$n" claude "$@"
 }
 
-# resume NAME [session]: Claude's session picker (or one session, by ID or
-# name) in a tmux session inside the container, so it outlives your SSH
-# login. Typing /remote-control in it puts it in the Claude app with its
-# history. Re-running re-attaches if it's still open.
+# resume NAME [N|ID] [--attach] [--force] [--stop]: earlier sessions, in a
+# numbered list; picking one puts it in the Claude app with its history. The
+# work happens inside the container (boxen-sessions).
 cmd_resume() {
   require_project "${1:-}"
-  local n=$1 cmd="claude --resume"
+  local n=$1
   shift
-  if (( $# )); then cmd+=" $(printf '%q ' "$@")"; fi
   [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]] \
     || die "$n isn't running; start it with 'boxen up $n'"
-  cat <<EOF
-
-==> Resuming a session in '$n'. Pick one from the list, then type
-    /remote-control in it so it shows up in the Claude app.
-    It runs in tmux: press Ctrl+B then D to leave it running, and
-    'boxen resume $n' to come back. It ends if the container restarts
-    (the transcript stays, so you can resume it again).
-
-EOF
-  docker exec -it "boxen-$n" tmux new-session -A -s resume "$cmd"
+  docker exec -it "boxen-$n" boxen-sessions resume "$@"
 }
 
 cmd_trust() {

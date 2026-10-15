@@ -213,8 +213,8 @@ Good to know:
   under the plan's names, so a later `boxen new <same name> <url>` picks them up.
 - **Sessions:** Claude Code keeps transcripts for 30 days by default (longer
   for sessions started in the Desktop app), so older ones aren't there to
-  move. Continue an imported one with `boxen resume <name>` (see "Resuming
-  sessions"). Their history still mentions Mac paths, and rewind checkpoints
+  move. Continue an imported one with `boxen resume <name>` (see "Sessions
+  across restarts"). Their history still mentions Mac paths, and rewind checkpoints
   don't carry over. Stop working in a session on the Mac before exporting
   it; the export is a snapshot.
 - **MCP servers** are listed (full settings in `~/.config/boxen/mac-mcp.json`)
@@ -224,25 +224,57 @@ Good to know:
   you reinstall with `/plugin`.
 - Requires `rsync` on the Mac (built in) and SSH from the Mac to the VM.
 
-## Resuming sessions
+## Sessions across restarts
 
-Sessions you start from the Claude app run in the project's Remote Control
-server. If the server restarts (a `restart`, `rebuild`, `update` or VM
-reboot), it brings its sessions back on its own, as long as it's back within
-about 4 hours.
+You shouldn't have to think about restarts: sessions you were using stay in
+the Claude app.
 
-For any other session, use `boxen resume <name>`:
+- **Short restarts** (`restart`, `rebuild`, `update`, a VM reboot): the
+  project's Remote Control server brings its own sessions back if it's back
+  within about 4 hours of stopping.
+- **Longer downtime** (VM off overnight, a project stopped for the weekend):
+  the server starts fresh, so boxen brings back the sessions you'd used in
+  the 24 hours before it stopped, each continued with its full history.
+  `boxen logs <name>` says what it brought back.
+- Sessions boxen brought back (or that you resumed yourself, below) aren't
+  the server's, so boxen starts them again after every restart. It stops
+  keeping a session once you close it or it's been idle for 24 hours.
+  `boxen ls` shows how many each project has.
 
-- one imported from a Mac,
-- one older than the server brings back by itself,
-- one you started in a terminal with `boxen claude <name>`.
+### Picking up an older session
 
-It opens Claude's session picker in a tmux session inside the container (or
-pass a session ID or name to skip the picker). Pick one, then type
-`/remote-control` in it: it shows up in the Claude app with its history, and
-you can carry on from your phone. Press Ctrl+B then D to leave it running;
-`boxen resume <name>` re-attaches. It ends if the container restarts, but the
-transcript stays, so you can resume it again.
+```bash
+boxen resume myproj
+```
+
+```
+Sessions in myproj, newest first:
+
+   1) 25m ago  "add retry to the webhook handler"   may be open in the app already
+   2) 3h ago   "fix the login redirect bug"         in the app (boxen keeps it running)
+   3) 6d ago   "add CSV export"
+Number to continue in the Claude app (Enter to cancel): 3
+```
+
+Pick one and it's in the Claude app with its history; there's nothing to
+attach to. Use it for sessions imported from a Mac, ones older than boxen
+brings back by itself, or ones you started in a terminal with
+`boxen claude <name>`. The list shows the first thing you typed in each.
+
+- `boxen resume myproj 3` skips the list.
+- A session marked "may be open in the app already" was used since the server
+  started, so continue it in the app. boxen won't open it a second time
+  (two copies would mix their messages) unless you add `--force`.
+- `boxen resume myproj 3 --stop` closes a session boxen keeps.
+- `boxen resume myproj 3 --attach` shows it in your terminal (Ctrl+B then D
+  to leave it running). Useful if one seems stuck in the app, for example on
+  a question Claude asks in the terminal when resuming a long session.
+
+Saved sessions are kept for 30 days (Claude Code's default), so that's how
+far back you can go. Between about 4 and 4.5 hours of downtime neither the
+server nor boxen brings sessions back automatically (boxen waits that long
+to be sure it won't open a session the server is also reopening); use
+`boxen resume` for those.
 
 ## Commands
 
@@ -259,7 +291,7 @@ doesn't, and no project can be named `all`.)
 | `boxen logs <name> [-f]` | Remote Control server output |
 | `boxen shell <name>` | Bash inside the container |
 | `boxen claude <name>` | Terminal Claude session inside the container |
-| `boxen resume <name> [session]` | Continue an earlier session (picker, or by ID/name) in tmux; `/remote-control` puts it in the app |
+| `boxen resume <name> [N]` | Pick an earlier session from a list and continue it in the Claude app (`--stop`, `--attach`) |
 | `boxen up <name\|all>` | Start, or apply changes to `boxen.env` / `project.env` / `compose.yaml` |
 | `boxen down <name\|all>` | Stop |
 | `boxen restart <name\|all>` | Recreate the container (also picks up env changes) |
@@ -307,8 +339,8 @@ toolchains in the Dockerfiles. Anything installed by hand inside a container
 is gone after a rebuild.
 
 `restart: unless-stopped` brings containers back after VM reboots and after
-the Remote Control server exits during a long network outage. Sessions
-reconnect if the server restarts in the same folder within about 4 hours.
+the Remote Control server exits during a long network outage. Your sessions
+come back too (see "Sessions across restarts").
 
 There are two kinds of update:
 
