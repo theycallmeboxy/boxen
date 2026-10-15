@@ -60,8 +60,7 @@ RUN test -n "$USERNAME" || (echo "USERNAME build arg is required" >&2; exit 1) \
 COPY git-credential-boxen gh /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/git-credential-boxen /usr/local/bin/gh
 
-# Runs the Remote Control server and keeps your sessions in the Claude app
-# across restarts (see the script for how).
+# `boxen resume`: continue an earlier session in the Claude app.
 COPY boxen-sessions /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/boxen-sessions
 

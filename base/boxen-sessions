@@ -1,51 +1,30 @@
 #!/bin/bash
-# boxen-sessions: runs inside a boxen container and keeps your Claude
-# sessions available in the Claude app across restarts.
+# boxen-sessions: runs inside a boxen container (via `boxen resume`).
 #
-#   boxen-sessions serve [server flags]   the container's main command
 #   boxen-sessions resume [N|ID] [--attach] [--force] [--stop]
 #   boxen-sessions count
 #
-# Background: the project's Remote Control server brings its own sessions
-# back if it restarts within about 4 hours of stopping. Past that it starts
-# fresh. So when the server comes back after longer than that, this script
-# brings back the sessions you used in the hours before it stopped, each in
-# its own tmux session with Remote Control on. Sessions kept this way (and
-# ones you resume by hand) aren't the server's, so they're started again
-# after every restart, until they're closed or go idle.
-#
-# Everything here is best effort: failures are logged and never stop the
-# server from starting.
+# Lists this project's earlier Claude sessions and continues the one you pick
+# in a tmux session with Remote Control on, so it shows up in the Claude app
+# with its history. It runs until you stop it or the container restarts (the
+# transcript stays, so you can resume it again).
 
 set -u
 
 CFG=${CLAUDE_CONFIG_DIR:?CLAUDE_CONFIG_DIR not set}
-NAME=${BOXEN_PROJECT:?BOXEN_PROJECT not set}
-STATE="$CFG/boxen/$NAME"
-RUNDIR=/tmp/boxen-sessions            # this container's lifetime only
-# The server reliably brings its sessions back within ~4h; past 4.5h, we do.
-# (In between, neither does automatically; `boxen resume` covers it.)
-WINDOW=${BOXEN_RC_WINDOW_SECS:-16200}
-RECENT_HOURS=${BOXEN_REVIVE_HOURS:-24}
-IDLE_HOURS=${BOXEN_KEEP_IDLE_HOURS:-24}
-MAX=${BOXEN_REVIVE_MAX:-8}
-
+NAME=${BOXEN_PROJECT:-$(hostname)}
 KEYDIR="$CFG/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
-mkdir -p "$STATE" "$RUNDIR"
-touch "$STATE/kept" "$RUNDIR/started"
-
-log()   { printf '[boxen] %s\n' "$*"; }
 now()   { date +%s; }
-get()   { cat "$STATE/$1" 2>/dev/null || true; }
-put()   { printf '%s\n' "$2" > "$STATE/$1.tmp" && mv -f "$STATE/$1.tmp" "$STATE/$1"; }
 tfile() { printf '%s/%s.jsonl' "$KEYDIR" "$1"; }
 mtime() { stat -c %Y "$(tfile "$1")" 2>/dev/null || echo 0; }
 tname() { printf 's-%s' "${1:0:8}"; }
 alive() { tmux has-session -t "$(tname "$1")" 2>/dev/null \
             && [[ "$(tmux display -p -t "$(tname "$1")" '#{pane_dead}' 2>/dev/null)" != 1 ]]; }
-kept()  { grep -qxF "$1" "$STATE/kept"; }
+
+# When this container (and so its Remote Control server) started.
+started() { echo $(( $(now) - $(ps -o etimes= -p 1 | tr -d ' ') )); }
 
 ago() {
   local s=$(( $(now) - $1 ))
@@ -74,128 +53,46 @@ preview() {
     | grep -v '^[[:space:]]*$' | grep -v '^<' | head -1 | tr '\t\n' '  ' | cut -c1-60 | sed 's/[[:space:]]*$//'
 }
 
-remember() { kept "$1" || printf '%s\n' "$1" >> "$STATE/kept"; }
-forget()   { grep -vxF "$1" "$STATE/kept" > "$STATE/kept.tmp" || true; mv -f "$STATE/kept.tmp" "$STATE/kept"; }
-
-# start_in_tmux ID CMD: start CMD in the session's tmux window and report
-# whether it's still running a few seconds later.
+# start_in_tmux ID CMD: start CMD in the session's tmux window; true if it's
+# still running a few seconds later.
 start_in_tmux() {
-  local id=$1 cmd=$2 t
-  t=$(tname "$id")
+  local t
+  t=$(tname "$1")
   tmux kill-session -t "$t" 2>/dev/null || true
-  tmux new-session -d -s "$t" -x 200 -y 50 "$cmd" || return 1
+  tmux new-session -d -s "$t" -x 200 -y 50 "$2" || return 1
   tmux set-option -t "$t" remain-on-exit on >/dev/null 2>&1 || true
   sleep "${BOXEN_START_WAIT:-8}"
-  alive "$id"
+  alive "$1"
 }
 
-# keep ID: continue a session in tmux with Remote Control on, so it's in the
-# Claude app, and remember it so it comes back after restarts.
-keep() {
+# Continue a session in tmux with Remote Control on.
+host() {
   local id=$1 t
   t=$(tname "$id")
-  remember "$id"
   alive "$id" && return 0
-  if start_in_tmux "$id" "claude --resume $id --remote-control"; then
-    printf '%s\n' "$id" >> "$RUNDIR/started"
-    return 0
-  fi
+  start_in_tmux "$id" "claude --resume $id --remote-control" && return 0
   # Fallback: resume, then turn Remote Control on from inside the session.
   if start_in_tmux "$id" "claude --resume $id"; then
     tmux send-keys -t "$t" "/remote-control" Enter
     sleep 2
-    if alive "$id"; then printf '%s\n' "$id" >> "$RUNDIR/started"; return 0; fi
+    alive "$id" && return 0
   fi
-  log "couldn't continue session $id; last output:"
-  tmux capture-pane -p -t "$t" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | sed 's/^/    /'
+  echo "Couldn't continue that session. Its last output:" >&2
+  tmux capture-pane -p -t "$t" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | sed 's/^/    /' >&2
   tmux kill-session -t "$t" 2>/dev/null || true
   return 1
 }
 
-unkeep() {
-  tmux kill-session -t "$(tname "$1")" 2>/dev/null || true
-  forget "$1"
-}
-
-# Every 10 minutes: drop kept sessions that ended (closed, /exit) or have
-# been idle for IDLE_HOURS, so nothing lingers.
-prune() {
-  local id cutoff
-  cutoff=$(( $(now) - IDLE_HOURS * 3600 ))
-  while IFS= read -r id; do
-    [[ -n $id ]] || continue
-    if [[ ! -f "$(tfile "$id")" ]]; then
-      unkeep "$id"; log "stopped keeping $id (its transcript is gone)"
-    elif grep -qxF "$id" "$RUNDIR/started" && ! alive "$id"; then
-      unkeep "$id"; log "session $id ended; stopped keeping it"
-    elif (( $(mtime "$id") < cutoff )); then
-      unkeep "$id"; log "session $id idle for ${IDLE_HOURS}h; closed it"
-    fi
-  done < <(cat "$STATE/kept")
-}
-
-# Runs in the background next to the server.
-background() {
-  local server=$1 last=$2 epoch=$3 revive_from=$4 id n=0 i=0
-  sleep "${BOXEN_BG_DELAY:-15}"    # let the server start first
-  # Sessions boxen keeps aren't the server's: start them again.
-  while IFS= read -r id; do
-    [[ -n $id ]] && keep "$id" && n=$((n + 1))
-  done < <(cat "$STATE/kept")
-  (( n )) && log "continued $n session(s) boxen keeps"
-
-  # After long downtime, bring back what you were using.
-  if (( revive_from > 0 )); then
-    n=0
-    for id in $(sessions); do
-      (( $(mtime "$id") >= revive_from )) || break
-      kept "$id" && continue
-      [[ -n "$(preview "$id")" ]] || continue     # empty, never-used session
-      (( n >= MAX )) && break
-      keep "$id" && n=$((n + 1))
-    done
-    log "the server was down $(( ($(now) - last) / 3600 ))h, too long for it to bring its sessions back; brought back $n session(s) you'd used"
-  fi
-
-  # Heartbeat (only once the server has been up a minute, so a server that
-  # keeps crashing doesn't count as running) and cleanup.
-  sleep "${BOXEN_HB_DELAY:-45}"
-  while kill -0 "$server" 2>/dev/null; do
-    put heartbeat "$(now)"
-    (( i % 10 == 0 )) && prune
-    i=$((i + 1))
-    sleep 60
-  done
-}
-
-cmd_serve() {
-  local t last epoch revive_from=0
-  t=$(now)
-  last=$(get heartbeat); last=${last:-0}
-  epoch=$(get epoch); epoch=${epoch:-0}
-  # A "serving period" is a run of server restarts each within the window,
-  # during which the server keeps its own sessions. A longer gap ends it.
-  if (( last == 0 )); then
-    put epoch "$t"
-  elif (( t - last > WINDOW && epoch <= last )); then
-    revive_from=$(( last - RECENT_HOURS * 3600 ))
-    (( epoch > revive_from )) && revive_from=$epoch
-    put epoch "$t"
-  fi
-  background $$ "$last" "$epoch" "$revive_from" &
-  exec claude remote-control --name "$NAME" "$@"
-}
-
-# The list `boxen resume` shows: number, id, state, last active, preview.
+# number, id, state, last active, preview
 list_rows() {
-  local id st epoch m p i=0
-  epoch=$(get epoch); epoch=${epoch:-0}
+  local id st since m p i=0
+  since=$(started)
   for id in $(sessions); do
     p=$(preview "$id")
-    [[ -n $p ]] || continue
+    [[ -n $p ]] || continue            # empty, never-used session
     m=$(mtime "$id")
-    if kept "$id" && alive "$id"; then st=kept
-    elif (( m >= epoch )) && ! kept "$id"; then st=live
+    if alive "$id"; then st=open
+    elif (( m >= since )); then st=live
     else st=-; fi
     i=$((i + 1))
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$id" "$st" "$m" "$p"
@@ -221,7 +118,7 @@ cmd_resume() {
     echo
     while IFS=$'\t' read -r n id st m p; do
       case $st in
-        kept) st="in the app (boxen keeps it running)" ;;
+        open) st="in the app (resumed with boxen)" ;;
         live) st="may be open in the app already" ;;
         *)    st="" ;;
       esac
@@ -235,41 +132,41 @@ cmd_resume() {
   if [[ $pick =~ ^[0-9]+$ ]]; then
     id=$(awk -F'\t' -v n="$pick" '$1 == n { print $2 }' <<< "$rows")
   else
-    id=$(awk -F'\t' -v s="$pick" '$2 == s || index($2, s) == 1 { print $2; exit }' <<< "$rows")
+    id=$(awk -F'\t' -v s="$pick" 'index($2, s) == 1 { print $2; exit }' <<< "$rows")
   fi
   [[ -n $id ]] || { echo "No session '$pick' in the list." >&2; return 1; }
   st=$(awk -F'\t' -v s="$id" '$2 == s { print $3 }' <<< "$rows")
   p=$(awk -F'\t' -v s="$id" '$2 == s { print $5 }' <<< "$rows")
 
   if (( stop )); then
-    unkeep "$id"
-    echo "Closed \"$p\" and stopped keeping it."
+    tmux kill-session -t "$(tname "$id")" 2>/dev/null || true
+    echo "Closed \"$p\"."
     return 0
   fi
   if [[ $st == live ]] && (( ! force )); then
     cat >&2 <<EOF
-"$p" was used since the server started, so it's probably still open in the
-Claude app; continue it there. (Opening it twice would mix the two copies'
-messages.) If it isn't in the app, run this again with --force.
+"$p"
+was used since $NAME started, so it's probably still open in the Claude app;
+continue it there. (Opening it twice would mix the two copies' messages.)
+If it isn't in the app, run this again with --force.
 EOF
     return 1
   fi
-  if [[ $st != kept ]]; then
+  if [[ $st != open ]]; then
     echo "Continuing \"$p\"..."
-    keep "$id" || return 1
+    host "$id" || return 1
   fi
   if (( attach )); then
     tmux attach -t "$(tname "$id")"
   else
-    echo "It's in the Claude app now, with its history. boxen keeps it running"
-    echo "across restarts until you close it or it's idle for ${IDLE_HOURS}h."
+    echo "It's in the Claude app now, with its history. It stays open until you"
+    echo "close it (boxen resume $NAME $pick --stop) or the container restarts."
     echo "(To see it here: boxen resume $NAME $pick --attach; Ctrl+B then D to leave.)"
   fi
 }
 
 case ${1:-} in
-  serve)  shift; cmd_serve "$@" ;;
   resume) shift; cmd_resume "$@" ;;
-  count)  n=0; while IFS= read -r id; do [[ -n $id ]] && alive "$id" && n=$((n + 1)); done < "$STATE/kept"; echo "$n" ;;
-  *)      sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  count)  tmux ls -F '#S' 2>/dev/null | grep -c '^s-' || true ;;
+  *)      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

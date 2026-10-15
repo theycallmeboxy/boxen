@@ -64,8 +64,8 @@ Day to day ("all" in place of <name> means every project)
   shell <name>              Bash shell inside the container
   claude <name> [args]      Interactive Claude session in the container's terminal
   resume <name> [N]         Pick an earlier session from a numbered list and
-                            continue it in the Claude app (--stop N closes one
-                            boxen keeps; --attach N shows it here)
+                            continue it in the Claude app (--stop N closes it;
+                            --attach N shows it here)
   trust <name>              Re-run the one-time trust / Remote Control prompts
 
 Maintenance
@@ -748,7 +748,7 @@ cmd_ls() {
            "boxen-$n" 2>/dev/null) || st="not created"
     if [[ $st == running* ]]; then
       k=$(docker exec "boxen-$n" boxen-sessions count 2>/dev/null || true)
-      [[ -n $k && $k != 0 ]] && st+=", $k session(s) kept by boxen"
+      [[ -n $k && $k != 0 ]] && st+=", $k resumed session(s) open"
     fi
     printf '%-24s %s\n' "$n" "$st"
   done < <(projects)

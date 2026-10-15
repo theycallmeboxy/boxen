@@ -18,11 +18,9 @@ services:
     # The code sits at the same path inside as on the VM. Claude keys history
     # and auto memory by path, and git worktrees store absolute paths.
     working_dir: __SRC__
-    # The Remote Control server (shows up in the Claude app's Code tab as
-    # "__NAME__"), plus boxen's session keeper, which brings your sessions back
-    # after long downtime. Extra server flags go after "serve", e.g.
-    # "--permission-mode", "acceptEdits"  |  "--spawn", "worktree"
-    command: ["boxen-sessions", "serve"]
+    # Remote Control server; shows up in the Claude app's Code tab as "__NAME__".
+    # Optional flags: "--permission-mode", "acceptEdits"  |  "--spawn", "worktree"
+    command: ["claude", "remote-control", "--name", "__NAME__"]
     env_file:
       # Shared by every project: git identity, TZ.
       - path: ../../boxen.env

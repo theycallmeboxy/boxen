@@ -226,22 +226,14 @@ Good to know:
 
 ## Sessions across restarts
 
-You shouldn't have to think about restarts: sessions you were using stay in
-the Claude app.
+When a project restarts (`restart`, `rebuild`, `update`, a VM reboot), its
+Remote Control server brings its sessions back in the Claude app by itself,
+as long as it's back within about 4 hours. Restarts take seconds, so in
+practice that's every time. The exception is a project left down longer,
+such as the VM off overnight or a project stopped for the weekend. For those,
+and for any other earlier session, use `boxen resume`.
 
-- **Short restarts** (`restart`, `rebuild`, `update`, a VM reboot): the
-  project's Remote Control server brings its own sessions back if it's back
-  within about 4 hours of stopping.
-- **Longer downtime** (VM off overnight, a project stopped for the weekend):
-  the server starts fresh, so boxen brings back the sessions you'd used in
-  the 24 hours before it stopped, each continued with its full history.
-  `boxen logs <name>` says what it brought back.
-- Sessions boxen brought back (or that you resumed yourself, below) aren't
-  the server's, so boxen starts them again after every restart. It stops
-  keeping a session once you close it or it's been idle for 24 hours.
-  `boxen ls` shows how many each project has.
-
-### Picking up an older session
+### Picking up an earlier session
 
 ```bash
 boxen resume myproj
@@ -251,30 +243,29 @@ boxen resume myproj
 Sessions in myproj, newest first:
 
    1) 25m ago  "add retry to the webhook handler"   may be open in the app already
-   2) 3h ago   "fix the login redirect bug"         in the app (boxen keeps it running)
+   2) 3h ago   "fix the login redirect bug"
    3) 6d ago   "add CSV export"
 Number to continue in the Claude app (Enter to cancel): 3
 ```
 
-Pick one and it's in the Claude app with its history; there's nothing to
-attach to. Use it for sessions imported from a Mac, ones older than boxen
-brings back by itself, or ones you started in a terminal with
-`boxen claude <name>`. The list shows the first thing you typed in each.
+Pick one and it's in the Claude app with its history, with Remote Control
+already on; there's nothing to attach to. That covers sessions imported from a
+Mac, sessions from before a long downtime, and ones you started in a terminal
+with `boxen claude <name>`. The list shows the first thing you typed in each.
 
 - `boxen resume myproj 3` skips the list.
-- A session marked "may be open in the app already" was used since the server
-  started, so continue it in the app. boxen won't open it a second time
-  (two copies would mix their messages) unless you add `--force`.
-- `boxen resume myproj 3 --stop` closes a session boxen keeps.
+- A session marked "may be open in the app already" was used since the
+  project started, so continue it in the app. boxen won't open it a second
+  time (two copies would mix their messages) unless you add `--force`.
+- A resumed session stays open until you close it with
+  `boxen resume myproj 3 --stop` or the container restarts; after a restart,
+  resume it again. `boxen ls` shows how many are open per project.
 - `boxen resume myproj 3 --attach` shows it in your terminal (Ctrl+B then D
-  to leave it running). Useful if one seems stuck in the app, for example on
-  a question Claude asks in the terminal when resuming a long session.
+  to leave it running). Useful if one seems stuck, for example on a question
+  Claude asks in the terminal when resuming a long session.
 
 Saved sessions are kept for 30 days (Claude Code's default), so that's how
-far back you can go. Between about 4 and 4.5 hours of downtime neither the
-server nor boxen brings sessions back automatically (boxen waits that long
-to be sure it won't open a session the server is also reopening); use
-`boxen resume` for those.
+far back you can go.
 
 ## Commands
 
@@ -339,8 +330,8 @@ toolchains in the Dockerfiles. Anything installed by hand inside a container
 is gone after a rebuild.
 
 `restart: unless-stopped` brings containers back after VM reboots and after
-the Remote Control server exits during a long network outage. Your sessions
-come back too (see "Sessions across restarts").
+the Remote Control server exits during a long network outage. Sessions come
+back too (see "Sessions across restarts").
 
 There are two kinds of update:
 
