@@ -20,6 +20,7 @@
 IMPORT_DIR="$BOXEN_HOME/import-mac"
 PLAN="$IMPORT_DIR/plan.tsv"
 PROBE="$IMPORT_DIR/probe.tsv"
+SELECTED="$IMPORT_DIR/selected.txt"
 STAGE="$IMPORT_DIR/stage"
 CONFIG_ITEMS=(CLAUDE.md rules skills agents commands output-styles agent-memory settings.json)
 ALL_SCOPES="code,memory,sessions,config"
@@ -80,7 +81,7 @@ imp_begin() {
   mkdir_private "$BOXEN_HOME"
   mkdir_private "$IMPORT_DIR"
   # Fresh staging every run; an earlier plan (with your names) is kept.
-  rm -rf "$STAGE" "$IMPORT_DIR/map.tsv" "$IMPORT_DIR/roots.tsv"
+  rm -rf "$STAGE" "$IMPORT_DIR/map.tsv" "$IMPORT_DIR/roots.tsv" "$SELECTED"
   mkdir -p "$STAGE/claude" "$SRC_ROOT"
   printf 'STAGE=%s\nSRC=%s\nPLAN=%s\n' "$STAGE" "$SRC_ROOT" "$([[ -f $PLAN ]] && echo 1 || echo 0)"
 }
@@ -157,6 +158,7 @@ imp_plan() {
     rows+=("$(printf '%s\t%s\t# %s' "$name" "$p" "$note")")
   done
 
+  if (( ${#rows[@]} )); then mapfile -t rows < <(printf '%s\n' "${rows[@]}" | sort); fi
   {
     cat <<'EOF'
 # boxen import plan: one project per line, NAME<TAB>MAC FOLDER.
@@ -175,16 +177,66 @@ EOF
   imp_show
 }
 
+# Projects are numbered for selection; with a selection in place for this
+# run, the unselected ones are marked.
 imp_show() {
   [[ -f $PLAN ]] || die "no import plan yet"
-  local line
+  local line i=0 name mark
   echo
   while IFS= read -r line; do
     [[ $line == \#home* ]] && continue
-    if [[ $line == \#* ]]; then printf '  \033[2m%s\033[0m\n' "$line"
-    else printf '  %s\n' "${line//$'\t'/   }"; fi
+    if [[ $line == \#* ]]; then printf '  \033[2m%s\033[0m\n' "$line"; continue; fi
+    i=$((i + 1))
+    name=${line%%$'\t'*}
+    mark=" "
+    if [[ -f $SELECTED ]]; then
+      grep -qxF "$name" "$SELECTED" && mark="*" || mark="-"
+    fi
+    printf '  %s %2d) %s\n' "$mark" "$i" "${line//$'\t'/   }"
   done < "$PLAN"
+  if [[ -f $SELECTED ]]; then
+    printf '\n  This run: %s project(s) marked *. Those marked - are left for another run.\n' "$(wc -l < "$SELECTED")"
+  fi
   echo
+}
+
+# _select TOKEN...: choose which plan projects this run covers, by number
+# (as shown), range (3-5) or name. "all" clears the selection.
+imp_select() {
+  local rows=() names=() arg t a b i chosen=()
+  mapfile -t rows < <(plan_rows)
+  for t in "${rows[@]}"; do names+=("${t%%$'\t'*}"); done
+  (( $# )) || die "select projects by number, range (2-4) or name"
+  if [[ $1 == all ]]; then rm -f "$SELECTED"; imp_show; return; fi
+  for arg in "$@"; do
+    arg=${arg//,/ }
+    for t in $arg; do
+      if [[ $t =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
+        for (( i = a; i <= b; i++ )); do
+          (( i >= 1 && i <= ${#names[@]} )) || die "no project number $i"
+          chosen+=("${names[i-1]}")
+        done
+      elif [[ $t =~ ^[0-9]+$ ]]; then
+        (( t >= 1 && t <= ${#names[@]} )) || die "no project number $t"
+        chosen+=("${names[t-1]}")
+      else
+        printf '%s\n' "${names[@]}" | grep -qxF "$t" || die "no project named '$t' in the plan"
+        chosen+=("$t")
+      fi
+    done
+  done
+  printf '%s\n' "${chosen[@]}" | sort -u > "$SELECTED"
+  imp_show
+}
+
+# Plan rows this run covers: the selection if there is one, else all.
+run_rows() {
+  if [[ -f $SELECTED ]]; then
+    plan_rows | awk -F'\t' 'NR == FNR { sel[$0] = 1; next } sel[$1]' "$SELECTED" -
+  else
+    plan_rows
+  fi
 }
 
 imp_edit() { "${EDITOR:-nano}" "$PLAN"; }
@@ -219,7 +271,7 @@ imp_transfers() {
       if (( want_sessions )); then printf 'DATA\tprojects/%s\n' "$mk"
       elif (( want_memory )); then printf 'DATA\tprojects/%s/memory\n' "$mk"; fi
     done
-  done < <(plan_rows | sort -u)
+  done < <(run_rows | sort -u)
   if (( want_config )); then
     for p in "${CONFIG_ITEMS[@]}"; do printf 'DATA\t%s\n' "$p"; done
   fi
@@ -306,10 +358,13 @@ imp_apply() {
     done < "$IMPORT_DIR/roots.tsv"
 
     if (( ${#created[@]} )); then
-      local ans
+      local ans=n
       echo
-      read -rp "Start the ${#created[@]} new project(s) now? You'll answer y once per project. [Y/n] " ans
-      if [[ ${ans:-y} == [yY]* ]]; then
+      if [[ -t 0 ]]; then
+        read -rp "Start the ${#created[@]} new project(s) now? You'll answer y once per project. [Y/n] " ans
+        ans=${ans:-y}
+      fi
+      if [[ $ans == [yY]* ]]; then
         ensure_login
         for name in "${created[@]}"; do
           info "--- $name"
@@ -359,6 +414,7 @@ cmd_import_mac() {
     _paths)      imp_paths ;;
     _plan)       imp_plan "$@" ;;
     _show)       imp_show ;;
+    _select)     imp_select "$@" ;;
     _edit)       imp_edit ;;
     _transfers)  imp_transfers "$@" ;;
     _apply)      imp_apply "$@" ;;

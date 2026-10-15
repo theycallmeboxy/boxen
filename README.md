@@ -169,7 +169,8 @@ details filled in. On the Mac:
 ```bash
 scp you@vm:boxen/mac/boxen-export ~/boxen-export
 bash ~/boxen-export you@vm                          # everything
-bash ~/boxen-export you@vm --only memory,config     # just part of it
+bash ~/boxen-export you@vm --only memory,config     # only some kinds of data
+bash ~/boxen-export you@vm --projects alpha,gamma   # only some projects
 ```
 
 What happens:
@@ -179,8 +180,11 @@ What happens:
    its folder. Your home folder, folders that no longer exist, and plain
    folders that just contain several projects are left out. Folders inside a
    project (subfolders, worktrees) come along with that project.
-2. You approve it, or edit it on the VM (rename projects, drop ones you don't
-   want, add skipped ones back).
+2. You approve it, pick which projects this run covers (`[s]elect`, by number,
+   range like `5-7`, or name; or `--projects` up front), or edit the plan on
+   the VM (rename projects, drop ones for good, add skipped ones back). A
+   selection is just for that run: the plan keeps every project and name, so
+   you can move a few now and the rest later.
 3. It rsyncs the code to `~/src/<name>`, including `.git` (unpushed commits,
    stashes) and untracked files like `.env`, but skipping `node_modules`,
    Python virtualenvs and caches; add more with `--exclude PATTERN`. Things
@@ -209,15 +213,36 @@ Good to know:
   under the plan's names, so a later `boxen new <same name> <url>` picks them up.
 - **Sessions:** Claude Code keeps transcripts for 30 days by default (longer
   for sessions started in the Desktop app), so older ones aren't there to
-  move. Imported ones show up in each project's resume list; their history
-  still mentions Mac paths, and rewind checkpoints don't carry over. For work
-  in progress, a handoff note or a pushed branch is the more reliable bridge.
+  move. Continue an imported one with `boxen resume <name>` (see "Resuming
+  sessions"). Their history still mentions Mac paths, and rewind checkpoints
+  don't carry over. Stop working in a session on the Mac before exporting
+  it; the export is a snapshot.
 - **MCP servers** are listed (full settings in `~/.config/boxen/mac-mcp.json`)
   rather than installed, since they often run Mac programs. Re-add the ones
   you need. claude.ai connectors follow your account and need nothing.
 - **Plugins** synced to your claude.ai account download by themselves; others
   you reinstall with `/plugin`.
 - Requires `rsync` on the Mac (built in) and SSH from the Mac to the VM.
+
+## Resuming sessions
+
+Sessions you start from the Claude app run in the project's Remote Control
+server. If the server restarts (a `restart`, `rebuild`, `update` or VM
+reboot), it brings its sessions back on its own, as long as it's back within
+about 4 hours.
+
+For any other session, use `boxen resume <name>`:
+
+- one imported from a Mac,
+- one older than the server brings back by itself,
+- one you started in a terminal with `boxen claude <name>`.
+
+It opens Claude's session picker in a tmux session inside the container (or
+pass a session ID or name to skip the picker). Pick one, then type
+`/remote-control` in it: it shows up in the Claude app with its history, and
+you can carry on from your phone. Press Ctrl+B then D to leave it running;
+`boxen resume <name>` re-attaches. It ends if the container restarts, but the
+transcript stays, so you can resume it again.
 
 ## Commands
 
@@ -234,6 +259,7 @@ doesn't, and no project can be named `all`.)
 | `boxen logs <name> [-f]` | Remote Control server output |
 | `boxen shell <name>` | Bash inside the container |
 | `boxen claude <name>` | Terminal Claude session inside the container |
+| `boxen resume <name> [session]` | Continue an earlier session (picker, or by ID/name) in tmux; `/remote-control` puts it in the app |
 | `boxen up <name\|all>` | Start, or apply changes to `boxen.env` / `project.env` / `compose.yaml` |
 | `boxen down <name\|all>` | Stop |
 | `boxen restart <name\|all>` | Recreate the container (also picks up env changes) |
