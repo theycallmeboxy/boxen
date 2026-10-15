@@ -26,15 +26,68 @@ gh repo clone theycallmeboxy/boxen ~/boxen
 
 `install.sh` is safe to re-run. It:
 
-1. installs Docker CE + the compose plugin from Docker's apt repo (and stops
+1. installs the few tools boxen uses on the VM (`jq`, `openssl`, `cron`, ...),
+2. installs Docker CE + the compose plugin from Docker's apt repo (and stops
    with instructions if Docker is installed as a snap, which can't work here),
-2. adds you to the `docker` group,
-3. links `boxen` into `~/.local/bin`,
-4. runs `boxen setup`: creates `~/.config/boxen/boxen.env`, the
+3. adds you to the `docker` group,
+4. links `boxen` into `~/.local/bin`,
+5. runs `boxen setup`: creates `~/.config/boxen/boxen.env`, the
    `claude-config` volume, and the base image.
 
-Then log out and back in, fill in `~/.config/boxen/boxen.env` (GitHub token,
-git identity, timezone), and create your first project.
+Then log out and back in, run `boxen github` (next section), check the
+timezone in `~/.config/boxen/boxen.env`, and create your first project.
+
+## Connect GitHub
+
+```bash
+boxen github
+```
+
+Containers never get a long-lived GitHub token. Instead, a private GitHub App
+that you own mints a **1-hour token for each project, scoped to that
+project's repo only**. The app's private key stays on the VM; each container
+sees only its own token, through a read-only mount, and cron replaces it
+every 30 minutes. git and `gh` inside the container pick it up automatically.
+
+`boxen github` walks you through it once (about 3 minutes):
+
+1. It prints a link that pre-fills a new GitHub App (name `boxen-<you>`,
+   private, no webhook, the permissions below). Click **Create GitHub App**,
+   copy the **Client ID**, and click **Generate a private key** (a `.pem`
+   downloads).
+2. Paste the Client ID, then paste the `.pem` file's contents (or its path, if
+   you've copied it to the VM).
+3. It prints the app's install link. Choose **All repositories** so repos you
+   create later work without coming back, or pick specific ones.
+
+It also sets your commit identity for containers to your GitHub name and
+**no-reply address** (`ID+username@users.noreply.github.com`), so your real
+email stays out of commits. If you've already set `GIT_AUTHOR_EMAIL` in
+`boxen.env`, it leaves yours alone. To make GitHub refuse any push that
+would expose your private email, turn on "Block command line pushes that
+expose my email" in GitHub's email settings.
+
+App permissions: Contents, Pull requests, Issues (write); Actions, Checks,
+Statuses (read), so Claude can push branches, open PRs, work with issues, and
+read CI results. Changes under `.github/workflows/` need the **Workflows**
+permission too; add it in the app's settings if you want Claude editing CI.
+
+Good to know:
+
+- Pushes, PRs and comments made with these tokens show as `boxen-<you>[bot]`.
+  Commits themselves still carry your name and no-reply address.
+- A project gets a token once its folder has a github.com `origin` remote.
+  A brand-new project has no GitHub access until you add one (then
+  `boxen tokens <name>`).
+- Containers can't create new GitHub repos. Create them on the VM with
+  `gh repo create`, then use the URL with `boxen new`.
+- `boxen tokens` refreshes immediately and shows each project's repo and
+  expiry. Cron problems are logged to `~/.config/boxen/tokens.log`.
+- The VM's clock must be right (Ubuntu's default time sync is fine); GitHub
+  rejects app requests from a clock that's off by more than a minute or so.
+- Skipping the app: you can instead put a personal access token in
+  `boxen.env` or a project's `project.env` as `GH_TOKEN`; git and `gh` fall
+  back to it.
 
 ## Create a project
 
@@ -60,9 +113,9 @@ boxen refuses to clone into a folder that already has files, so it never
 overwrites existing code.
 
 Use HTTPS URLs (`https://github.com/...`), not SSH (`git@github.com:...`).
-The clone runs inside the container and authenticates with the `GH_TOKEN` in
-`boxen.env` through the GitHub CLI, which is what makes private repos work.
-The containers have no SSH keys.
+The clone runs inside the container with a token boxen mints for that repo
+(see "Connect GitHub"), which is what makes private repos work. The
+containers have no SSH keys.
 
 What `boxen new` does, in order:
 
@@ -101,6 +154,8 @@ Everything in the shared `~/.claude` applies to every project.
 | Command | What it does |
 |---|---|
 | `boxen ls` | Projects, container status and restart counts |
+| `boxen github [--reset]` | Connect GitHub (or redo it with a new app/key) |
+| `boxen tokens [name...]` | Refresh GitHub tokens now and show their repos and expiry |
 | `boxen logs <name> [-f]` | Remote Control server output |
 | `boxen shell <name>` | Bash inside the container |
 | `boxen claude <name>` | Terminal Claude session inside the container |
@@ -123,7 +178,7 @@ Everything in the shared `~/.claude` applies to every project.
 | Tools for every project | `~/.config/boxen/base.local.Dockerfile` | `boxen update` |
 | Tools for one project | `~/.config/boxen/projects/<name>/Dockerfile` | `boxen rebuild <name>` |
 | Env for every project | `~/.config/boxen/boxen.env` | `boxen restart <name>` per project |
-| Env for one project (e.g. its own `GH_TOKEN`) | `~/.config/boxen/projects/<name>/project.env` | `boxen restart <name>` |
+| Env for one project | `~/.config/boxen/projects/<name>/project.env` | `boxen restart <name>` |
 | Container settings (limits, Remote Control flags) | `~/.config/boxen/projects/<name>/compose.yaml` | `boxen up <name>` |
 
 `base.local.Dockerfile` must start with `FROM boxen-base:core`. Containers
@@ -165,8 +220,8 @@ boxen self-update && boxen update
 at the end. It also prunes old build cache.
 
 Backups: Proxmox backups of the VM cover `~/src` and the `claude-config`
-volume. They also contain your GitHub token and Claude login, so treat them
-as secrets.
+volume. They also contain the GitHub App's private key and your Claude login,
+so treat them as secrets.
 
 ## Security model
 
@@ -179,9 +234,13 @@ The VM is the hard boundary. Inside it:
   project's container can read the Claude login (including its refresh token)
   and every project's transcripts and memory. That's the trade for signing in
   once. Don't run code you don't trust here; use a separate VM for that.
-- **`GH_TOKEN` is visible to everything in the container**: Claude, build
-  scripts, dependencies' install scripts. Use a fine-grained token with only
-  the permissions in `boxen.env`, or a per-repo token in `project.env`.
+- **A project's GitHub token is visible to everything in its container**:
+  Claude, build scripts, dependencies' install scripts. That's why it's
+  limited to that one repo and expires within the hour. The GitHub App's
+  private key, which can mint tokens for every repo the app is installed on,
+  lives only on the VM (`~/.config/boxen/github/`) and is never mounted into
+  containers. Anyone with a shell on the VM as you can use it, so guard the
+  VM accordingly.
 - **Containers can reach anything the VM can**, including your LAN (NAS,
   router admin, Proxmox UI). Put the VM on its own VLAN and block RFC1918
   destinations there except what you need (DNS, any internal services you
@@ -198,8 +257,10 @@ The VM is the hard boundary. Inside it:
 - **"Workspace not trusted" in the logs:** `boxen trust <name>`.
 - **Env change didn't take effect:** `boxen restart <name>` (a plain Docker
   restart doesn't re-read env files).
-- **Clone failed:** check `GH_TOKEN` in `boxen.env` covers that repo, then
-  run `boxen new` again.
+- **Clone, push or `gh` fails with an auth error:** `boxen tokens <name>`
+  says why. Usually the app isn't installed on that repo (add it on the
+  app's install page) or the repo needs a permission the app lacks (e.g.
+  Workflows). Check `~/.config/boxen/tokens.log` for cron-time failures.
 
 ## Network egress (VLAN allowlist)
 

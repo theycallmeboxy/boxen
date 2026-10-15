@@ -29,7 +29,8 @@ USER_GID="$(id -g "$USER_NAME")"
 CHOME="/home/$USER_NAME"
 
 die()  { printf 'boxen: %s\n' "$*" >&2; exit 1; }
-warn() { printf 'boxen: %s\n' "$*" >&2; }
+# In cron runs (QUIET set), stamp warnings with the time for tokens.log.
+warn() { printf '%sboxen: %s\n' "${QUIET:+$(date -Is) }" "$*" >&2; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
 usage() {
@@ -38,6 +39,8 @@ Usage: boxen <command> [args]
 
 Setup
   setup                     First-time setup: env file, config volume, base image
+  github [--reset]          Connect GitHub: create/verify your GitHub App, set
+                            your no-reply commit identity, schedule token refresh
   new <name> [git-url]      Create a project and start its container.
                             git-url: optional HTTPS GitHub URL to clone into
                             ~/src/<name>. Omit it for a new empty project, or
@@ -61,6 +64,7 @@ Day to day
 
 Maintenance
   rebuild <name>            Rebuild one project image and recreate its container
+  tokens [name...]          Refresh GitHub tokens now (cron does it every 30 min)
   regen <name>              Re-render compose.yaml from the current template
                             (old one saved as compose.yaml.bak)
   update                    Rebuild base (fresh Ubuntu + Claude Code), then all projects
@@ -146,7 +150,7 @@ cmd_setup() {
   if [[ ! -f "$ENV_FILE" ]]; then
     cp "$BOXEN_REPO/templates/boxen.env" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    info "created $ENV_FILE (add your GitHub token and git identity)"
+    info "created $ENV_FILE"
   fi
 
   build_base
@@ -159,7 +163,7 @@ cmd_setup() {
   docker run --rm --user root -v "$CONFIG_VOLUME:/v" "$BASE_IMAGE" \
     chown "$USER_UID:$USER_GID" /v
 
-  info "setup done. Next: edit $ENV_FILE, then 'boxen new <name> [git-url]'"
+  info "setup done. Next: 'boxen github' to connect GitHub, then 'boxen new <name> [git-url]'"
 }
 
 # ------------------------------------------------------- shared config / login
@@ -224,6 +228,307 @@ cmd_config() {
   run_base -it "${args[@]}" -w "$CHOME/.claude" "$BASE_IMAGE" bash
 }
 
+# ---------------------------------------------------------------- GitHub
+#
+# A private GitHub App you own mints short-lived tokens (1 hour), each scoped
+# to one project's repo. The app's private key stays on the VM. Containers only
+# see their own token, through a read-only mount of projects/<name>/token, and
+# cron refreshes it every 30 minutes.
+
+GH_DIR="$BOXEN_HOME/github"
+GH_KEY="$GH_DIR/app.pem"
+GH_CONF="$GH_DIR/app.conf"
+TOKENS_LOG="$BOXEN_HOME/tokens.log"
+GH_API="https://api.github.com"
+
+app_configured() { [[ -s "$GH_KEY" && -s "$GH_CONF" ]]; }
+app_conf() { sed -n "s/^$1=//p" "$GH_CONF" 2>/dev/null | tail -1; }
+set_app_conf() {
+  local tmp="$GH_CONF.tmp"
+  { grep -v "^$1=" "$GH_CONF" 2>/dev/null || true; printf '%s=%s\n' "$1" "$2"; } > "$tmp"
+  mv -f "$tmp" "$GH_CONF"
+}
+app_install_url() { printf 'https://github.com/apps/%s/installations/new' "$(app_conf APP_SLUG)"; }
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# RS256 JWT identifying the app, valid for 9 minutes (iat backdated 60s for
+# clock drift, as GitHub recommends).
+make_jwt() {
+  local now h p s
+  now=$(date +%s)
+  h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+  p=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$(app_conf CLIENT_ID)" | b64url)
+  s=$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$GH_KEY" -binary | b64url)
+  printf '%s.%s.%s' "$h" "$p" "$s"
+}
+
+# gh_app_api METHOD PATH [JSON]: call the GitHub API as the app. Prints the
+# JSON reply; on failure it still prints JSON with a .message, and fails.
+gh_app_api() {
+  local out rc=0
+  local args=(-s --fail-with-body -X "$1"
+              -H "Authorization: Bearer $(make_jwt)"
+              -H "Accept: application/vnd.github+json"
+              -H "X-GitHub-Api-Version: 2022-11-28")
+  if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" -d "$3"); fi
+  out=$(curl "${args[@]}" "$GH_API$2") || rc=$?
+  if (( rc )) && [[ -z "$out" ]]; then
+    out=$(printf '{"message":"no reply from GitHub (curl exit %d)"}' "$rc")
+  fi
+  printf '%s\n' "$out"
+  return "$rc"
+}
+gh_msg() { jq -r '.message // empty' <<<"$1" 2>/dev/null || true; }
+
+# github.com remote URL (https or ssh form) -> owner/repo
+github_repo() {
+  local u=${1%/}
+  u=${u%.git}
+  case $u in
+    https://github.com/*)   u=${u#https://github.com/} ;;
+    https://*@github.com/*) u=${u#https://*@github.com/} ;;
+    git@github.com:*)       u=${u#git@github.com:} ;;
+    ssh://git@github.com/*) u=${u#ssh://git@github.com/} ;;
+    *) return 1 ;;
+  esac
+  [[ $u =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  printf '%s\n' "$u"
+}
+
+project_repo() {
+  local url
+  url=$(git -C "$SRC_ROOT/$1" remote get-url origin 2>/dev/null) || return 1
+  github_repo "$url"
+}
+
+mkdir_private() { mkdir -p "$1" && chmod 700 "$1"; }
+
+token_dir() { printf '%s/token' "$(proj_dir "$1")"; }
+
+# mint_token owner/repo dir: write a 1-hour token for just that repo to
+# dir/gh-token (atomically, so a reader never sees half a token). Prints
+# the expiry time.
+mint_token() {
+  local repo=$1 dir=$2 out inst tok
+  out=$(gh_app_api GET "/repos/$repo/installation") || {
+    warn "$repo: the boxen GitHub App can't access it ($(gh_msg "$out")). Add it to the app's installation: $(app_install_url)"
+    return 1
+  }
+  inst=$(jq -r .id <<<"$out")
+  out=$(gh_app_api POST "/app/installations/$inst/access_tokens" \
+          "$(jq -nc --arg r "${repo#*/}" '{repositories: [$r]}')") || {
+    warn "$repo: couldn't get a token ($(gh_msg "$out"))"
+    return 1
+  }
+  tok=$(jq -r '.token // empty' <<<"$out")
+  [[ -n "$tok" ]] || { warn "$repo: GitHub's reply had no token"; return 1; }
+  mkdir_private "$dir"
+  (umask 077; printf '%s\n' "$tok" > "$dir/.gh-token.tmp")
+  mv -f "$dir/.gh-token.tmp" "$dir/gh-token"
+  jq -r .expires_at <<<"$out"
+}
+
+# Refresh one project's token. A no-op when GitHub isn't set up; removes the
+# token when the project has no GitHub remote (yet).
+refresh_project() {
+  local n=$1 dir repo exp
+  app_configured || return 0
+  dir=$(token_dir "$n")
+  mkdir_private "$dir"
+  if ! repo=$(project_repo "$n"); then
+    rm -f "$dir/gh-token"
+    [[ -n "${QUIET:-}" ]] || printf '  %-24s no GitHub remote; no token\n' "$n"
+    return 0
+  fi
+  exp=$(mint_token "$repo" "$dir") || return 1
+  [[ -n "${QUIET:-}" ]] || printf '  %-24s %-36s token valid until %s\n' "$n" "$repo" "$exp"
+}
+
+cmd_tokens() {
+  local n failed=0 list=()
+  if [[ "${1:-}" == --quiet ]]; then
+    # From cron: output goes to tokens.log, so stay silent unless something fails.
+    QUIET=1
+    shift
+    if [[ -f "$TOKENS_LOG" ]] && (( $(stat -c %s "$TOKENS_LOG") > 1000000 )); then
+      : > "$TOKENS_LOG"
+    fi
+  fi
+  if ! app_configured; then
+    [[ -n "${QUIET:-}" ]] || warn "GitHub isn't set up yet; run 'boxen github'"
+    return 0
+  fi
+  if (( $# )); then
+    for n in "$@"; do require_project "$n"; list+=("$n"); done
+  else
+    mapfile -t list < <(projects)
+  fi
+  for n in "${list[@]}"; do
+    refresh_project "$n" || failed=1
+  done
+  return "$failed"
+}
+
+install_cron() {
+  if ! command -v crontab >/dev/null; then
+    warn "cron isn't installed, so tokens won't refresh on their own. Install it (sudo apt install cron) and re-run 'boxen github'."
+    return 1
+  fi
+  local tag="# boxen-tokens" job current
+  job="BOXEN_HOME=\"$BOXEN_HOME\" BOXEN_SRC=\"$SRC_ROOT\" \"$BOXEN_REPO/bin/boxen\" tokens --quiet >>\"$TOKENS_LOG\" 2>&1"
+  # Read your existing crontab in full first, then rewrite it with our lines
+  # replaced (everything else kept as is).
+  current=$(crontab -l 2>/dev/null || true)
+  {
+    if [[ -n "$current" ]]; then grep -vF "$tag" <<<"$current" || true; fi
+    printf '*/30 * * * * %s %s\n' "$job" "$tag"
+    printf '@reboot sleep 30 && %s %s\n' "$job" "$tag"
+  } | crontab -
+  info "cron refreshes tokens every 30 minutes and at boot (problems go to $TOKENS_LOG)"
+}
+
+env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
+
+# set_env KEY VALUE in boxen.env: replace an existing (or commented-out) line,
+# else append.
+set_env() {
+  if grep -qE "^#?$1=" "$ENV_FILE"; then
+    sed -i -E "s|^#?$1=.*|$1=$(sed_esc "$2")|" "$ENV_FILE"
+  else
+    printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE"
+  fi
+}
+
+# Read a PEM private key pasted into the terminal, or a path to one, into $1.
+read_key() {
+  local dest=$1 first line
+  (umask 077; : > "$dest")
+  IFS= read -r first
+  if [[ $first == -----BEGIN* ]]; then
+    {
+      printf '%s\n' "$first"
+      while IFS= read -r line; do
+        printf '%s\n' "$line"
+        [[ $line == -----END* ]] && break
+      done
+    } > "$dest"
+  else
+    first=${first/#\~/$HOME}
+    [[ -f $first ]] || { rm -f "$dest"; die "no such file: $first"; }
+    cat "$first" > "$dest"
+  fi
+  openssl pkey -in "$dest" -noout 2>/dev/null || { rm -f "$dest"; die "that isn't a valid private key"; }
+}
+
+cmd_github() {
+  local c
+  for c in openssl curl jq git; do
+    command -v "$c" >/dev/null || die "$c is required (sudo apt install $c)"
+  done
+  [[ -f "$ENV_FILE" ]] || die "run 'boxen setup' first"
+
+  if [[ "${1:-}" == --reset ]]; then
+    rm -f "$GH_KEY" "$GH_CONF"
+    info "forgot the GitHub App; setting it up again"
+  fi
+  mkdir_private "$GH_DIR"
+
+  # Who you are on GitHub: from the VM's gh login if there is one.
+  local uid="" login="" name="" user
+  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+    login=$(gh api user --jq .login)
+  else
+    read -rp "Your GitHub username: " login
+  fi
+  [[ -n "$login" ]] || die "need your GitHub username"
+  user=$(curl -fsS "$GH_API/users/$login") || die "couldn't look up GitHub user '$login'"
+  uid=$(jq -r .id <<<"$user")
+  name=$(jq -r '.name // empty' <<<"$user")
+
+  if ! app_configured; then
+    local cid url
+    url="https://github.com/settings/apps/new?name=boxen-$login"
+    url+="&description=Short-lived%20per-repo%20tokens%20for%20boxen%20containers"
+    url+="&url=https://github.com/$login&public=false&webhook_active=false"
+    url+="&contents=write&pull_requests=write&issues=write"
+    url+="&actions=read&checks=read&statuses=read&metadata=read"
+    cat <<EOF
+
+Step 1 of 2: create your private GitHub App. Open this link, signed in to
+GitHub as $login. It pre-fills the name and permissions:
+
+  $url
+
+Click "Create GitHub App" at the bottom. On the page that follows:
+  - copy the Client ID (near the top)
+  - under "Private keys", click "Generate a private key" (a .pem file downloads)
+
+EOF
+    read -rp "Client ID: " cid
+    cid=${cid//[[:space:]]/}
+    [[ -n "$cid" ]] || die "need the Client ID"
+    echo "Paste the private key (the whole .pem file, BEGIN through END line),"
+    echo "or type the path to the .pem file if you've copied it to this VM:"
+    read_key "$GH_KEY.tmp"
+    mv -f "$GH_KEY.tmp" "$GH_KEY"
+    set_app_conf CLIENT_ID "$cid"
+  fi
+
+  local app slug
+  app=$(gh_app_api GET /app) || \
+    die "GitHub rejected the app's credentials ($(gh_msg "$app")). Check the Client ID and key, then run 'boxen github --reset'."
+  slug=$(jq -r .slug <<<"$app")
+  set_app_conf APP_SLUG "$slug"
+  info "GitHub App: $slug"
+
+  local installs
+  installs=$(gh_app_api GET /app/installations | jq length) || die "couldn't list the app's installations"
+  if [[ "$installs" == 0 ]]; then
+    cat <<EOF
+
+Step 2 of 2: install the app on your account:
+
+  $(app_install_url)
+
+Choose "All repositories" so repos you create later are covered too, or pick
+specific ones (then add new repos to it as you go).
+
+EOF
+    read -rp "Press Enter once it's installed... " _
+    installs=$(gh_app_api GET /app/installations | jq length) || die "couldn't list the app's installations"
+    [[ "$installs" != 0 ]] || die "the app isn't installed yet; install it, then re-run 'boxen github'"
+  fi
+  info "app is installed"
+
+  # Commit identity for containers: your GitHub no-reply address keeps your
+  # real email out of commits. Leave it alone if you've already set one.
+  local email="${uid}+${login}@users.noreply.github.com"
+  name=${name:-$login}
+  if [[ -z "$(env_get GIT_AUTHOR_EMAIL)" ]]; then
+    set_env GIT_AUTHOR_NAME "$name"
+    set_env GIT_COMMITTER_NAME "$name"
+    set_env GIT_AUTHOR_EMAIL "$email"
+    set_env GIT_COMMITTER_EMAIL "$email"
+    info "commits from containers: $name <$email>"
+  else
+    info "keeping the git identity already in $ENV_FILE ($(env_get GIT_AUTHOR_EMAIL)); your no-reply address is $email"
+  fi
+
+  install_cron || true
+
+  local n stale=()
+  while read -r n; do
+    grep -q '/run/boxen' "$(proj_dir "$n")/compose.yaml" || stale+=("$n")
+  done < <(projects)
+  info "minting tokens for existing projects"
+  cmd_tokens || true
+  if (( ${#stale[@]} )); then
+    warn "these projects predate GitHub App support; run 'boxen regen <name>' for each: ${stale[*]}"
+  fi
+  info "GitHub is set up. Restart projects ('boxen restart <name>') to pick up the git identity."
+}
+
 # ------------------------------------------------------------ new project
 
 # Escape a value for use as a sed replacement (we use | as the delimiter).
@@ -285,7 +590,7 @@ cmd_new() {
   local name=${1:-} url=${2:-}
   [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]  (git-url optional; HTTPS GitHub URL to clone)"
   if [[ "$url" == git@* || "$url" == ssh://* ]]; then
-    die "use the HTTPS form of the URL (https://github.com/owner/repo.git); containers authenticate with GH_TOKEN, not SSH keys"
+    die "use the HTTPS form of the URL (https://github.com/owner/repo.git); containers authenticate over HTTPS with a GitHub token, not SSH keys"
   fi
   valid_name "$name"
   require_setup
@@ -303,8 +608,9 @@ cmd_new() {
   [[ -d "$src" ]] || NEW_CREATED_SRC=1
   trap new_cleanup EXIT
 
-  # Create the code dir yourself so Docker doesn't create it root-owned.
+  # Create the code and token dirs yourself so Docker doesn't create them root-owned.
   mkdir -p "$src" "$pdir"
+  mkdir_private "$(token_dir "$name")"
   render "$BOXEN_REPO/templates/compose.yaml" "$name" "$src" > "$pdir/compose.yaml"
   render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" > "$pdir/Dockerfile"
 
@@ -312,9 +618,18 @@ cmd_new() {
   dc "$name" build
 
   if [[ -n "$url" ]]; then
+    if app_configured; then
+      local repo
+      repo=$(github_repo "$url") || die "'$url' isn't a github.com repo URL"
+      mint_token "$repo" "$(token_dir "$name")" >/dev/null \
+        || die "no GitHub token for $repo, so it can't be cloned (see above)"
+    else
+      warn "GitHub isn't set up ('boxen github'); cloning a private repo will fail unless GH_TOKEN is in boxen.env"
+    fi
     info "cloning $url"
     dc "$name" run --rm --no-deps -T claude git clone "$url" .
   fi
+  refresh_project "$name" || true
 
   ensure_login
   first_run "$name"
@@ -341,9 +656,9 @@ cmd_ls() {
   done < <(projects)
 }
 
-cmd_up()      { require_project "${1:-}"; dc "$1" up -d; }
+cmd_up()      { require_project "${1:-}"; refresh_project "$1" || true; dc "$1" up -d; }
 cmd_down()    { require_project "${1:-}"; dc "$1" down; }
-cmd_restart() { require_project "${1:-}"; dc "$1" up -d --force-recreate; }
+cmd_restart() { require_project "${1:-}"; refresh_project "$1" || true; dc "$1" up -d --force-recreate; }
 
 cmd_logs() {
   require_project "${1:-}"
@@ -365,6 +680,7 @@ cmd_claude() {
 cmd_trust() {
   require_project "${1:-}"
   dc "$1" down
+  refresh_project "$1" || true
   first_run "$1"
   dc "$1" up -d
   check_running "$1"
@@ -374,6 +690,7 @@ cmd_trust() {
 
 rebuild_one() {
   info "rebuilding $1"
+  refresh_project "$1" || true
   dc "$1" build && dc "$1" up -d --force-recreate
 }
 
@@ -390,6 +707,8 @@ cmd_regen() {
   cp "$pdir/compose.yaml" "$pdir/compose.yaml.bak"
   render "$BOXEN_REPO/templates/compose.yaml" "$1" "$SRC_ROOT/$1" > "$pdir/compose.yaml"
   info "re-rendered $pdir/compose.yaml (old one in compose.yaml.bak; diff them if you'd edited it)"
+  mkdir_private "$(token_dir "$1")"
+  refresh_project "$1" || true
   dc "$1" up -d
 }
 
@@ -425,6 +744,8 @@ shift || true
 case "$cmd" in
   setup)    cmd_setup "$@" ;;
   new)      cmd_new "$@" ;;
+  github)   cmd_github "$@" ;;
+  tokens)   cmd_tokens "$@" ;;
   login)    cmd_login ;;
   import)   cmd_import "$@" ;;
   config)   cmd_config ;;

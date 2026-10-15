@@ -22,10 +22,10 @@ services:
     # Optional flags: "--permission-mode", "acceptEdits"  |  "--spawn", "worktree"
     command: ["claude", "remote-control", "--name", "__NAME__"]
     env_file:
-      # Shared by every project: GH_TOKEN, git identity, TZ.
+      # Shared by every project: git identity, TZ.
       - path: ../../boxen.env
         required: true
-      # Optional per-project overrides, e.g. a GH_TOKEN scoped to just this repo.
+      # Optional per-project overrides.
       - path: ./project.env
         required: false
     environment:
@@ -34,6 +34,8 @@ services:
       - __SRC__:__SRC__
       # Shared Claude login, settings, CLAUDE.md, skills and memory.
       - claude-config:__CHOME__/.claude
+      # This project's short-lived GitHub token, refreshed by boxen on the VM.
+      - ./token:/run/boxen:ro
     security_opt:
       - no-new-privileges:true
     # Keeps a runaway build or fork bomb from taking down the VM.

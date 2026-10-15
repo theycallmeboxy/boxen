@@ -55,6 +55,11 @@ RUN test -n "$USERNAME" || (echo "USERNAME build arg is required" >&2; exit 1) \
  && install -d -o "$USER_UID" -g "$USER_GID" \
       "/home/$USERNAME/.claude" "/home/$USERNAME/src"
 
+# GitHub access: git and gh both read the project's short-lived token from
+# /run/boxen/gh-token (mounted read-only; boxen refreshes it on the VM).
+COPY git-credential-boxen gh /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/git-credential-boxen /usr/local/bin/gh
+
 USER $USERNAME
 WORKDIR /home/$USERNAME
 
@@ -62,9 +67,9 @@ WORKDIR /home/$USERNAME
 # volume mounted here. CLAUDE_CONFIG_DIR keeps .claude.json (the login) inside it.
 ENV CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
 
-# git uses the GH_TOKEN from boxen.env via the GitHub CLI for github.com.
+# For github.com, git asks git-credential-boxen (and only it) for credentials.
 RUN git config --global init.defaultBranch main \
  && git config --global credential.https://github.com.helper '' \
- && git config --global --add credential.https://github.com.helper '!gh auth git-credential'
+ && git config --global --add credential.https://github.com.helper boxen
 
 CMD ["bash"]

@@ -25,6 +25,17 @@ if snap list docker >/dev/null 2>&1 \
   die "Docker is installed as a snap, which boxen can't use. Remove it with 'sudo snap remove docker', then re-run."
 fi
 
+# 0. Tools boxen itself uses on the VM (GitHub token minting and its cron job).
+missing=()
+for pkg in ca-certificates curl git jq openssl cron; do
+  dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+done
+if (( ${#missing[@]} )); then
+  info "installing ${missing[*]}"
+  sudo apt-get update
+  sudo apt-get install -y "${missing[@]}"
+fi
+
 # 1. Docker CE + compose plugin, from Docker's own apt repo.
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
   info "Docker already installed"
@@ -84,7 +95,8 @@ cat <<EOF
 
 ==> Installed. Next:
     1. Log out and back in (picks up the docker group and ~/.local/bin on PATH).
-    2. Edit ~/.config/boxen/boxen.env: GitHub token + git identity.
-    3. Optional: bring over your personal Claude config (see README, "Your Claude config").
-    4. boxen new <name> https://github.com/<you>/<repo>.git
+    2. boxen github     (connects GitHub; sets your no-reply commit identity)
+    3. Check ~/.config/boxen/boxen.env (timezone, anything else).
+    4. Optional: bring over your personal Claude config (see README, "Your Claude config").
+    5. boxen new <name> https://github.com/<you>/<repo>.git
 EOF
