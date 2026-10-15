@@ -340,12 +340,30 @@ mkdir_private() { mkdir -p "$1" && chmod 700 "$1"; }
 
 token_dir() { printf '%s/token' "$(proj_dir "$1")"; }
 
+# app_account OWNER: true if the boxen app is installed on that account (you,
+# or an org you added it to). Only asked when a repo lookup fails.
+APP_ACCOUNTS=""
+app_account() {
+  if [[ -z "$APP_ACCOUNTS" ]]; then
+    APP_ACCOUNTS=$(gh_app_api GET "/app/installations?per_page=100" \
+                     | jq -r '.[].account.login' 2>/dev/null | tr 'A-Z' 'a-z') || true
+    # If GitHub can't be asked, assume it's yours so the real error is shown.
+    [[ -n "$APP_ACCOUNTS" ]] || { APP_ACCOUNTS="?"; }
+  fi
+  [[ "$APP_ACCOUNTS" == "?" ]] && return 0
+  grep -qxF "$(tr 'A-Z' 'a-z' <<<"$1")" <<<"$APP_ACCOUNTS"
+}
+
 # mint_token owner/repo dir: write a 1-hour token for just that repo to
 # dir/gh-token (atomically, so a reader never sees half a token). Prints
 # the expiry time.
 mint_token() {
   local repo=$1 dir=$2 out inst tok
   out=$(gh_app_api GET "/repos/$repo/installation") || {
+    # Someone else's repo (a clone of an upstream project): the app can only
+    # be installed on accounts you control, so no token is possible. Not an
+    # error; return 2 so the caller can say so.
+    if ! app_account "${repo%%/*}"; then return 2; fi
     warn "$repo: the boxen GitHub App can't access it ($(gh_msg "$out")). Add it to the app's installation: $(app_install_url)"
     return 1
   }
@@ -375,7 +393,14 @@ refresh_project() {
     [[ -n "${QUIET:-}" ]] || printf '  %-24s no GitHub remote; no token\n' "$n"
     return 0
   fi
-  exp=$(mint_token "$repo" "$dir") || return 1
+  local rc=0
+  exp=$(mint_token "$repo" "$dir") || rc=$?
+  if (( rc == 2 )); then
+    rm -f "$dir/gh-token"
+    [[ -n "${QUIET:-}" ]] || printf '  %-24s %-36s not your repo: pulls work (public), no token to push\n' "$n" "$repo"
+    return 0
+  fi
+  (( rc == 0 )) || return 1
   [[ -n "${QUIET:-}" ]] || printf '  %-24s %-36s token valid until %s\n' "$n" "$repo" "$exp"
 }
 
@@ -769,8 +794,13 @@ cmd_new() {
     if app_configured; then
       local repo
       repo=$(github_repo "$url") || die "'$url' isn't a github.com repo URL"
-      mint_token "$repo" "$(token_dir "$name")" >/dev/null \
-        || die "no GitHub token for $repo, so it can't be cloned (see above)"
+      local rc=0
+      mint_token "$repo" "$(token_dir "$name")" >/dev/null || rc=$?
+      if (( rc == 2 )); then
+        info "$repo isn't yours, so there's no token for it; cloning works if it's public. To push changes, fork it and clone your fork."
+      elif (( rc )); then
+        die "no GitHub token for $repo, so it can't be cloned (see above)"
+      fi
     else
       warn "GitHub isn't set up ('boxen github'); cloning a private repo will fail unless GH_TOKEN is in boxen.env"
     fi

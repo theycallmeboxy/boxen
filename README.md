@@ -62,6 +62,13 @@ every 30 minutes. git and `gh` inside the container pick it up automatically.
 3. It prints the app's install link. Choose **All repositories** so repos you
    create later work without coming back, or pick specific ones.
 
+The app can only be installed on accounts you control, so a project cloned
+straight from someone else's repo gets no token. Pulling still works if the
+repo is public, and `boxen tokens` lists it as "not your repo". To push
+changes, fork it on GitHub and point the project's `origin` at your fork
+(`git remote rename origin upstream && git remote add origin <your fork>`);
+the next token refresh picks it up.
+
 It also sets your commit identity for containers to your GitHub name and
 **no-reply address** (`ID+username@users.noreply.github.com`), so your real
 email stays out of commits. If you've already set `GIT_AUTHOR_EMAIL` in
