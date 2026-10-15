@@ -55,8 +55,10 @@ every 30 minutes. git and `gh` inside the container pick it up automatically.
    private, no webhook, the permissions below). Click **Create GitHub App**,
    copy the **Client ID**, and click **Generate a private key** (a `.pem`
    downloads).
-2. Paste the Client ID, then paste the `.pem` file's contents (or its path, if
-   you've copied it to the VM).
+2. Paste the Client ID, then paste the `.pem` file's contents. The key isn't
+   shown as you paste (so it doesn't sit in your scrollback); a `*` appears
+   for each line received. If you've copied the file to the VM instead, run
+   `boxen github --key /path/to/file.pem`.
 3. It prints the app's install link. Choose **All repositories** so repos you
    create later work without coming back, or pick specific ones.
 
@@ -122,12 +124,16 @@ What `boxen new` does, in order:
 1. Builds the project image.
 2. Clones the repo, if you gave a URL.
 3. Signs you in to Claude (first project only; every project shares the login).
-   Open the URL it prints on any device, sign in, paste the code back.
-4. Runs two one-time prompts. Answer **y** to "trust this folder" and (first
-   time ever) "enable Remote Control", then press **Ctrl+C** once the session
-   URL/QR appears.
-5. Starts the container and checks it stays up. The project shows up in the
-   Claude app's Code tab as `<name>`.
+   Open the URL it prints on any device, sign in, then paste the code back
+   and press Enter. Nothing appears on screen while you paste; that's normal.
+4. Starts the container with your terminal attached, so you can answer
+   Claude's one-time prompts in the real server: **y** to "trust this folder"
+   and (first time ever) **y** to "enable Remote Control". As soon as the
+   server shows its session URL, boxen detaches on its own; the server keeps
+   running. (If it ever doesn't detach, press Ctrl+P then Ctrl+Q. Don't press
+   Ctrl+C, which stops the server.)
+5. Checks the server stays up. The project shows up in the Claude app's Code
+   tab as `<name>`.
 
 If anything fails or you interrupt it, `new` cleans up after itself so you
 can simply run it again.

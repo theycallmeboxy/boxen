@@ -39,7 +39,8 @@ Usage: boxen <command> [args]
 
 Setup
   setup                     First-time setup: env file, config volume, base image
-  github [--reset]          Connect GitHub: create/verify your GitHub App, set
+  github [--reset] [--key f.pem]
+                            Connect GitHub: create/verify your GitHub App, set
                             your no-reply commit identity, schedule token refresh
   new <name> [git-url]      Create a project and start its container.
                             git-url: optional HTTPS GitHub URL to clone into
@@ -205,8 +206,9 @@ logged_in() {
 
 do_login() {
   local args; mapfile -t args < <(base_args)
-  echo "    Open the URL it prints on any device, sign in with your claude.ai account,"
-  echo "    and paste the code back here."
+  echo "    Open the URL it prints on any device and sign in with your claude.ai account."
+  echo "    Then paste the code it gives you here and press Enter. Nothing appears on"
+  echo "    screen while you paste; that's normal."
   run_base -it "${args[@]}" "$BASE_IMAGE" claude auth login
 }
 
@@ -428,23 +430,37 @@ set_env() {
   fi
 }
 
-# Read a PEM private key pasted into the terminal, or a path to one, into $1.
+# read_key DEST [FILE]: copy a PEM private key from FILE, or read one pasted
+# into the terminal. A pasted key isn't echoed (it would sit in your scrollback);
+# a * appears for each line received instead.
 read_key() {
-  local dest=$1 first line
+  local dest=$1 src=${2:-} line n=0 started=0 tty=0
   (umask 077; : > "$dest")
-  IFS= read -r first
-  if [[ $first == -----BEGIN* ]]; then
-    {
-      printf '%s\n' "$first"
-      while IFS= read -r line; do
-        printf '%s\n' "$line"
-        [[ $line == -----END* ]] && break
-      done
-    } > "$dest"
+  if [[ -n "$src" ]]; then
+    src=${src/#\~/$HOME}
+    [[ -f $src ]] || { rm -f "$dest"; die "no such file: $src"; }
+    cat "$src" > "$dest"
   else
-    first=${first/#\~/$HOME}
-    [[ -f $first ]] || { rm -f "$dest"; die "no such file: $first"; }
-    cat "$first" > "$dest"
+    if [[ -t 0 ]]; then
+      tty=1
+      stty -echo
+      trap 'stty echo 2>/dev/null' EXIT
+    fi
+    while IFS= read -r line; do
+      # Ignore anything before the BEGIN line (stray whitespace, etc).
+      if (( ! started )); then
+        [[ $line == -----BEGIN* ]] || continue
+        started=1
+      fi
+      printf '%s\n' "$line" >> "$dest"
+      n=$((n + 1))
+      printf '*' >&2
+      [[ $line == -----END* ]] && break
+    done
+    if (( tty )); then stty echo; trap - EXIT; fi
+    printf '\n' >&2
+    (( n )) || { rm -f "$dest"; die "no key received"; }
+    info "received $n lines"
   fi
   openssl pkey -in "$dest" -noout 2>/dev/null || { rm -f "$dest"; die "that isn't a valid private key"; }
 }
@@ -456,10 +472,15 @@ cmd_github() {
   done
   [[ -f "$ENV_FILE" ]] || die "run 'boxen setup' first"
 
-  if [[ "${1:-}" == --reset ]]; then
-    rm -f "$GH_KEY" "$GH_CONF"
-    info "forgot the GitHub App; setting it up again"
-  fi
+  local keyfile=""
+  while (( $# )); do
+    case $1 in
+      --reset) rm -f "$GH_KEY" "$GH_CONF"; info "forgot the GitHub App; setting it up again" ;;
+      --key)   keyfile=${2:-}; [[ -n "$keyfile" ]] || die "--key needs a path to the .pem file"; shift ;;
+      *)       die "usage: boxen github [--reset] [--key file.pem]" ;;
+    esac
+    shift
+  done
   mkdir_private "$GH_DIR"
 
   # Who you are on GitHub: from the VM's gh login if there is one.
@@ -496,9 +517,14 @@ EOF
     read -rp "Client ID: " cid
     cid=${cid//[[:space:]]/}
     [[ -n "$cid" ]] || die "need the Client ID"
-    echo "Paste the private key (the whole .pem file, BEGIN through END line),"
-    echo "or type the path to the .pem file if you've copied it to this VM:"
-    read_key "$GH_KEY.tmp"
+    if [[ -n "$keyfile" ]]; then
+      read_key "$GH_KEY.tmp" "$keyfile"
+    else
+      echo "Now paste the private key: open the downloaded .pem file, copy all of it"
+      echo "(BEGIN through END line), and paste here. It won't be shown; you'll see"
+      echo "a * per line. (Or re-run with --key /path/to/file.pem if it's on this VM.)"
+      read_key "$GH_KEY.tmp"
+    fi
     mv -f "$GH_KEY.tmp" "$GH_KEY"
     set_app_conf CLIENT_ID "$cid"
   fi
@@ -570,20 +596,47 @@ render() {
       -e "s|__SRC__|$(sed_esc "$3")|g" "$1"
 }
 
-first_run() {
-  local name=$1
+# start_attached NAME: create the project's container and start it with this
+# terminal attached from its first line of output, so you can answer Claude's
+# one-time prompts (trust this folder; enable Remote Control) in the real
+# server. Once it prints its session URL, boxen detaches on its own and the
+# server keeps running.
+start_attached() {
+  local n=$1 c="boxen-$1" tmp watcher
+  dc "$n" up --no-start
+  tmp=$(mktemp -d)
   cat <<EOF
 
-==> One-time prompts for '$name'
-    Claude will ask you to trust this folder and, the very first time ever,
-    to enable Remote Control. Answer y to each.
-    When it shows the session URL / QR code, press Ctrl+C to continue.
+==> Starting '$n'. If Claude asks, answer y to trust this folder and (first
+    time only) y to enable Remote Control. boxen detaches by itself as soon as
+    the server is up. If it ever doesn't, press Ctrl+P then Ctrl+Q to detach;
+    don't use Ctrl+C, which would stop the server.
 
 EOF
-  read -rp "Press Enter to start... " _
-  trap ':' INT
-  dc "$name" run --rm --no-deps claude claude remote-control --name "$name" || true
-  trap - INT
+  # Watch the attached output for the session URL, then end the attachment
+  # (the docker client, not the container). Gives up after 10 minutes.
+  (
+    for _ in $(seq 600); do
+      if [[ -s "$tmp/pid" ]] && grep -q 'claude\.ai/code' "$tmp/out" 2>/dev/null; then
+        sleep 1    # let the rest of the banner arrive
+        kill -9 "$(cat "$tmp/pid")" 2>/dev/null || true
+        exit 0
+      fi
+      sleep 1
+    done
+  ) &
+  watcher=$!
+  # script(1) gives the attachment a terminal and copies its output to a file
+  # we can watch. The shell records its PID, then becomes the docker client.
+  script -qfec "echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" || true
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  stty sane 2>/dev/null || true
+  echo
+  if grep -q 'claude\.ai/code' "$tmp/out" 2>/dev/null; then
+    info "$n's Remote Control server is up"
+  fi
+  rm -rf "$tmp"
 }
 
 # After `up`, make sure the server stays running instead of crash-looping.
@@ -661,10 +714,7 @@ cmd_new() {
   refresh_project "$name" || true
 
   ensure_login
-  first_run "$name"
-
-  info "starting $name"
-  dc "$name" up -d
+  start_attached "$name"
 
   # From here on the project exists; keep it even if the health check fails.
   trap - EXIT
@@ -710,8 +760,7 @@ cmd_trust() {
   require_project "${1:-}"
   dc "$1" down
   refresh_project "$1" || true
-  first_run "$1"
-  dc "$1" up -d
+  start_attached "$1"
   check_running "$1"
 }
 
