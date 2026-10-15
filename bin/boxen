@@ -52,20 +52,21 @@ Setup
                             into the shared config
   config                    Shell in the shared ~/.claude (edit CLAUDE.md etc.)
 
-Day to day
+Day to day ("all" in place of <name> means every project)
   ls                        List projects and container status
-  up <name>                 Start (or apply boxen.env / project.env changes)
-  down <name>               Stop
-  restart <name>            Recreate the container (picks up env changes)
+  up <name|all>             Start (or apply boxen.env / project.env changes)
+  down <name|all>           Stop
+  restart <name|all>        Recreate the container (picks up env changes)
   logs <name> [-f]          Show the Remote Control server's output
   shell <name>              Bash shell inside the container
   claude <name> [args]      Interactive Claude session in the container's terminal
   trust <name>              Re-run the one-time trust / Remote Control prompts
 
 Maintenance
-  rebuild <name>            Rebuild one project image and recreate its container
-  tokens [name...]          Refresh GitHub tokens now (cron does it every 30 min)
-  regen <name>              Re-render compose.yaml from the current template
+  rebuild <name|all>        Rebuild the project image and recreate its container
+  tokens [name...|all]      Refresh GitHub tokens now (default all; cron does it
+                            every 30 min)
+  regen <name|all>          Re-render compose.yaml from the current template
                             (old one saved as compose.yaml.bak)
   update                    Rebuild base (fresh Ubuntu + Claude Code), then all projects
   rm <name>                 Remove a project's container, image and config
@@ -112,6 +113,27 @@ projects() {
   shopt -s nullglob
   local d
   for d in "$PROJECTS_DIR"/*/; do basename "$d"; done
+}
+
+# each <cmd_fn> <name|all> [args...]: run a per-project command for one
+# project, or for every project when the name is "all". Each project runs in
+# a subshell, so one failing doesn't stop the rest; failures are listed at the end.
+each() {
+  local fn=$1
+  shift
+  if [[ "${1:-}" != all ]]; then
+    "$fn" "$@"
+    return
+  fi
+  shift
+  local n failed=() any=0
+  while read -r n; do
+    any=1
+    info "--- $n"
+    ( "$fn" "$n" "$@" ) || failed+=("$n")
+  done < <(projects)
+  (( any )) || { info "no projects yet"; return 0; }
+  (( ${#failed[@]} == 0 )) || die "failed for: ${failed[*]}"
 }
 
 # ---------------------------------------------------------------- setup
@@ -346,7 +368,7 @@ refresh_project() {
 }
 
 cmd_tokens() {
-  local n failed=0 list=()
+  local n rc=0 list=()
   if [[ "${1:-}" == --quiet ]]; then
     # From cron: output goes to tokens.log, so stay silent unless something fails.
     QUIET=1
@@ -359,15 +381,16 @@ cmd_tokens() {
     [[ -n "${QUIET:-}" ]] || warn "GitHub isn't set up yet; run 'boxen github'"
     return 0
   fi
+  if [[ "${1:-}" == all ]]; then shift; fi
   if (( $# )); then
     for n in "$@"; do require_project "$n"; list+=("$n"); done
   else
     mapfile -t list < <(projects)
   fi
   for n in "${list[@]}"; do
-    refresh_project "$n" || failed=1
+    refresh_project "$n" || rc=1
   done
-  return "$failed"
+  return "$rc"
 }
 
 install_cron() {
@@ -524,9 +547,9 @@ EOF
   info "minting tokens for existing projects"
   cmd_tokens || true
   if (( ${#stale[@]} )); then
-    warn "these projects predate GitHub App support; run 'boxen regen <name>' for each: ${stale[*]}"
+    warn "these projects predate GitHub App support; run 'boxen regen all': ${stale[*]}"
   fi
-  info "GitHub is set up. Restart projects ('boxen restart <name>') to pick up the git identity."
+  info "GitHub is set up. Run 'boxen restart all' so running projects pick up the git identity."
 }
 
 # ------------------------------------------------------------ new project
@@ -593,6 +616,7 @@ cmd_new() {
     die "use the HTTPS form of the URL (https://github.com/owner/repo.git); containers authenticate over HTTPS with a GitHub token, not SSH keys"
   fi
   valid_name "$name"
+  [[ "$name" != all ]] || die "'all' is reserved (it means every project); pick another name"
   require_setup
 
   local pdir src
@@ -750,15 +774,15 @@ case "$cmd" in
   import)   cmd_import "$@" ;;
   config)   cmd_config ;;
   ls|list)  cmd_ls ;;
-  up)       cmd_up "$@" ;;
-  down)     cmd_down "$@" ;;
-  restart)  cmd_restart "$@" ;;
+  up)       each cmd_up "$@" ;;
+  down)     each cmd_down "$@" ;;
+  restart)  each cmd_restart "$@" ;;
   logs)     cmd_logs "$@" ;;
   shell)    cmd_shell "$@" ;;
   claude)   cmd_claude "$@" ;;
   trust)    cmd_trust "$@" ;;
-  rebuild)  cmd_rebuild "$@" ;;
-  regen)    cmd_regen "$@" ;;
+  rebuild)  each cmd_rebuild "$@" ;;
+  regen)    each cmd_regen "$@" ;;
   update)   cmd_update ;;
   rm)       cmd_rm "$@" ;;
   self-update) git -C "$BOXEN_REPO" pull --ff-only ;;

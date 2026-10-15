@@ -151,22 +151,27 @@ Everything in the shared `~/.claude` applies to every project.
 
 ## Commands
 
+`up`, `down`, `restart`, `rebuild`, `regen` and `tokens` accept `all` in
+place of a project name, for example `boxen regen all`. They carry on past a
+project that fails and list the failures at the end. (`rm` deliberately
+doesn't, and no project can be named `all`.)
+
 | Command | What it does |
 |---|---|
 | `boxen ls` | Projects, container status and restart counts |
 | `boxen github [--reset]` | Connect GitHub (or redo it with a new app/key) |
-| `boxen tokens [name...]` | Refresh GitHub tokens now and show their repos and expiry |
+| `boxen tokens [name...\|all]` | Refresh GitHub tokens now and show their repos and expiry |
 | `boxen logs <name> [-f]` | Remote Control server output |
 | `boxen shell <name>` | Bash inside the container |
 | `boxen claude <name>` | Terminal Claude session inside the container |
-| `boxen up <name>` | Start, or apply changes to `boxen.env` / `project.env` / `compose.yaml` |
-| `boxen down <name>` | Stop |
-| `boxen restart <name>` | Recreate the container (also picks up env changes) |
+| `boxen up <name\|all>` | Start, or apply changes to `boxen.env` / `project.env` / `compose.yaml` |
+| `boxen down <name\|all>` | Stop |
+| `boxen restart <name\|all>` | Recreate the container (also picks up env changes) |
 | `boxen trust <name>` | Re-run the one-time prompts |
 | `boxen login` | Sign in again, then restart running projects |
 | `boxen import <dir>` / `boxen config` | Manage the shared `~/.claude` |
-| `boxen rebuild <name>` | Apply edits to that project's Dockerfile |
-| `boxen regen <name>` | Replace its `compose.yaml` with the current template (old one kept as `.bak`) |
+| `boxen rebuild <name\|all>` | Apply edits to that project's Dockerfile |
+| `boxen regen <name\|all>` | Replace its `compose.yaml` with the current template (old one kept as `.bak`) |
 | `boxen update` | Fresh base image (Ubuntu patches + newest stable Claude Code), rebuild all |
 | `boxen self-update` | `git pull` this repo |
 | `boxen rm <name>` | Remove container, image and config; keeps the code and its Claude history |
@@ -177,7 +182,7 @@ Everything in the shared `~/.claude` applies to every project.
 |---|---|---|
 | Tools for every project | `~/.config/boxen/base.local.Dockerfile` | `boxen update` |
 | Tools for one project | `~/.config/boxen/projects/<name>/Dockerfile` | `boxen rebuild <name>` |
-| Env for every project | `~/.config/boxen/boxen.env` | `boxen restart <name>` per project |
+| Env for every project | `~/.config/boxen/boxen.env` | `boxen restart all` |
 | Env for one project | `~/.config/boxen/projects/<name>/project.env` | `boxen restart <name>` |
 | Container settings (limits, Remote Control flags) | `~/.config/boxen/projects/<name>/compose.yaml` | `boxen up <name>` |
 
@@ -195,7 +200,7 @@ USER your-username
 
 Don't edit files in this repo to customize; that would block
 `boxen self-update`. Template changes from later boxen versions reach
-existing projects only through `boxen regen <name>`.
+existing projects only through `boxen regen <name>` (or `boxen regen all`).
 
 ## Lifecycle and updates
 
