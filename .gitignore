@@ -1,4 +1,3 @@
-# Never commit secrets or per-machine state.
+# Never commit secrets.
 *.env
 !templates/*.env
-projects/

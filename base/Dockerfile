@@ -1,6 +1,11 @@
-# boxen base image: shared by every project container.
+# boxen core image (tagged boxen-base:core): shared by every project container.
 # Built by `boxen setup` / `boxen update` with your VM user's name and UID/GID,
 # so files Claude writes in ~/src show up as owned by you on the VM.
+#
+# Don't edit this file to add tools (it would block `boxen self-update`).
+# Put additions for every project in ~/.config/boxen/base.local.Dockerfile
+# (starting with FROM boxen-base:core), and per-project ones in that
+# project's Dockerfile.
 FROM ubuntu:24.04
 
 ARG USERNAME
@@ -11,11 +16,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-# Core tools. Add languages you want in EVERY project here;
-# project-specific toolchains go in that project's Dockerfile instead.
+# Core tools.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg git openssh-client sudo tmux less jq ripgrep \
+      ca-certificates curl gnupg git openssh-client tmux less jq ripgrep \
       build-essential python3 python3-venv python3-pip \
       unzip zip xz-utils procps tzdata \
  && rm -rf /var/lib/apt/lists/*
@@ -39,15 +43,15 @@ RUN install -d -m 0755 /etc/apt/keyrings \
  && rm -rf /var/lib/apt/lists/*
 
 # Your user, with the same UID/GID as on the VM. Ubuntu 24.04 images ship an
-# "ubuntu" user at UID 1000, so remove it first. Passwordless sudo lets Claude
-# apt-install things ad hoc; anything installed that way is lost on rebuild,
-# so make permanent additions in a Dockerfile. Delete the sudoers line to opt out.
+# "ubuntu" user at UID 1000, so remove it first.
+#
+# No sudo, on purpose: root in the container could leave a setuid-root binary
+# in ~/src, which is your home on the VM. Containers also run with
+# no-new-privileges. Install tools through the Dockerfiles instead.
 RUN test -n "$USERNAME" || (echo "USERNAME build arg is required" >&2; exit 1) \
  && (userdel -r ubuntu 2>/dev/null || true) \
  && (getent group "$USER_GID" >/dev/null || groupadd -g "$USER_GID" "$USERNAME") \
- && useradd -m -s /bin/bash -u "$USER_UID" -g "$USER_GID" "$USERNAME" \
- && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME" \
- && chmod 0440 "/etc/sudoers.d/$USERNAME" \
+ && useradd -l -m -s /bin/bash -u "$USER_UID" -g "$USER_GID" "$USERNAME" \
  && install -d -o "$USER_UID" -g "$USER_GID" \
       "/home/$USERNAME/.claude" "/home/$USERNAME/src"
 

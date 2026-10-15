@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # boxen installer. On a fresh Ubuntu VM, as your normal user:
 #
-#   git clone https://github.com/theycallmeboxy/boxen.git ~/boxen
+#   gh repo clone theycallmeboxy/boxen ~/boxen    (or git clone)
 #   ~/boxen/install.sh
 #
 # Safe to re-run: every step checks whether it's already done.
@@ -9,6 +9,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
+ME="$(id -un)"
 
 die()  { printf 'install: %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -18,11 +19,24 @@ info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" ]] || die "expected Ubuntu, found '${ID:-unknown}'"
 
-# 1. Docker CE + compose plugin, from Docker's own apt repo (not the snap).
+# The snap build of Docker can't see hidden dirs in your home (~/.config/boxen).
+if snap list docker >/dev/null 2>&1 \
+   || [[ "$(readlink -f "$(command -v docker 2>/dev/null || echo /nonexistent)")" == /snap/* ]]; then
+  die "Docker is installed as a snap, which boxen can't use. Remove it with 'sudo snap remove docker', then re-run."
+fi
+
+# 1. Docker CE + compose plugin, from Docker's own apt repo.
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
   info "Docker already installed"
 else
   info "installing Docker CE from download.docker.com"
+  # Ubuntu's own Docker packages conflict with Docker CE.
+  for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
+    if dpkg -s "$pkg" >/dev/null 2>&1; then
+      info "removing conflicting package $pkg"
+      sudo apt-get remove -y "$pkg"
+    fi
+  done
   sudo apt-get update
   sudo apt-get install -y ca-certificates curl git
   sudo install -m 0755 -d /etc/apt/keyrings
@@ -43,24 +57,27 @@ EOF
 fi
 
 # 2. Let your user run docker without sudo.
-if id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-  info "$USER is already in the docker group"
+if id -nG "$ME" | tr ' ' '\n' | grep -qx docker; then
+  info "$ME is already in the docker group"
 else
-  info "adding $USER to the docker group"
-  sudo usermod -aG docker "$USER"
+  info "adding $ME to the docker group"
+  sudo usermod -aG docker "$ME"
 fi
 
 # 3. Put the boxen command on your PATH.
 mkdir -p "$BIN_DIR"
-ln -sfn "$REPO_DIR/bin/boxen" "$BIN_DIR/boxen"
 chmod +x "$REPO_DIR/bin/boxen"
+ln -sfn "$REPO_DIR/bin/boxen" "$BIN_DIR/boxen"
 info "linked $BIN_DIR/boxen -> $REPO_DIR/bin/boxen"
 
-# 4. Run boxen setup. This shell may predate the docker group change, so use sg if needed.
+# 4. Run boxen setup. This shell may predate the docker group change, so use
+#    sg if needed (the path goes through the environment to avoid quoting issues).
+export BOXEN_BIN="$REPO_DIR/bin/boxen"
 if docker info >/dev/null 2>&1; then
-  "$REPO_DIR/bin/boxen" setup
+  "$BOXEN_BIN" setup
 else
-  sg docker -c "$(printf '%q' "$REPO_DIR/bin/boxen") setup"
+  # shellcheck disable=SC2016  # expanded by sg's shell, on purpose
+  sg docker -c '"$BOXEN_BIN" setup'
 fi
 
 cat <<EOF
@@ -68,5 +85,6 @@ cat <<EOF
 ==> Installed. Next:
     1. Log out and back in (picks up the docker group and ~/.local/bin on PATH).
     2. Edit ~/.config/boxen/boxen.env: GitHub token + git identity.
-    3. boxen new <name> https://github.com/<you>/<repo>.git
+    3. Optional: bring over your personal Claude config (see README, "Your Claude config").
+    4. boxen new <name> https://github.com/<you>/<repo>.git
 EOF
