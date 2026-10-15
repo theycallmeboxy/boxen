@@ -68,8 +68,12 @@ WORKDIR /home/$USERNAME
 ENV CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
 
 # For github.com, git asks git-credential-boxen (and only it) for credentials.
+# SSH-style GitHub remotes (common in repos brought over from a Mac) are
+# rewritten to HTTPS, since containers authenticate with tokens, not SSH keys.
 RUN git config --global init.defaultBranch main \
  && git config --global credential.https://github.com.helper '' \
- && git config --global --add credential.https://github.com.helper boxen
+ && git config --global --add credential.https://github.com.helper boxen \
+ && git config --global url.https://github.com/.insteadOf git@github.com: \
+ && git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
 
 CMD ["bash"]

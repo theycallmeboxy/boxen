@@ -114,10 +114,10 @@ Pick the case that matches what you have:
 boxen refuses to clone into a folder that already has files, so it never
 overwrites existing code.
 
-Use HTTPS URLs (`https://github.com/...`), not SSH (`git@github.com:...`).
 The clone runs inside the container with a token boxen mints for that repo
-(see "Connect GitHub"), which is what makes private repos work. The
-containers have no SSH keys.
+(see "Connect GitHub"), which is what makes private repos work. Containers
+have no SSH keys, so GitHub remotes in SSH form (`git@github.com:...`) are
+transparently used over HTTPS; either URL form works.
 
 What `boxen new` does, in order:
 
@@ -142,18 +142,82 @@ can simply run it again.
 
 Everything in the shared `~/.claude` applies to every project.
 
-- **Bring your personal config from another machine.** Copy your old
-  `~/.claude` folder to the VM (for example `scp -r ~/.claude vm:old-claude`),
-  then run `boxen import ~/old-claude`. It copies `CLAUDE.md`, `rules/`,
-  `skills/`, `agents/` and `commands/`. It deliberately skips `settings.json`
-  (it may hold Mac-specific paths or hooks; copy settings across by hand) and
-  per-project auto memory (that's keyed to the old machine's paths).
+- **Bring it from a Mac:** see "Moving from a Mac" below (it can bring just
+  the config with `--only config`).
+- **Bring it from a folder:** `boxen import <dir>` copies `CLAUDE.md`,
+  `rules/`, `skills/`, `agents/` and `commands/` from a copy of a `~/.claude`
+  folder you've put on the VM.
 - **Edit it later:** `boxen config` opens a shell in the shared `~/.claude`.
 - **Phone notifications** when a task finishes or Claude needs a decision:
   run `boxen claude <name>`, then `/config`, and turn on **Push when Claude
   decides** and/or **Push when actions required**. It's stored in the shared
   config, so once covers every project. The Claude app on your phone must be
   signed in to the same account.
+
+## Moving from a Mac
+
+Everything you had in Claude Code on a Mac can come over in one go: each
+project's code, Claude's auto memory for it, its session transcripts, and
+your personal config. The Mac pushes over the SSH you already use to reach
+the VM, so the VM never needs a connection to your LAN. Nothing on the Mac is
+changed or deleted.
+
+Set up boxen and run `boxen github` first, so projects get GitHub access as
+they arrive. Then `boxen import-mac` on the VM prints these commands with your
+details filled in. On the Mac:
+
+```bash
+scp you@vm:boxen/mac/boxen-export ~/boxen-export
+bash ~/boxen-export you@vm                          # everything
+bash ~/boxen-export you@vm --only memory,config     # just part of it
+```
+
+What happens:
+
+1. It finds every folder Claude Code has been used in (from the Mac's
+   `~/.claude.json`) and shows a **plan**: one project per line, named after
+   its folder. Your home folder, folders that no longer exist, and plain
+   folders that just contain several projects are left out. Folders inside a
+   project (subfolders, worktrees) come along with that project.
+2. You approve it, or edit it on the VM (rename projects, drop ones you don't
+   want, add skipped ones back).
+3. It rsyncs the code to `~/src/<name>`, including `.git` (unpushed commits,
+   stashes) and untracked files like `.env`, but skipping `node_modules`,
+   Python virtualenvs and caches; add more with `--exclude PATTERN`. Things
+   built on the Mac won't run in Linux containers anyway, so reinstall
+   dependencies on the VM.
+4. It puts Claude's data where the VM's Claude will look for it. Claude Code
+   files a folder's memory and sessions under its path, so they're re-filed
+   under each project's new path (`/Users/you/code/foo` becomes
+   `/home/you/src/foo`). Nothing already on the VM is overwritten.
+5. It creates a boxen project for each one and offers to start them (one `y`
+   per project for the trust prompt).
+
+Scopes for `--only` (comma-separated):
+
+| Scope | What comes over |
+|---|---|
+| `code` | Project folders, and a boxen project for each |
+| `memory` | Claude's auto memory per project |
+| `sessions` | Session transcripts per project (includes memory) |
+| `config` | `CLAUDE.md`, rules, skills, agents, commands and output styles from `~/.claude`; `settings.json` saved as `settings.mac.json` for reference (not active: hooks and paths in it are often Mac-specific); a list of your MCP servers |
+
+Good to know:
+
+- **Re-running syncs again**, and offers to reuse your previous plan so code
+  lands in the same projects. Without `code`, memory and sessions are filed
+  under the plan's names, so a later `boxen new <same name> <url>` picks them up.
+- **Sessions:** Claude Code keeps transcripts for 30 days by default (longer
+  for sessions started in the Desktop app), so older ones aren't there to
+  move. Imported ones show up in each project's resume list; their history
+  still mentions Mac paths, and rewind checkpoints don't carry over. For work
+  in progress, a handoff note or a pushed branch is the more reliable bridge.
+- **MCP servers** are listed (full settings in `~/.config/boxen/mac-mcp.json`)
+  rather than installed, since they often run Mac programs. Re-add the ones
+  you need. claude.ai connectors follow your account and need nothing.
+- **Plugins** synced to your claude.ai account download by themselves; others
+  you reinstall with `/plugin`.
+- Requires `rsync` on the Mac (built in) and SSH from the Mac to the VM.
 
 ## Commands
 
@@ -176,6 +240,7 @@ doesn't, and no project can be named `all`.)
 | `boxen trust <name>` | Re-run the one-time prompts |
 | `boxen login` | Sign in again, then restart running projects |
 | `boxen import <dir>` / `boxen config` | Manage the shared `~/.claude` |
+| `boxen import-mac` | How to move code, memory, sessions and config from a Mac (run on the Mac) |
 | `boxen rebuild <name\|all>` | Apply edits to that project's Dockerfile |
 | `boxen regen <name\|all>` | Replace its `compose.yaml` with the current template (old one kept as `.bak`) |
 | `boxen update` | Fresh base image (Ubuntu patches + newest stable Claude Code), rebuild all |

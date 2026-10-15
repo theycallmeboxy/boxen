@@ -52,6 +52,8 @@ Setup
                             from <dir> (e.g. a copy of your Mac's ~/.claude)
                             into the shared config
   config                    Shell in the shared ~/.claude (edit CLAUDE.md etc.)
+  import-mac                How to move your code, memory, sessions and config
+                            from a Mac (you run the export on the Mac)
 
 Day to day ("all" in place of <name> means every project)
   ls                        List projects and container status
@@ -653,6 +655,21 @@ check_running() {
   fi
 }
 
+# create_project NAME: write the project's compose.yaml and Dockerfile and
+# build its image. Its code folder (~/src/NAME) must already exist.
+create_project() {
+  local name=$1 pdir src
+  pdir=$(proj_dir "$name")
+  src="$SRC_ROOT/$name"
+  # Create the token dir yourself so Docker doesn't create it root-owned.
+  mkdir -p "$pdir"
+  mkdir_private "$(token_dir "$name")"
+  render "$BOXEN_REPO/templates/compose.yaml" "$name" "$src" > "$pdir/compose.yaml"
+  render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" > "$pdir/Dockerfile"
+  info "building image for $name"
+  dc "$name" build
+}
+
 # Set by cmd_new so a failed or interrupted run can be retried cleanly.
 NEW_NAME="" NEW_PDIR="" NEW_SRC="" NEW_CREATED_SRC=0
 new_cleanup() {
@@ -669,9 +686,9 @@ new_cleanup() {
 
 cmd_new() {
   local name=${1:-} url=${2:-}
-  [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]  (git-url optional; HTTPS GitHub URL to clone)"
-  if [[ "$url" == git@* || "$url" == ssh://* ]]; then
-    die "use the HTTPS form of the URL (https://github.com/owner/repo.git); containers authenticate over HTTPS with a GitHub token, not SSH keys"
+  [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]  (git-url optional; GitHub URL to clone)"
+  if [[ -n "$url" ]] && ! github_repo "$url" >/dev/null && [[ "$url" == git@* || "$url" == ssh://* ]]; then
+    die "only github.com repos can be cloned over SSH-style URLs (containers have no SSH keys); use the https:// URL"
   fi
   valid_name "$name"
   [[ "$name" != all ]] || die "'all' is reserved (it means every project); pick another name"
@@ -690,14 +707,9 @@ cmd_new() {
   [[ -d "$src" ]] || NEW_CREATED_SRC=1
   trap new_cleanup EXIT
 
-  # Create the code and token dirs yourself so Docker doesn't create them root-owned.
-  mkdir -p "$src" "$pdir"
-  mkdir_private "$(token_dir "$name")"
-  render "$BOXEN_REPO/templates/compose.yaml" "$name" "$src" > "$pdir/compose.yaml"
-  render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" > "$pdir/Dockerfile"
-
-  info "building image for $name"
-  dc "$name" build
+  # Create the code dir yourself so Docker doesn't create it root-owned.
+  mkdir -p "$src"
+  create_project "$name"
 
   if [[ -n "$url" ]]; then
     if app_configured; then
@@ -858,6 +870,10 @@ case "$cmd" in
   login)    cmd_login ;;
   import)   cmd_import "$@" ;;
   config)   cmd_config ;;
+  import-mac)
+    # shellcheck source=lib/import-mac.sh
+    source "$BOXEN_REPO/lib/import-mac.sh"
+    cmd_import_mac "$@" ;;
   ls|list)  cmd_ls ;;
   up)       each cmd_up "$@" ;;
   down)     each cmd_down "$@" ;;

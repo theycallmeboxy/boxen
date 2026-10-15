@@ -1,0 +1,160 @@
+#!/bin/bash
+# boxen-export: move your Claude Code work from this Mac into a boxen VM.
+#
+#   bash boxen-export you@your-vm [--only code,memory,sessions,config]
+#                                 [--exclude PATTERN]... [--yes]
+#
+# Runs on the Mac and pushes over SSH (rsync), so the VM never needs to reach
+# your LAN. Nothing on the Mac is changed or deleted. Re-running syncs again.
+#
+# Scopes (default: all of them):
+#   code      each project folder, minus node_modules, virtualenvs and caches
+#   memory    Claude's auto memory for each project
+#   sessions  session transcripts (includes memory)
+#   config    ~/.claude CLAUDE.md, rules, skills, agents, commands, output
+#             styles; settings.json for reference; your MCP server list
+#
+# Written for the bash that ships with macOS (3.2).
+
+set -e
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+VM="" ONLY="all" YES=0
+EXCLUDES="node_modules .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS_Store .next .turbo .parcel-cache .gradle"
+while [ $# -gt 0 ]; do
+  case $1 in
+    --only)    ONLY=$2; shift ;;
+    --only=*)  ONLY=${1#--only=} ;;
+    --exclude) EXCLUDES="$EXCLUDES $2"; shift ;;
+    --yes|-y)  YES=1 ;;
+    -h|--help) usage 0 ;;
+    -*)        echo "unknown option: $1" >&2; usage 1 ;;
+    *)         [ -z "$VM" ] || usage 1; VM=$1 ;;
+  esac
+  shift
+done
+[ -n "$VM" ] || usage 1
+
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+die()  { printf 'boxen-export: %s\n' "$*" >&2; exit 1; }
+want() { case ",$ONLY," in *,all,*|*,"$1",*) return 0 ;; esac; return 1; }
+
+for s in $(echo "$ONLY" | tr ',' ' '); do
+  case $s in all|code|memory|sessions|config) ;; *) die "unknown scope '$s'" ;; esac
+done
+
+# One SSH sign-in for the whole run.
+CTL="/tmp/boxen-export-$$"
+SSH="${BOXEN_EXPORT_SSH:-ssh} -o ControlMaster=auto -o ControlPath=$CTL -o ControlPersist=600"
+PROBE_FILE=$(mktemp "${TMPDIR:-/tmp}/boxen-probe.XXXXXX")
+cleanup() { $SSH -O exit "$VM" >/dev/null 2>&1 || true; rm -f "$PROBE_FILE" "$PROBE_FILE.data"; }
+trap cleanup EXIT
+
+# boxen lives in ~/.local/bin, which non-interactive SSH sessions don't
+# always have on PATH. vm: no input; vm_in: input from stdin; vm_t: interactive.
+# shellcheck disable=SC2016  # $HOME expands on the VM, not here
+BOXEN='$HOME/.local/bin/boxen import-mac'
+vm()    { $SSH "$VM" "$BOXEN $*" < /dev/null; }
+vm_in() { $SSH "$VM" "$BOXEN $*"; }
+vm_t()  { $SSH -t "$VM" "$BOXEN $*"; }
+
+info "connecting to $VM"
+$SSH -o ConnectTimeout=15 "$VM" true < /dev/null || die "can't SSH to $VM"
+BEGIN=$(vm _begin) || die "boxen on $VM isn't ready (has 'boxen setup' run there?)"
+STAGE=$(printf '%s\n' "$BEGIN" | sed -n 's/^STAGE=//p')
+HAS_PLAN=$(printf '%s\n' "$BEGIN" | sed -n 's/^PLAN=//p')
+[ -n "$STAGE" ] || die "unexpected reply from $VM: $BEGIN"
+
+push() { rsync -a -e "$SSH" "$@"; }
+
+# 1. The project list comes from ~/.claude.json, which records every folder
+#    Claude Code has been used in.
+if [ -f "$HOME/.claude.json" ]; then
+  push "$HOME/.claude.json" "$VM:$STAGE/claude.json"
+fi
+
+# 2. Check each folder here (exists? git? size?) and let the VM build a plan.
+info "looking at the folders Claude Code has been used in"
+{
+  printf '#home\t%s\n' "$HOME"
+  vm _paths | while IFS= read -r p; do
+    e=0 g=0 kb=0
+    if [ -d "$p" ]; then
+      e=1
+      [ -e "$p/.git" ] && g=1
+      if want code; then kb=$(du -sk "$p" 2>/dev/null | cut -f1); fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$e" "$g" "${kb:-0}" "$p"
+  done
+} > "$PROBE_FILE"
+
+# A plan from an earlier run keeps your names, so a re-run syncs into the
+# same projects.
+KEEP=""
+if [ "$HAS_PLAN" = 1 ]; then
+  if [ "$YES" = 1 ]; then
+    KEEP="--keep"
+  else
+    printf 'Use the plan from your last import (keeps your project names)? [Y/n]: '
+    read -r ans
+    case $ans in n|N|no) ;; *) KEEP="--keep" ;; esac
+  fi
+fi
+vm_in _plan $KEEP < "$PROBE_FILE"
+
+# 3. Review.
+if [ "$YES" != 1 ]; then
+  while :; do
+    printf 'Copy this to %s? [y]es / [e]dit the plan / [n]o: ' "$VM"
+    read -r ans
+    case $ans in
+      y|Y|yes) break ;;
+      e|E|edit) vm_t _edit; vm _show ;;
+      *) echo "Nothing copied."; exit 0 ;;
+    esac
+  done
+fi
+
+# 4. Push what the plan and scopes call for.
+TODO=$(vm _transfers "$ONLY")
+EX_ARGS=""
+for x in $EXCLUDES; do EX_ARGS="$EX_ARGS --exclude=$x"; done
+
+# Claude data: parents first (one SSH call), then one rsync per item.
+DIRS=""
+printf '%s\n' "$TODO" | while IFS="$(printf '\t')" read -r kind rel _; do
+  [ "$kind" = DATA ] || continue
+  [ -e "$HOME/.claude/$rel" ] || continue
+  printf '%s\n' "$rel"
+done > "$PROBE_FILE.data"
+if [ -s "$PROBE_FILE.data" ]; then
+  while IFS= read -r rel; do
+    DIRS="$DIRS '$STAGE/claude/$(dirname "$rel")'"
+  done < "$PROBE_FILE.data"
+  $SSH "$VM" "mkdir -p $DIRS"
+  n=$(wc -l < "$PROBE_FILE.data" | tr -d ' ')
+  info "copying Claude data ($n items)"
+  while IFS= read -r rel; do
+    if [ -d "$HOME/.claude/$rel" ]; then
+      push "$HOME/.claude/$rel/" "$VM:$STAGE/claude/$rel/"
+    else
+      push "$HOME/.claude/$rel" "$VM:$STAGE/claude/$rel"
+    fi
+  done < "$PROBE_FILE.data"
+fi
+rm -f "$PROBE_FILE.data"
+
+# Code: one rsync per project into ~/src/<name> on the VM.
+printf '%s\n' "$TODO" | while IFS="$(printf '\t')" read -r kind name path dest; do
+  [ "$kind" = CODE ] || continue
+  if [ ! -d "$path" ]; then echo "  $name: $path is gone; skipped"; continue; fi
+  info "copying $name ($path)"
+  $SSH "$VM" "mkdir -p '$dest'" < /dev/null
+  # shellcheck disable=SC2086  # EX_ARGS is a list of --exclude=... words
+  push $EX_ARGS "$path/" "$VM:$dest/" < /dev/null
+done
+
+# 5. The VM puts the Claude data in place and sets up the projects.
+info "finishing on $VM"
+vm_t _apply "$ONLY"
