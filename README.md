@@ -276,7 +276,7 @@ doesn't, and no project can be named `all`.)
 
 | Command | What it does |
 |---|---|
-| `boxen ls` | Projects, container status and restart counts |
+| `boxen ls` | Projects: container status, and whether each server is connected, reconnecting, or waiting on you |
 | `boxen github [--reset]` | Connect GitHub (or redo it with a new app/key) |
 | `boxen tokens [name...\|all]` | Refresh GitHub tokens now and show their repos and expiry |
 | `boxen logs <name> [-f]` | Remote Control server output |
@@ -304,7 +304,7 @@ doesn't, and no project can be named `all`.)
 | Tools for one project | `~/.config/boxen/projects/<name>/Dockerfile` | `boxen rebuild <name>` |
 | Env for every project | `~/.config/boxen/boxen.env` | `boxen restart all` |
 | Env for one project | `~/.config/boxen/projects/<name>/project.env` | `boxen restart <name>` |
-| Container settings (limits, Remote Control flags) | `~/.config/boxen/projects/<name>/compose.yaml` | `boxen up <name>` |
+| Container settings (limits, Remote Control flags such as `--spawn=worktree`) | `~/.config/boxen/projects/<name>/compose.yaml` | `boxen up <name>` |
 
 `base.local.Dockerfile` must start with `FROM boxen-base:core`. Containers
 have no sudo, so install as root there and switch back to your user:
@@ -388,8 +388,10 @@ The VM is the hard boundary. Inside it:
 
 ## Troubleshooting
 
-- **A project doesn't show in the app:** `boxen ls`. A climbing restart count
-  means the server keeps exiting; `boxen logs <name>` says why.
+- **A project doesn't show in the app:** `boxen ls`. The SERVER column says
+  what's wrong and what to run: "waiting for an answer" or "not trusted"
+  → `boxen trust <name>`; "not signed in" → `boxen login`. A climbing
+  restart count means the server keeps exiting; `boxen logs <name>` says why.
 - **Sign-in expired or wrong account:** `boxen login`.
 - **"Workspace not trusted" in the logs:** `boxen trust <name>` and answer
   the prompt. (Before the fix for "This terminal did not report its size",

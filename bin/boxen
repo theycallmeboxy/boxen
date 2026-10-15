@@ -590,17 +590,47 @@ EOF
 
 # ------------------------------------------------------------ new project
 
-# Strip terminal control sequences (colors, cursor moves, screen clears,
-# window titles) and stray control characters, leaving readable text.
+# Turn the server's terminal output into plain text: strip control sequences
+# (colors, cursor moves, clears, window titles) and stray control characters.
+# The server redraws its status box in place (cursor up, then repaint), which
+# in a log becomes the same lines over and over; after a redraw, lines already
+# shown in the previous or current paint are skipped, so you see changes only.
+# perl works on raw bytes, so this behaves the same in any locale (sed's
+# character ranges don't under en_US.UTF-8).
 plain_text() {
-  sed -u -E \
-      -e 's#\x1b\[[0-9;?<>=]*[ -/]*[@-~]##g' \
-      -e 's/\x1b\][^\x07\x1b]*(\x07|\x1b\\)//g' \
-      -e 's/\x1b[()*+][0-9A-Za-z]//g' \
-      -e 's/\x1b[=>78DEHMNOZc]//g' \
-      -e 's/\r/\n/g' \
-    | tr -d '\000-\010\013\014\016-\037\177' \
-    | sed -u -E '/^[[:space:]]*$/d'
+  LC_ALL=C perl -ne '
+    BEGIN { $| = 1; our ($redraw, %prev, %cur) = (0) }
+    if (/\e\[[0-9]*A/) { $redraw = 1; %prev = %cur; %cur = () }
+    s/\e\[[0-9;?<>=!]*[ -\/]*[@-~]//g;      # CSI: colors, cursor, clears
+    s/\e\][^\a\e]*(?:\a|\e\\)//g;           # OSC: window titles, links
+    s/\e[()*+][0-9A-Za-z]//g;               # charset selection
+    s/\e[=>78DEHMNOZc]//g;                  # other short escapes
+    for my $l (split /\r|\n/) {
+      $l =~ tr/\000-\010\013-\037\177//d;
+      $l =~ s/\s+$//;
+      next unless $l =~ /\S/;
+      if ($redraw) { my $seen = $prev{$l} || $cur{$l}; $cur{$l} = 1; next if $seen }
+      print "$l\n";
+    }'
+}
+
+# server_state NAME: what the project's Remote Control server is doing, read
+# from its output since the container last started. A container can be
+# "running" while the server inside sits at a question nobody can answer, so
+# `boxen ls` and the checks after starting a project use this.
+server_state() {
+  local n=$1 started
+  started=$(docker inspect -f '{{.State.StartedAt}}' "boxen-$n" 2>/dev/null) || { echo "not created"; return; }
+  docker logs --since "$started" --tail 300 "boxen-$n" 2>&1 | plain_text | perl -ne '
+    BEGIN { $s = "starting" }
+    if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen trust NAME" }
+    elsif (/not logged in|please (log|sign) in|claude (auth )?login/i)
+                                                         { $s = "not signed in: run boxen login" }
+    elsif (/Spawn mode for this project/)                { $s = "waiting for an answer: run boxen trust NAME" }
+    elsif (/\[y\/N\]\s*$|\[Y\/n\]\s*$/)                  { $s = "waiting for an answer: run boxen trust NAME" }
+    elsif (/Reconnecting/)                               { $s = "reconnecting" }
+    elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected" }
+    END   { print "$s\n" }' | sed "s/NAME/$n/" || true
 }
 
 # Escape a value for use as a sed replacement (we use | as the delimiter).
@@ -635,7 +665,9 @@ EOF
   # (the docker client, not the container). Gives up after 10 minutes.
   (
     for _ in $(seq 600); do
-      if [[ -s "$tmp/pid" ]] && grep -q 'claude\.ai/code' "$tmp/out" 2>/dev/null; then
+      # The session URL (claude.ai/code?environment=...), not just any mention
+      # of claude.ai/code: the server's one-time questions mention it too.
+      if [[ -s "$tmp/pid" ]] && grep -q 'claude\.ai/code?environment=' "$tmp/out" 2>/dev/null; then
         sleep 1    # let the rest of the banner arrive
         kill -9 "$(cat "$tmp/pid")" 2>/dev/null || true
         exit 0
@@ -651,7 +683,7 @@ EOF
   wait "$watcher" 2>/dev/null || true
   stty sane 2>/dev/null || true
   echo
-  if grep -q 'claude\.ai/code' "$tmp/out" 2>/dev/null; then
+  if grep -q 'claude\.ai/code?environment=' "$tmp/out" 2>/dev/null; then
     info "$n's Remote Control server is up"
   fi
   rm -rf "$tmp"
@@ -669,6 +701,12 @@ check_running() {
     warn "fix the cause, then 'boxen up $n'. If it's a sign-in problem: 'boxen login'."
     return 1
   fi
+  st=$(server_state "$n")
+  case $st in
+    connected|reconnecting) info "$n is $st; it's in the Claude app's Code tab" ;;
+    starting) info "$n's server is still starting; check with 'boxen ls'" ;;
+    *) warn "$n's server is $st"; return 1 ;;
+  esac
 }
 
 # create_project NAME: write the project's compose.yaml and Dockerfile and
@@ -753,17 +791,23 @@ cmd_new() {
 
 # -------------------------------------------------------------- day to day
 
+# Each project's container, and whether its server is actually connected
+# (a running container can hold a server stuck at a question).
 cmd_ls() {
-  printf '%-24s %s\n' PROJECT STATUS
-  local n st k
+  printf '%-24s %-12s %s\n' PROJECT CONTAINER SERVER
+  local n c st k
   while read -r n; do
-    st=$(docker inspect -f '{{.State.Status}}  (restarts: {{.RestartCount}}, started {{.State.StartedAt}})' \
-           "boxen-$n" 2>/dev/null) || st="not created"
-    if [[ $st == running* ]]; then
+    c=$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "boxen-$n" 2>/dev/null) || c="-"
+    st="-"
+    if [[ $c == running* ]]; then
+      st=$(server_state "$n")
       k=$(docker exec "boxen-$n" boxen-sessions count 2>/dev/null || true)
-      [[ -n $k && $k != 0 ]] && st+=", $k resumed session(s) open"
+      [[ -n $k && $k != 0 ]] && st+=" (+$k resumed session(s))"
     fi
-    printf '%-24s %s\n' "$n" "$st"
+    [[ $c == *" 0" ]] && c=${c% 0}
+    [[ $c == *" "* ]] && c="${c% *} (${c##* } restarts)"
+    [[ $c == "-" ]] && c="not created"
+    printf '%-24s %-12s %s\n' "$n" "$c" "$st"
   done < <(projects)
 }
 

@@ -19,8 +19,10 @@ services:
     # and auto memory by path, and git worktrees store absolute paths.
     working_dir: __SRC__
     # Remote Control server; shows up in the Claude app's Code tab as "__NAME__".
-    # Optional flags: "--permission-mode", "acceptEdits"  |  "--spawn", "worktree"
-    command: ["claude", "remote-control", "--name", "__NAME__"]
+    # --spawn is set so the server never stops to ask (it runs unattended).
+    # same-dir: sessions work in this folder. worktree: each session gets its
+    # own git worktree. Also optional: "--permission-mode=acceptEdits".
+    command: ["claude", "remote-control", "--name", "__NAME__", "--spawn=same-dir"]
     env_file:
       # Shared by every project: git identity, TZ.
       - path: ../../boxen.env
