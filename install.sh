@@ -91,6 +91,9 @@ else
   sg docker -c '"$BOXEN_BIN" setup'
 fi
 
+# `boxen self-update` runs this too and prints its own summary.
+[[ -z "${BOXEN_SELF_UPDATE:-}" ]] || exit 0
+
 cat <<EOF
 
 ==> Installed. Next:

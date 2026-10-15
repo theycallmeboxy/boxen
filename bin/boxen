@@ -71,7 +71,8 @@ Maintenance
   update                    Rebuild base (fresh Ubuntu + Claude Code), then all projects
   rm <name>                 Remove a project's container, image and config
                             (leaves ~/src/<name> alone)
-  self-update               git pull this boxen repo (then run 'update' to apply)
+  self-update               Pull the latest boxen and re-run its installer, then
+                            say which projects need 'regen' or 'rebuild'
 EOF
 }
 
@@ -761,6 +762,37 @@ cmd_rm() {
   info "removed '$name'. Code in $SRC_ROOT/$name and its Claude history in the shared config are kept."
 }
 
+cmd_self_update() {
+  local old new changed
+  old=$(git -C "$BOXEN_REPO" rev-parse HEAD)
+  git -C "$BOXEN_REPO" pull --ff-only \
+    || die "couldn't fast-forward $BOXEN_REPO. If you edited files there, move those changes to ~/.config/boxen (see README, Customizing) and retry."
+  new=$(git -C "$BOXEN_REPO" rev-parse HEAD)
+  if [[ "$old" == "$new" ]]; then
+    info "boxen is already up to date"
+    return 0
+  fi
+  info "updated boxen:"
+  git -C "$BOXEN_REPO" log --oneline --no-decorate "$old..$new" | sed 's/^/    /'
+  changed=$(git -C "$BOXEN_REPO" diff --name-only "$old" "$new")
+
+  # The new installer: VM prerequisites, PATH link, base image. (This script
+  # keeps running from the old copy it already opened, which is fine.)
+  info "running the updated installer"
+  BOXEN_SELF_UPDATE=1 "$BOXEN_REPO/install.sh"
+
+  # What existing projects need. Neither step runs on its own: both restart
+  # containers (interrupting a turn in progress), and regen replaces any edits
+  # to compose.yaml (keeping a .bak).
+  [[ -n "$(projects)" ]] || return 0
+  if grep -qE '^templates/compose\.yaml$' <<<"$changed"; then
+    warn "the project compose template changed: run 'boxen regen all' (your current files are kept as compose.yaml.bak)"
+  fi
+  if grep -qE '^(base/|templates/Dockerfile$)' <<<"$changed"; then
+    warn "the base image changed: run 'boxen rebuild all' so projects use it"
+  fi
+}
+
 # ------------------------------------------------------------------- main
 
 cmd=${1:-help}
@@ -785,7 +817,7 @@ case "$cmd" in
   regen)    each cmd_regen "$@" ;;
   update)   cmd_update ;;
   rm)       cmd_rm "$@" ;;
-  self-update) git -C "$BOXEN_REPO" pull --ff-only ;;
+  self-update) cmd_self_update ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac

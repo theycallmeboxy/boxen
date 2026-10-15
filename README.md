@@ -173,7 +173,7 @@ doesn't, and no project can be named `all`.)
 | `boxen rebuild <name\|all>` | Apply edits to that project's Dockerfile |
 | `boxen regen <name\|all>` | Replace its `compose.yaml` with the current template (old one kept as `.bak`) |
 | `boxen update` | Fresh base image (Ubuntu patches + newest stable Claude Code), rebuild all |
-| `boxen self-update` | `git pull` this repo |
+| `boxen self-update` | Update boxen itself (pull + re-run the installer) and say what projects need |
 | `boxen rm <name>` | Remove container, image and config; keeps the code and its Claude history |
 
 ## Customizing
@@ -213,16 +213,28 @@ is gone after a rebuild.
 the Remote Control server exits during a long network outage. Sessions
 reconnect if the server restarts in the same folder within about 4 hours.
 
-Claude Code comes from Anthropic's signed apt repo (stable channel) and
-doesn't auto-update inside containers. Upgrade monthly or when you want a
-new release:
+There are two kinds of update:
+
+- **`boxen self-update`** updates boxen itself. It pulls this repo, shows
+  what changed, and re-runs `install.sh` (prerequisites, PATH link, base
+  image). Then it tells you if your projects need `boxen regen all` (the
+  compose template changed) or `boxen rebuild all` (the base image changed).
+  It doesn't run those for you, since both restart containers and `regen`
+  replaces any edits to `compose.yaml` (keeping a `.bak`).
+- **`boxen update`** updates what runs in the containers: a fresh Ubuntu base
+  with current patches and the newest stable Claude Code, then a rebuild of
+  every project. Claude Code comes from Anthropic's signed apt repo and
+  doesn't auto-update inside containers, so this is how you upgrade it.
+
+Doing both monthly is reasonable:
 
 ```bash
 boxen self-update && boxen update
 ```
 
-`update` keeps going if one project fails to rebuild and lists the failures
-at the end. It also prunes old build cache.
+`update` rebuilds every project, so after it you don't also need
+`rebuild all`. It keeps going if one project fails, lists the failures at the
+end, and prunes old build cache.
 
 Backups: Proxmox backups of the VM cover `~/src` and the `claude-config`
 volume. They also contain the GitHub App's private key and your Claude login,
