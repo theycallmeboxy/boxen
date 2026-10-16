@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""boxen-agentd: runs an allowlisted subset of boxen for the supervisor project.
+
+Listens on a unix socket ($BOXEN_HOME/agent/agent.sock, mode 0600). The
+supervisor container has that folder mounted and its `boxen` command
+(base/boxen-client) sends one request per connection:
+
+    {"argv": ["up", "caulker"]}          (without the leading "boxen")
+
+and gets JSON lines back as the command prints:
+
+    {"out": "<line>"} ...  then  {"exit": N}
+    {"error": "<why>"} then {"exit": 2}  for anything not allowed
+
+The request is checked against the allowlist below (verbs, argument shapes)
+before anything runs; what passes is run as [bin/boxen, *argv] with
+BOXEN_AGENT=1, no shell, stdin from /dev/null, in $HOME. One command at a
+time (a second request gets "busy"), 30 minutes each. Every request is
+logged to $BOXEN_HOME/agent.log. No Claude runs on the VM: this is a dumb
+relay, and the policy is here, not in the container.
+
+Installed as a systemd user service (boxen-agent.service) by install.sh.
+After an update of this file (boxen self-update, run through the agent
+itself), the agent re-executes itself once the running command is done.
+"""
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+BOXEN_HOME = os.environ.get("BOXEN_HOME") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "boxen")
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BOXEN = os.path.join(REPO, "bin", "boxen")
+AGENT_DIR = os.path.join(BOXEN_HOME, "agent")
+SOCK = os.path.join(AGENT_DIR, "agent.sock")
+LOG = os.path.join(BOXEN_HOME, "agent.log")
+TIMEOUT = 30 * 60
+MAX_REQUEST = 64 * 1024
+
+NAME = re.compile(r"^[a-z0-9]+([_-][a-z0-9]+)*$")
+NUMBER = re.compile(r"^[0-9]+$")
+SESSION = re.compile(r"^[0-9a-f-]{4,36}$")
+# owner and repo as GitHub shapes them: start alphanumeric, no trailing . or -
+# (and no ".." anywhere, checked separately).
+_SEG = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?"
+GITHUB_URL = re.compile(r"^https://github\.com/%s/%s(\.git)?$" % (_SEG, _SEG))
+TAIL_MAX = 5000
+ANSI = re.compile(r"\x1b\[[0-9;?<>=!]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+][0-9A-Za-z]|\x1b[=>78DEHMNOZc]")
+
+
+# --- allowlist ---------------------------------------------------------
+#
+# Each verb has a checker: args -> None when allowed, else why not. Options
+# are matched by exact string; nothing is ever interpreted by a shell.
+
+def name(a, allow_all=False):
+    if allow_all and a == "all":
+        return True
+    return bool(NAME.match(a)) and len(a) <= 40
+
+
+def flags(args, allowed):
+    """Options at the end of args, each one from allowed (a dict of option ->
+    number of values it takes), each at most once. Returns an error or None."""
+    seen = set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a not in allowed:
+            return "unexpected argument %r" % a
+        if a in seen:
+            return "option %s given twice" % a
+        seen.add(a)
+        n = allowed[a]
+        vals = args[i + 1:i + 1 + n]
+        if len(vals) < n:
+            return "%s needs a value" % a
+        if a == "--approve" and vals != ["trust"]:
+            return "--approve takes 'trust'"
+        if a == "--tail" and not (NUMBER.match(vals[0]) and 1 <= int(vals[0]) <= TAIL_MAX):
+            return "--tail needs a number of lines, 1 to %d" % TAIL_MAX
+        i += 1 + n
+    return None
+
+
+def check_ls(args):
+    return None if not args else "ls takes no arguments"
+
+
+def check_start(args):
+    if not args or not name(args[0], allow_all=True):
+        return "needs a project name (or all)"
+    if args[0] == "all" and "--approve" in args[1:]:
+        return "approve one project at a time, not all"
+    return flags(args[1:], {"--approve": 1})
+
+
+def check_down(args):
+    if len(args) != 1 or not name(args[0], allow_all=True):
+        return "needs a project name (or all), nothing else"
+    if args[0] == "supervisor":
+        return "the supervisor can't stop itself; from a terminal on the VM: boxen down supervisor"
+    return None
+
+
+def check_logs(args):
+    if not args or not name(args[0]):
+        return "needs a project name"
+    if "-f" in args or "--follow" in args:
+        return "logs -f isn't available here; use --tail"
+    return flags(args[1:], {"--tail": 1})
+
+
+def check_update(args):
+    if not args:
+        return None
+    if len(args) != 1 or not name(args[0], allow_all=True):
+        return "takes a project name or all, nothing else"
+    return None
+
+
+def check_self_update(args):
+    return None if not args else "self-update takes no arguments"
+
+
+def check_new(args):
+    if not args or not name(args[0]):
+        return "needs a project name"
+    if args[0] in ("all", "supervisor"):
+        return "'%s' is reserved" % args[0]
+    rest = args[1:]
+    if rest and not rest[0].startswith("-"):
+        if not GITHUB_URL.match(rest[0]) or ".." in rest[0]:
+            return "only https://github.com/owner/repo URLs can be cloned"
+        rest = rest[1:]
+    return flags(rest, {"--approve": 1})
+
+
+def check_resume(args):
+    if not args or not name(args[0]):
+        return "needs a project name"
+    rest = args[1:]
+    if rest and not rest[0].startswith("-"):
+        if not (NUMBER.match(rest[0]) or SESSION.match(rest[0])):
+            return "pick a session by its number or id prefix"
+        rest = rest[1:]
+    if "--attach" in rest:
+        return "resume --attach needs a terminal"
+    return flags(rest, {"--stop": 0, "--force": 0})
+
+
+def check_rm(args):
+    if not args or not name(args[0]):
+        return "needs a project name"
+    if args[0] == "supervisor":
+        return "the supervisor can't remove itself; from a terminal on the VM: boxen rm supervisor"
+    return flags(args[1:], {"--yes": 0})
+
+
+def check_tokens(args):
+    if not args:
+        return None
+    if len(args) != 1 or not name(args[0], allow_all=True):
+        return "takes a project name or all, nothing else"
+    return None
+
+
+VERBS = {
+    "ls": check_ls,
+    "up": check_start,
+    "restart": check_start,
+    "down": check_down,
+    "logs": check_logs,
+    "update": check_update,
+    "self-update": check_self_update,
+    "new": check_new,
+    "resume": check_resume,
+    "rm": check_rm,
+    "tokens": check_tokens,
+}
+
+
+def validate(argv):
+    """The reason argv isn't allowed, or None."""
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        return "argv must be a non-empty list of strings"
+    for a in argv:
+        if not a or len(a) > 256 or not a.isprintable() or any(c.isspace() for c in a):
+            return "argument %r isn't allowed" % a[:40]
+    verb = argv[0]
+    if verb not in VERBS:
+        return "'%s' isn't available here (allowed: %s)" % (verb, ", ".join(VERBS))
+    why = VERBS[verb](argv[1:])
+    return "%s: %s" % (verb, why) if why else None
+
+
+# --- running -----------------------------------------------------------
+
+lock = threading.Lock()
+running = [None]          # argv of the command running now
+log_lock = threading.Lock()
+started_mtime = os.stat(os.path.realpath(__file__)).st_mtime
+
+
+def log(argv, result):
+    line = "%s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), json.dumps(argv), result)
+    with log_lock:
+        try:
+            if os.path.getsize(LOG) > 1000000:
+                open(LOG, "w").close()
+        except OSError:
+            pass
+        with open(LOG, "a") as f:
+            f.write(line)
+
+
+def send(conn, obj):
+    conn.sendall((json.dumps(obj) + "\n").encode())
+
+
+def run(conn, argv):
+    """Run boxen, relaying its output to conn. Returns (exit code, note):
+    the note is "" normally, "timed out" or "client gone". The lock is held
+    by the caller, which sends the final reply after releasing it, so a
+    client that stops reading can hold things up for at most the 60s send
+    timeout: then it's taken as gone and the command is killed."""
+    env = dict(os.environ, BOXEN_AGENT="1")
+    proc = subprocess.Popen([BOXEN] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, cwd=HOME, env=env, start_new_session=True)
+    note = [""]
+
+    def kill(why):
+        note[0] = why
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    timer = threading.Timer(TIMEOUT, kill, ("timed out",))
+    timer.start()
+    conn.settimeout(60)
+    try:
+        for raw in proc.stdout:
+            line = ANSI.sub("", raw.decode("utf-8", "replace")).rstrip("\r\n")
+            send(conn, {"out": line})
+    except OSError:          # includes socket.timeout and BrokenPipeError
+        kill("client gone")
+        proc.stdout.close()
+    rc = proc.wait()
+    timer.cancel()
+    return rc, note[0]
+
+
+def peer_ok(conn):
+    """Only the user the agent runs as (the container runs as that uid)."""
+    try:
+        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        _pid, uid, _gid = struct.unpack("3i", creds)
+    except OSError:
+        return False
+    return uid == os.getuid()
+
+
+def reply(conn, msgs):
+    try:
+        for m in msgs:
+            send(conn, m)
+    except OSError:
+        pass
+
+
+def handle(conn):
+    try:
+        conn.settimeout(10)
+        data = b""
+        while b"\n" not in data and len(data) < MAX_REQUEST:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        if not peer_ok(conn):
+            reply(conn, [{"error": "not you"}, {"exit": 2}])
+            return
+        try:
+            req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+            argv = req["argv"]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            reply(conn, [{"error": "bad request: expected {\"argv\": [...]}"}, {"exit": 2}])
+            log(data[:200].decode("utf-8", "replace"), "exit=2 bad request")
+            return
+        why = validate(argv)
+        if why:
+            reply(conn, [{"error": why}, {"exit": 2}])
+            log(argv, "exit=2 rejected: " + why)
+            return
+        if not lock.acquire(blocking=False):
+            busy = "busy: %s is running" % " ".join(["boxen"] + (running[0] or []))
+            reply(conn, [{"error": busy}, {"exit": 2}])
+            log(argv, "exit=2 " + busy)
+            return
+        try:
+            running[0] = argv
+            rc, note = run(conn, argv)
+        finally:
+            running[0] = None
+            lock.release()
+        # The lock is free: a slow client can't hold up the next command.
+        if note == "timed out":
+            log(argv, "timed out")
+            reply(conn, [{"error": "timed out"}, {"exit": 124}])
+        elif note == "client gone":
+            log(argv, "exit=%d client gone (command killed)" % rc)
+        else:
+            log(argv, "exit=%d" % rc)
+            reply(conn, [{"exit": rc}])
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def updated():
+    try:
+        return os.stat(os.path.realpath(__file__)).st_mtime != started_mtime
+    except OSError:
+        return False
+
+
+def main():
+    os.makedirs(AGENT_DIR, mode=0o700, exist_ok=True)
+    os.chmod(AGENT_DIR, 0o700)
+    os.makedirs(BOXEN_HOME, exist_ok=True)
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o077)
+    cwd = os.getcwd()
+    try:
+        # Bound by its short name from inside the folder: socket paths are
+        # limited to 107 bytes, which a long home path could exceed.
+        os.chdir(AGENT_DIR)
+        srv.bind(os.path.basename(SOCK))
+    finally:
+        os.chdir(cwd)
+        os.umask(old)
+    os.chmod(SOCK, 0o600)
+    srv.listen(8)
+    srv.settimeout(1.0)
+    sys.stderr.write("boxen-agentd: listening on %s, running %s\n" % (SOCK, BOXEN))
+    sys.stderr.flush()
+
+    def stop(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                # Re-exec after an update, but never under a running command:
+                # the lock is held across the check and the exec.
+                if updated() and lock.acquire(blocking=False):
+                    try:
+                        sys.stderr.write("boxen-agentd: updated on disk; restarting\n")
+                        sys.stderr.flush()
+                        srv.close()
+                        os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)])
+                    finally:
+                        lock.release()
+                continue
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    finally:
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

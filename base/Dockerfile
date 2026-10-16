@@ -63,8 +63,10 @@ RUN chmod 0755 /usr/local/bin/git-credential-boxen /usr/local/bin/gh
 # `boxen resume`: continue an earlier session in the Claude app.
 # boxen-carry: the /carry skill's view of earlier sessions (list, read).
 # boxen-entry: waits for an attached terminal's size before Claude starts.
-COPY boxen-sessions boxen-carry boxen-entry /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/boxen-sessions /usr/local/bin/boxen-carry /usr/local/bin/boxen-entry
+# boxen-client: the supervisor project's `boxen` (boxen-entry links it in).
+COPY boxen-sessions boxen-carry boxen-entry boxen-client /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/boxen-sessions /usr/local/bin/boxen-carry \
+      /usr/local/bin/boxen-entry /usr/local/bin/boxen-client
 
 USER $USERNAME
 WORKDIR /home/$USERNAME

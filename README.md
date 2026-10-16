@@ -78,11 +78,11 @@ appears in the app's Code tab.
   server is waiting on a question, lets you answer it.
 - `boxen down <name|all>` — stop.
 - `boxen restart <name|all>` — recreate the container (picks up env changes).
-- `boxen logs <name> [-f]` — the server's output, as plain text.
+- `boxen logs <name> [-f] [--tail N]` — the server's output, as plain text.
 - `boxen shell <name>` — bash inside the container.
 - `boxen claude <name> [args]` — a terminal Claude session inside it.
-- `boxen rm <name>` — remove container, image and config; keeps `~/src/<name>`
-  and its Claude history.
+- `boxen rm <name> [--yes]` — remove container, image and config; keeps
+  `~/src/<name>` and its Claude history.
 
 `boxen update` rebuilds the base image from a fresh Ubuntu with the newest
 stable Claude Code and then every project; `boxen update <name>` rebuilds one
@@ -110,6 +110,28 @@ with its full history, under "Remote Control" rather than the project, as
 `--attach` shows it in your terminal (Ctrl+B then D to leave it running),
 `--stop` closes one you resumed. A restarted server brings its recent sessions
 back by itself; `resume` is for older ones.
+
+## Supervisor
+
+`boxen supervisor` (run once, from a terminal on the VM) creates a project,
+"boxen supervisor", that runs boxen for you from the Claude app: what's
+running, start or stop a project, a server's log, a new project from a
+GitHub URL, resume an old conversation, update. Inside it, `boxen` is a
+client of a small listener on the VM (`boxen-agentd`: a systemd user service
+set up by `install.sh`, with a cron `@reboot` fallback) that runs the real
+boxen only for `ls`, `up`, `restart`, `down`, `logs --tail`, `update`,
+`self-update`, `new`, `resume`, `rm` and `tokens`, arguments checked first;
+no shell, no Docker socket, nothing that needs a terminal. When an action
+needs a decision (trusting a new folder, `rm`), boxen prints the exact
+question instead of answering, the supervisor shows it to you in the app,
+and only your yes re-runs it with `--approve trust` or `--yes`.
+
+Be clear about what that protects: the approval flow is enforced by the
+supervisor's instructions (its read-only `CLAUDE.md`), not by the listener,
+which accepts `--approve trust` and `--yes` from the container. It guards
+against mistakes and casual injection, not a fully compromised supervisor
+session. `down all`, `restart all` and `update` need no approval and are
+disruptive. Every request goes to `~/.config/boxen/agent.log`.
 
 ## Moving from a Mac
 

@@ -34,6 +34,29 @@ die()  { printf 'boxen: %s\n' "$*" >&2; exit 1; }
 warn() { printf '%sboxen: %s\n' "${QUIET:+$(date -Is) }" "$*" >&2; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
+# Agent mode (BOXEN_AGENT=1): boxen is being run by boxen-agentd for the
+# supervisor project, with no terminal and nobody at the keyboard. Nothing may
+# stop to ask; a command that needs a person either fails (need_tty, exit 2)
+# or reports the exact question for someone to answer in the app and exits 3
+# (approval_needed). Interactive use is unchanged.
+agent_mode() { [[ "${BOXEN_AGENT:-}" == 1 ]]; }
+need_tty() {
+  agent_mode || return 0
+  printf 'boxen: %s needs a terminal\n' "$1" >&2
+  exit 2
+}
+# approval_needed KIND NAME COMMAND, with the question's text on stdin: print
+# it in the fixed form the supervisor looks for, then return 3.
+approval_needed() {
+  printf 'boxen: approval needed (%s) for %s:\n' "$1" "$2"
+  sed 's/^/    /'
+  printf 'boxen: to approve, run: %s\n' "$3"
+  return 3
+}
+# Set from `--approve trust` (up, restart, new): answer the trust question
+# in agent mode instead of reporting it.
+APPROVE_TRUST=0
+
 # run_quiet LABEL cmd...: run a command with its output hidden. On failure,
 # print "LABEL failed:" and the last 40 lines of its output, and fail too.
 run_quiet() {
@@ -54,15 +77,16 @@ usage() {
 Usage: boxen <command> [args]
 
   new <name> [git-url]                            Create a project (cloning git-url if given) and start it
+  supervisor                                      Create/start the supervisor: runs boxen for you from the app
   ls                                              List projects, their servers and GitHub tokens
   up <name|all>                                   Start, or apply env/compose changes; answers pending prompts
   down <name|all>                                 Stop
   restart <name|all>                              Recreate the container (picks up env changes)
-  logs <name> [-f]                                The Remote Control server's output
+  logs <name> [-f] [--tail N]                     The Remote Control server's output
   shell <name>                                    Bash inside the container
   claude <name> [args]                            Terminal Claude session inside the container
   resume <name> [N|ID] [--stop|--attach|--force]  Continue an earlier session in the Claude app
-  rm <name>                                       Remove container, image and config (keeps the code)
+  rm <name> [--yes]                               Remove container, image and config (keeps the code)
   github [--reset] [--key f.pem]                  Connect GitHub: your app, per-project tokens, commit identity
   login                                           Sign in to Claude again (shared by every project)
   update [name|all]                               Rebuild images: fresh base and every project, or one project
@@ -109,15 +133,23 @@ base_args() {
   printf '%s\n' -v "$CONFIG_VOLUME:$CHOME/.claude" -e "CLAUDE_CONFIG_DIR=$CHOME/.claude"
 }
 
+# The supervisor project (the one that runs boxen for you from the app) goes
+# last, so an "all" that restarts it has finished everything else first.
 projects() {
   shopt -s nullglob
-  local d
-  for d in "$PROJECTS_DIR"/*/; do basename "$d"; done
+  local d n
+  for d in "$PROJECTS_DIR"/*/; do
+    n=$(basename "$d")
+    [[ "$n" != supervisor ]] && printf '%s\n' "$n"
+  done
+  [[ -d "$PROJECTS_DIR/supervisor" ]] && echo supervisor
+  return 0
 }
 
 # each <cmd_fn> <name|all> [args...]: run a per-project command for one
 # project, or for every project when the name is "all". Each project runs in
-# a subshell, so one failing doesn't stop the rest; failures are listed at the end.
+# a subshell, so one failing doesn't stop the rest; failures are listed at
+# the end (exit 3 if any of them was only waiting for an approval).
 each() {
   local fn=$1
   shift
@@ -126,13 +158,22 @@ each() {
     return
   fi
   shift
-  local n failed=() list=()
+  local n rc=0 failed=() list=()
   mapfile -t list < <(projects)
   (( ${#list[@]} )) || { info "no projects yet"; return 0; }
   for n in "${list[@]}"; do
-    ( "$fn" "$n" "$@" ) || failed+=("$n")
+    ( "$fn" "$n" "$@" ) || { if (( $? == 3 && rc != 1 )); then rc=3; else rc=1; fi; failed+=("$n"); }
   done
-  (( ${#failed[@]} == 0 )) || die "failed for: ${failed[*]}"
+  (( ${#failed[@]} == 0 )) || { warn "failed for: ${failed[*]}"; exit "$rc"; }
+}
+
+# The compose template a project is rendered from: the supervisor has its own.
+compose_template() {
+  if [[ "$1" == supervisor ]]; then
+    printf '%s/templates/compose.supervisor.yaml\n' "$BOXEN_REPO"
+  else
+    printf '%s/templates/compose.yaml\n' "$BOXEN_REPO"
+  fi
 }
 
 # ---------------------------------------------------------------- setup
@@ -239,6 +280,7 @@ logged_in() {
 }
 
 do_login() {
+  need_tty login
   local args; mapfile -t args < <(base_args)
   echo "    Open the URL it prints on any device and sign in with your claude.ai account."
   echo "    Then paste the code it gives you here and press Enter. Nothing appears on"
@@ -248,6 +290,10 @@ do_login() {
 
 ensure_login() {
   logged_in && return
+  if agent_mode; then
+    printf 'boxen: login needs a terminal (Claude isn'"'"'t signed in yet; run '"'"'boxen login'"'"' on the VM)\n' >&2
+    exit 2
+  fi
   info "Claude isn't signed in (with a claude.ai account) yet. Every project shares this login."
   do_login
   logged_in || die "still not signed in with a claude.ai account; run 'boxen login' to retry"
@@ -332,7 +378,9 @@ github_repo() {
     ssh://git@github.com/*) u=${u#ssh://git@github.com/} ;;
     *) return 1 ;;
   esac
-  [[ $u =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  # owner and repo: GitHub's own shape (start alphanumeric, no trailing . or -), and no ".."
+  local seg='[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9_])?'
+  [[ $u =~ ^$seg/$seg$ && $u != *..* ]] || return 1
   printf '%s\n' "$u"
 }
 
@@ -520,6 +568,7 @@ read_key() {
 }
 
 cmd_github() {
+  need_tty github
   local c
   for c in openssl curl jq git; do
     command -v "$c" >/dev/null || die "$c is required (sudo apt install $c)"
@@ -686,7 +735,8 @@ server_state() {
     elsif (/not logged in|please (log|sign) in|claude (auth )?login/i)
                                                          { $s = "not signed in: run boxen login" }
     elsif (/Spawn mode for this project/)                { $s = "waiting for an answer: run boxen up NAME" }
-    elsif (/\[y\/N\]\s*$|\[Y\/n\]\s*$/)                  { $s = "waiting for an answer: run boxen up NAME" }
+    elsif (/^Trust .*\? \[y\/N\]$|^Enable Remote Control\? \(y\/n\)$/)
+                                                         { $s = "waiting for an answer: run boxen up NAME" }
     elsif (/Reconnecting/)                               { $s = "reconnecting" }
     elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected" }
     END   { print "$s\n" }' | sed "s/NAME/$n/" || true
@@ -700,6 +750,7 @@ render() {
   sed -e "s|__NAME__|$(sed_esc "$2")|g" \
       -e "s|__USER__|$(sed_esc "$USER_NAME")|g" \
       -e "s|__CHOME__|$(sed_esc "$CHOME")|g" \
+      -e "s|__BOXEN_HOME__|$(sed_esc "$BOXEN_HOME")|g" \
       -e "s|__SRC__|$(sed_esc "$3")|g" "$1"
 }
 
@@ -745,6 +796,102 @@ EOF
   rm -rf "$tmp"
 }
 
+# drive_prompts NAME: attach_prompts for agent mode, where nobody is at a
+# keyboard. The container is started attached under script(1) as above, but
+# its input is a pipe boxen writes to, and its output is watched for the
+# server's one-time questions:
+#   - the line "Enable Remote Control? (y/n)", exactly, is answered y:
+#     starting Remote Control servers is what boxen is for.
+#   - any other question ("Trust <folder>? [y/N]", preceded by what trusting
+#     means for this folder: hooks, MCP servers, settings it brings; or
+#     anything else ending in [y/N], [Y/n] or (y/n)) is answered y only with
+#     `--approve trust`. Otherwise its text is reported for a person to see,
+#     the container is stopped so it doesn't sit at the prompt, and this
+#     returns 3. The exact match matters: the preamble quotes text from the
+#     repo (server names, rules), which must not be able to look like the
+#     question boxen answers by itself.
+# The pty gets a size first: Claude refuses to ask ("did not report its
+# size") on a 0x0 terminal. Returns 0 once the session URL appears or the
+# container stops by itself; wait_server then reports the state as usual.
+# 3 after 180s without a URL or a known question (whatever is on screen is
+# shown).
+# The coprocess's variables vanish once it exits, so test for it this way.
+drv_alive() { [[ -n "${DRV_PID:-}" ]] && kill -0 "$DRV_PID" 2>/dev/null; }
+
+drive_prompts() {
+  local n=$1 c="boxen-$1" tmp seg last off=0 size i state="" answer rc=0
+  docker stop "$c" >/dev/null 2>&1 || true
+  run_quiet "creating $n" dc "$n" up --no-start || return 1
+  tmp=$(mktemp -d)
+  : > "$tmp/out"
+  # DRV[1] is the pty's input. script's own stdout is discarded: the file
+  # has everything. A write to a pty whose reader is gone must not end boxen.
+  trap '' PIPE
+  coproc DRV { script -qfec "stty rows 50 cols 200; stty size > '$tmp/size'; echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" >/dev/null 2>&1; }
+  for (( i = 0; i < 180; i++ )); do
+    sleep 1
+    if [[ ! -s "$tmp/size" ]]; then continue; fi
+    if [[ "$(cat "$tmp/size")" == "0 0" ]]; then state=nosize; break; fi
+    # Only what arrived since the last answer, so an answered question isn't
+    # seen again: exactly the bytes from off to size, as it stood before the
+    # read. script's own "Script started on ..." header isn't output.
+    size=$(stat -c %s "$tmp/out")
+    seg=$(tail -c +$((off + 1)) "$tmp/out" | head -c $((size - off)) | plain_text | grep -v '^Script \(started\|done\) on ' || true)
+    if grep -q 'claude\.ai/code?environment=' <<<"$seg"; then
+      state=connected
+      break
+    fi
+    last=$(tail -n 1 <<<"$seg")
+    answer=0
+    if [[ "$last" == "Enable Remote Control? (y/n)" ]]; then
+      answer=1
+    else
+      case $last in
+        *"(y/n)"|*"[y/N]"|*"[Y/n]") state=trust ;;
+      esac
+    fi
+    if [[ "$state" == trust ]] && (( APPROVE_TRUST )); then state="" answer=1; fi
+    [[ "$state" != trust ]] || break
+    if (( answer )); then
+      off=$size
+      if drv_alive && [[ -n "${DRV[1]:-}" ]]; then
+        printf 'y\n' >&"${DRV[1]}" || true
+      fi
+      continue
+    fi
+    # The container stopped (crashed, or exited) on its own.
+    drv_alive || { state=exited; break; }
+  done
+  if [[ "$state" == connected ]]; then sleep 1; fi    # the rest of the banner
+  # End the attachment (the docker client), not the container.
+  if [[ -s "$tmp/pid" ]]; then kill -9 "$(cat "$tmp/pid")" 2>/dev/null || true; fi
+  wait "${DRV_PID:-}" 2>/dev/null || true
+  trap - PIPE
+  [[ -s "$tmp/size" ]] || state=nosize
+  case $state in
+    trust)
+      # The question as the server put it, from the line that introduces
+      # what trusting means (or the first line, if that changed) to the question.
+      docker stop "$c" >/dev/null 2>&1 || true
+      if grep -q '^Remote Control starts' <<<"$seg"; then
+        seg=$(sed -n '/^Remote Control starts/,$p' <<<"$seg")
+      fi
+      approval_needed trust "$n" "boxen up $n --approve trust" <<<"$seg" || rc=$? ;;
+    nosize)
+      docker stop "$c" >/dev/null 2>&1 || true
+      warn "couldn't give $n's server a terminal with a size, so it can't ask its questions; run 'boxen up $n' from a terminal on the VM"
+      rc=1 ;;
+    "")
+      docker stop "$c" >/dev/null 2>&1 || true
+      printf 'boxen: %s is waiting at an unrecognized question:\n' "$n"
+      tail -n 10 <<<"$seg" | sed 's/^/    /'
+      printf 'boxen: answer it with '"'"'boxen up %s'"'"' from a terminal on the VM\n' "$n"
+      rc=3 ;;
+  esac
+  rm -rf "$tmp"
+  return "$rc"
+}
+
 # poll_server NAME: server_state, checked every second for up to 20s until it
 # settles on something other than "starting". The restart count is baselined
 # the first time the container is seen running (each call starts over, so a
@@ -775,13 +922,17 @@ poll_server() {
 # wait_server NAME [PREFIX]: after a start, wait for the project's Remote
 # Control server to connect and print one line about it ("NAME: PREFIXconnected").
 # A server stuck at a one-time question gets answered through attach_prompts
-# when there's a terminal. Returns 1 when the project still needs you.
+# when there's a terminal, or drive_prompts in agent mode. Returns 1 when
+# the project still needs you (3 when it needs an approval).
 wait_server() {
   local n=$1 pre=${2:-} st
   st=$(poll_server "$n")
   case $st in
     "not trusted"*|"waiting for an answer"*)
-      if [[ -t 0 ]]; then
+      if agent_mode; then
+        drive_prompts "$n" || return $?
+        st=$(poll_server "$n")
+      elif [[ -t 0 ]]; then
         attach_prompts "$n" || return 1
         st=$(poll_server "$n")
       else
@@ -838,7 +989,7 @@ rerender_compose() {
   pdir=$(proj_dir "$n")
   new=$(mktemp)
   old=$(mktemp)
-  render "$BOXEN_REPO/templates/compose.yaml" "$n" "$SRC_ROOT/$n" > "$new"
+  render "$(compose_template "$n")" "$n" "$SRC_ROOT/$n" > "$new"
   if [[ -n "$oldt" && -s "$oldt" ]]; then render "$oldt" "$n" "$SRC_ROOT/$n" > "$old"; fi
   if ! cmp -s "$pdir/compose.yaml" "$new" && ! cmp -s "$pdir/compose.yaml" "$old"; then
     mv -f "$pdir/compose.yaml" "$pdir/compose.yaml.old"
@@ -861,7 +1012,7 @@ create_project() {
   # Create the token dir yourself so Docker doesn't create it root-owned.
   mkdir -p "$pdir"
   mkdir_private "$(token_dir "$name")"
-  render "$BOXEN_REPO/templates/compose.yaml" "$name" "$src" > "$pdir/compose.yaml"
+  render "$(compose_template "$name")" "$name" "$src" > "$pdir/compose.yaml"
   render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" > "$pdir/Dockerfile"
   write_override_example "$name"
   printf '\033[1;34m==>\033[0m building image for %s...' "$name"
@@ -887,13 +1038,22 @@ new_cleanup() {
 }
 
 cmd_new() {
-  local name=${1:-} url=${2:-}
+  local name="" url="" pos=()
+  while (( $# )); do
+    case $1 in
+      --*) start_opts "$@"; break ;;    # options come after name [git-url]
+      *)   pos+=("$1"); shift ;;
+    esac
+  done
+  name=${pos[0]:-} url=${pos[1]:-}
+  (( ${#pos[@]} <= 2 )) || die "usage: boxen new <name> [git-url] [--approve trust]"
   [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]  (git-url optional; GitHub URL to clone)"
   if [[ -n "$url" ]] && ! github_repo "$url" >/dev/null && [[ "$url" == git@* || "$url" == ssh://* ]]; then
     die "only github.com repos can be cloned over SSH-style URLs (containers have no SSH keys); use the https:// URL"
   fi
   valid_name "$name"
   [[ "$name" != all ]] || die "'all' is reserved (it means every project); pick another name"
+  [[ "$name" != supervisor ]] || die "'supervisor' is reserved; 'boxen supervisor' creates that project"
   require_setup
 
   local pdir src
@@ -940,6 +1100,52 @@ cmd_new() {
   info "done: '$name' is in the Claude app under Code."
 }
 
+# ------------------------------------------------------------- supervisor
+#
+# The supervisor is a project like any other, except that inside it, `boxen`
+# is a client (base/boxen-client) that reaches bin/boxen-agentd on the VM
+# through a socket mounted into the container, and may only run an
+# allowlisted set of boxen commands, with BOXEN_AGENT=1 (see agent_mode).
+# Its CLAUDE.md (templates/supervisor.CLAUDE.md) is what makes it a
+# supervisor; boxen owns that file: it lives in the project dir, is mounted
+# read-only over ~/src/supervisor/CLAUDE.md (so the supervisor can't edit
+# its own rules), and is rewritten here and on self-update.
+
+AGENT_DIR="$BOXEN_HOME/agent"
+AGENT_SOCK="$AGENT_DIR/agent.sock"
+
+write_supervisor_claude_md() {
+  local pdir
+  pdir=$(proj_dir supervisor)
+  mkdir -p "$pdir" "$SRC_ROOT/supervisor"
+  cp "$BOXEN_REPO/templates/supervisor.CLAUDE.md" "$pdir/CLAUDE.md"
+  chmod 0644 "$pdir/CLAUDE.md"
+}
+
+cmd_supervisor() {
+  (( $# == 0 )) || die "usage: boxen supervisor"
+  need_tty supervisor
+  require_setup
+  local name=supervisor pdir
+  pdir=$(proj_dir "$name")
+  # The socket's folder, mounted into the container (a folder, not the
+  # socket itself: boxen-agentd recreates the socket when it restarts, and a
+  # mount of the file would keep pointing at the old one). Created here so
+  # Docker doesn't create it root-owned.
+  mkdir_private "$AGENT_DIR"
+  [[ -S "$AGENT_SOCK" ]] || warn "boxen-agent isn't running (no $AGENT_SOCK); re-run $BOXEN_REPO/install.sh, which sets it up"
+  write_supervisor_claude_md
+  ensure_login
+  if [[ -f "$pdir/compose.yaml" ]]; then
+    rerender_compose "$name"
+    write_override_example "$name"
+  else
+    create_project "$name"
+  fi
+  start_project "$name"
+  info "done: 'boxen supervisor' is in the Claude app under Code. Ask it what's running."
+}
+
 # -------------------------------------------------------------- day to day
 
 # Each project's container, whether its server is actually connected (a
@@ -959,8 +1165,31 @@ cmd_ls() {
   done < <(projects)
 }
 
-cmd_up()      { require_project "${1:-}"; start_project "$1"; }
-cmd_restart() { require_project "${1:-}"; start_project "$1" --force-recreate; }
+# start_opts [--approve trust]: the options up, restart and new take after
+# the name. In agent mode, --approve trust answers the folder's trust
+# question (see drive_prompts); from a terminal you answer it yourself.
+start_opts() {
+  while (( $# )); do
+    case $1 in
+      --approve) [[ "${2:-}" == trust ]] || die "--approve takes 'trust' (e.g. boxen up <name> --approve trust)"; APPROVE_TRUST=1; shift ;;
+      --approve=trust) APPROVE_TRUST=1 ;;
+      *) die "unknown option '$1' (options: --approve trust)" ;;
+    esac
+    shift
+  done
+}
+
+# An approval is for one project's question: never `up all --approve trust`.
+no_approve_all() {
+  local a
+  [[ "${1:-}" == all ]] || return 0
+  for a in "${@:2}"; do
+    [[ "$a" != --approve* ]] || die "approve one project at a time (boxen up <name> --approve trust), not all"
+  done
+}
+
+cmd_up()      { require_project "${1:-}"; start_opts "${@:2}"; start_project "$1"; }
+cmd_restart() { require_project "${1:-}"; start_opts "${@:2}"; start_project "$1" --force-recreate; }
 cmd_down() {
   require_project "${1:-}"
   run_quiet "stopping $1" dc "$1" down || return 1
@@ -969,18 +1198,36 @@ cmd_down() {
 
 cmd_logs() {
   require_project "${1:-}"
-  local n=$1; shift
+  local n=$1 tail=100 args=()
+  shift
+  while (( $# )); do
+    case $1 in
+      --tail)   tail=${2:-}; shift ;;
+      --tail=*) tail=${1#--tail=} ;;
+      -f|--follow)
+        if agent_mode; then
+          printf 'boxen: logs -f isn'"'"'t available here; use --tail\n' >&2
+          exit 2
+        fi
+        args+=("$1") ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  [[ "$tail" =~ ^[0-9]+$ ]] && (( tail >= 1 && tail <= 5000 )) || die "--tail needs a number of lines, 1 to 5000"
   # The server writes to a terminal, so its log is full of screen-control
   # codes (cursor moves, clears) that would scramble yours; print the text.
-  dc "$n" logs --no-log-prefix --tail=100 "$@" claude 2>&1 | plain_text
+  dc "$n" logs --no-log-prefix --tail="$tail" "${args[@]}" claude 2>&1 | plain_text
 }
 
 cmd_shell() {
+  need_tty shell
   require_project "${1:-}"
   docker exec -it "boxen-$1" bash
 }
 
 cmd_claude() {
+  need_tty claude
   require_project "${1:-}"
   local n=$1; shift
   docker exec -it "boxen-$n" claude "$@"
@@ -991,18 +1238,37 @@ cmd_claude() {
 # work happens inside the container (boxen-sessions).
 cmd_resume() {
   require_project "${1:-}"
-  local n=$1
+  local n=$1 a
   shift
   [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]] \
     || die "$n isn't running; start it with 'boxen up $n'"
-  docker exec -it "boxen-$n" boxen-sessions resume "$@"
+  if agent_mode; then
+    for a in "$@"; do [[ "$a" != --attach ]] || need_tty "resume --attach"; done
+    docker exec -i -e BOXEN_AGENT=1 "boxen-$n" boxen-sessions resume "$@"
+  else
+    docker exec -it "boxen-$n" boxen-sessions resume "$@"
+  fi
 }
 
 cmd_rm() {
   require_project "${1:-}"
-  local name=$1 ans
-  read -rp "Remove container, image and config for '$name'? Code in $SRC_ROOT/$name is kept. [y/N] " ans
-  [[ "$ans" == [yY] ]] || { echo "aborted"; return; }
+  local name=$1 ans yes=0 q
+  shift
+  while (( $# )); do
+    case $1 in
+      --yes|-y) yes=1 ;;
+      *) die "usage: boxen rm <name> [--yes]" ;;
+    esac
+    shift
+  done
+  q="Remove container, image and config for '$name'? Code in $SRC_ROOT/$name is kept."
+  if (( ! yes )); then
+    if agent_mode; then
+      approval_needed rm "$name" "boxen rm $name --yes" <<<"$q" || return $?
+    fi
+    read -rp "$q [y/N] " ans
+    [[ "$ans" == [yY] ]] || { echo "aborted"; return; }
+  fi
   run_quiet "removing $name" dc "$name" down --rmi all || return 1
   rm -rf "$(proj_dir "$name")"
   info "removed '$name'. Code in $SRC_ROOT/$name and its Claude history in the shared config are kept."
@@ -1079,11 +1345,12 @@ cmd_self_update() {
   # Every project's compose.yaml comes from the template (settings of your
   # own belong in compose.override.yaml). Hand edits are kept as .old.
   oldt=$(mktemp)
-  git -C "$BOXEN_REPO" show "$old:templates/compose.yaml" > "$oldt" 2>/dev/null || true
   for n in "${list[@]}"; do
+    git -C "$BOXEN_REPO" show "$old:templates/$(basename "$(compose_template "$n")")" > "$oldt" 2>/dev/null || true
     rerender_compose "$n" "$oldt"
     write_override_example "$n"
     mkdir_private "$(token_dir "$n")"
+    [[ "$n" != supervisor ]] || write_supervisor_claude_md
   done
   rm -f "$oldt"
 
@@ -1091,7 +1358,7 @@ cmd_self_update() {
   # means `up` (compose recreates only what differs).
   if grep -qE '^base/' <<<"$changed"; then
     mode=rebuild
-  elif grep -qE '^templates/compose\.yaml$' <<<"$changed"; then
+  elif grep -qE '^templates/compose(\.supervisor)?\.yaml$' <<<"$changed"; then
     mode=up
   fi
   if [[ "$mode" != none ]]; then
@@ -1115,10 +1382,11 @@ cmd=${1:-help}
 shift || true
 case "$cmd" in
   new)      cmd_new "$@" ;;
+  supervisor) cmd_supervisor "$@" ;;
   ls|list)  cmd_ls ;;
-  up)       each cmd_up "$@" ;;
+  up)       no_approve_all "$@"; each cmd_up "$@" ;;
   down)     each cmd_down "$@" ;;
-  restart)  each cmd_restart "$@" ;;
+  restart)  no_approve_all "$@"; each cmd_restart "$@" ;;
   logs)     cmd_logs "$@" ;;
   shell)    cmd_shell "$@" ;;
   claude)   cmd_claude "$@" ;;
@@ -1129,6 +1397,7 @@ case "$cmd" in
   update)   cmd_update "$@" ;;
   self-update) cmd_self_update ;;
   import-mac)
+    need_tty import-mac
     # shellcheck source=lib/import-mac.sh
     source "$BOXEN_REPO/lib/import-mac.sh"
     cmd_import_mac "$@" ;;

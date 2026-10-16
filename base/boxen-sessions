@@ -7,6 +7,10 @@
 # in a tmux session with Remote Control on, so it shows up in the Claude app
 # with its history. It runs until you stop it or the container restarts (the
 # transcript stays, so you can resume it again).
+#
+# With BOXEN_AGENT=1 (run by the boxen agent for the supervisor, no terminal)
+# nothing stops to ask: the list is printed with how to pick, and --attach
+# is refused.
 
 set -u
 
@@ -162,10 +166,10 @@ report() {
       return 1 ;;
   esac
 
-  if [[ ! -t 0 ]]; then
+  if [[ ! -t 0 || "${BOXEN_AGENT:-}" == 1 ]]; then
     echo "Claude hasn't connected yet; it may be waiting for an answer. Its screen:" >&2
     screen_tail "$id" >&2
-    echo "Open it with: boxen resume $NAME ${id:0:8} --attach" >&2
+    echo "Open it from a terminal on the VM with: boxen resume $NAME ${id:0:8} --attach" >&2
     return 1
   fi
   echo
@@ -204,7 +208,10 @@ cmd_resume() {
   local pick="" attach=0 force=0 stop=0 rows id st m p n
   while (( $# )); do
     case $1 in
-      --attach) attach=1 ;; --force) force=1 ;; --stop) stop=1 ;;
+      --attach)
+        if [[ "${BOXEN_AGENT:-}" == 1 ]]; then echo "boxen: resume --attach needs a terminal" >&2; return 2; fi
+        attach=1 ;;
+      --force) force=1 ;; --stop) stop=1 ;;
       -*) echo "unknown option: $1" >&2; return 1 ;;
       *) pick=$1 ;;
     esac
@@ -226,6 +233,10 @@ cmd_resume() {
       printf '  %2s) %-8s %-62s %s\n' "$n" "$(ago "$m")" "\"$p\"" "$st"
     done <<< "$rows"
     echo
+    if [[ "${BOXEN_AGENT:-}" == 1 ]]; then
+      echo "To continue one in the Claude app: boxen resume $NAME <number>"
+      return 0
+    fi
     read -rp "Number to continue in the Claude app (Enter to cancel): " pick
     [[ -n $pick ]] || return 0
   fi

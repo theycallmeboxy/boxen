@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""boxen-client: the `boxen` command inside the supervisor container.
+
+Sends the arguments to boxen-agentd on the VM over /run/boxen/agent.sock
+(one JSON request per connection) and prints the lines it streams back,
+then exits with the command's exit code. The agent decides what may run;
+this end does nothing but relay.
+"""
+import json
+import socket
+import sys
+
+SOCK = "/run/boxen/agent.sock"
+USAGE = """Usage: boxen <command> [args]   (the supervisor's restricted boxen)
+
+  ls                                        List projects, servers, GitHub tokens
+  up <name|all> [--approve trust]           Start, or apply env/compose changes
+  restart <name|all> [--approve trust]      Recreate the container
+  down <name|all>                           Stop
+  logs <name> [--tail N]                    The server's output (default: last 100 lines)
+  update [name|all]                         Rebuild images (slow)
+  self-update                               Update boxen itself and apply it
+  new <name> [https-github-url] [--approve trust]
+                                            Create a project and start it
+  resume <name> [N|id] [--stop] [--force]   Continue an earlier session in the Claude app
+  rm <name> [--yes]                         Remove a project (keeps its code)
+  tokens [name|all]                         Refresh GitHub tokens
+
+When boxen prints "approval needed", ask the user before running the
+command it names. Anything not listed here needs a terminal on the VM.
+"""
+
+
+def fail(msg, code=1):
+    sys.stderr.write("boxen: %s\n" % msg)
+    sys.exit(code)
+
+
+def main(argv):
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        sys.stdout.write(USAGE)
+        return 0 if argv else 2
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(SOCK)
+    except OSError as e:
+        fail("can't reach the boxen agent at %s (%s); is boxen-agent running on the VM?" % (SOCK, e.strerror or e))
+    s.sendall((json.dumps({"argv": argv}) + "\n").encode())
+    s.shutdown(socket.SHUT_WR)
+    f = s.makefile("rb")
+    try:
+        for raw in f:
+            try:
+                msg = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if "out" in msg:
+                sys.stdout.write(msg["out"] + "\n")
+                sys.stdout.flush()
+            if "error" in msg:
+                sys.stderr.write("boxen: %s\n" % msg["error"])
+                sys.stderr.flush()
+            if "exit" in msg:
+                return int(msg["exit"])
+    except OSError:
+        pass
+    fail("the boxen agent closed the connection before the command finished (it may be restarting after an update)")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
