@@ -255,10 +255,17 @@ Sessions in myproj, newest first:
 Number to continue in the Claude app (Enter to cancel): 3
 ```
 
-Pick one and it's in the Claude app with its history, with Remote Control
-already on; there's nothing to attach to. That covers sessions imported from a
-Mac, sessions from before a long downtime, and ones you started in a terminal
-with `boxen claude <name>`. The list shows the first thing you typed in each.
+Pick one and boxen waits until it's connected, then tells you. In the app's
+session list it's titled `myproj: <first thing you typed>` (the list above
+shows the same text). That covers sessions imported from a Mac, sessions from
+before a long downtime, and ones you started in a terminal with
+`boxen claude <name>`.
+
+The first time you resume anything, Claude runs its one-time interactive
+setup (theme, a security note) and may ask you to confirm Remote Control.
+boxen notices it hasn't connected, opens the session for you to answer, and
+you press Ctrl+B then D once it shows `/rc active`. Your answers are saved in
+the shared config, so later resumes go straight to the app.
 
 - `boxen resume myproj 3` skips the list.
 - A session marked "may be open in the app already" was used since the

@@ -53,34 +53,96 @@ preview() {
     | grep -v '^[[:space:]]*$' | grep -v '^<' | head -1 | tr '\t\n' '  ' | cut -c1-60 | sed 's/[[:space:]]*$//'
 }
 
-# start_in_tmux ID CMD: start CMD in the session's tmux window; true if it's
-# still running a few seconds later.
-start_in_tmux() {
+# rc_state ID: is the session's Remote Control connected? Read off its screen.
+# Prints "connected [url]", "elsewhere", "dead" or "waiting". A connected
+# session shows "/rc active" in its footer and posts its claude.ai/code link
+# in the conversation.
+rc_state() {
+  local screen url
+  alive "$1" || { echo dead; return; }
+  screen=$(tmux capture-pane -p -J -S -300 -t "$(tname "$1")" 2>/dev/null)
+  if grep -q 'Remote Control not started here' <<<"$screen"; then echo elsewhere; return; fi
+  url=$(grep -oE 'https://claude\.ai/code/[A-Za-z0-9_-]{6,}' <<<"$screen" | tail -1)
+  if [[ -n $url ]] || grep -qiE '/rc active|remote control (is )?(active|connected)' <<<"$screen"; then
+    echo "connected${url:+ $url}"
+  else
+    echo waiting
+  fi
+}
+
+# wait_rc ID SECONDS: wait for the session to connect; prints its rc_state.
+wait_rc() {
+  local i st
+  for (( i = 0; i < $2; i++ )); do
+    st=$(rc_state "$1")
+    [[ $st == waiting ]] || { echo "$st"; return; }
+    sleep 1
+  done
+  echo waiting
+}
+
+screen_tail() {
+  tmux capture-pane -p -J -S -300 -t "$(tname "$1")" 2>/dev/null \
+    | grep -v '^[[:space:]]*$' | tail -"${2:-8}" | sed 's/^/    /'
+}
+
+# host ID TITLE: continue the session in tmux with Remote Control on, under a
+# title you'll recognize in the app ("<project>: <first message>"). Without
+# one, the app titles it from the conversation's last message.
+host() {
   local t
   t=$(tname "$1")
   tmux kill-session -t "$t" 2>/dev/null || true
-  tmux new-session -d -s "$t" -x 200 -y 50 "$2" || return 1
-  tmux set-option -t "$t" remain-on-exit on >/dev/null 2>&1 || true
-  sleep "${BOXEN_START_WAIT:-8}"
-  alive "$1"
+  # Keep the window after Claude exits (so its last words can be shown) before
+  # Claude starts, then start it. The command goes in as separate arguments,
+  # so tmux runs it directly with no shell quoting.
+  tmux new-session -d -s "$t" -x 200 -y 50 \; \
+       set-option -t "$t" remain-on-exit on \; \
+       respawn-pane -k -t "$t" claude --resume "$1" --remote-control "$2" >/dev/null || return 1
 }
 
-# Continue a session in tmux with Remote Control on.
-host() {
-  local id=$1 t
-  t=$(tname "$id")
-  alive "$id" && return 0
-  start_in_tmux "$id" "claude --resume $id --remote-control" && return 0
-  # Fallback: resume, then turn Remote Control on from inside the session.
-  if start_in_tmux "$id" "claude --resume $id"; then
-    tmux send-keys -t "$t" "/remote-control" Enter
-    sleep 2
-    alive "$id" && return 0
+# report ID TITLE: say whether the session made it into the app. If Claude is
+# still waiting on a question (first-run setup, a one-time Remote Control
+# confirmation), open it here so you can answer.
+report() {
+  local id=$1 title=$2 st
+  st=$(wait_rc "$id" "${BOXEN_RC_WAIT:-30}")
+  case $st in
+    connected*)
+      echo "It's in the Claude app as \"$title\"."
+      [[ $st == "connected "* ]] && echo "  ${st#connected }"
+      echo "It stays open until you close it (boxen resume $NAME ${id:0:8} --stop) or the container restarts."
+      return 0 ;;
+    elsewhere)
+      echo "Another Claude process already has this conversation in the app; continue it there." >&2
+      tmux kill-session -t "$(tname "$id")" 2>/dev/null || true
+      return 1 ;;
+    dead)
+      echo "Claude exited instead of continuing the session. Its last output:" >&2
+      screen_tail "$id" >&2
+      tmux kill-session -t "$(tname "$id")" 2>/dev/null || true
+      return 1 ;;
+  esac
+
+  if [[ ! -t 0 ]]; then
+    echo "Claude hasn't connected yet; it may be waiting for an answer. Its screen:" >&2
+    screen_tail "$id" >&2
+    echo "Open it with: boxen resume $NAME ${id:0:8} --attach" >&2
+    return 1
   fi
-  echo "Couldn't continue that session. Its last output:" >&2
-  tmux capture-pane -p -t "$t" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | sed 's/^/    /' >&2
-  tmux kill-session -t "$t" 2>/dev/null || true
-  return 1
+  echo
+  echo "Claude hasn't connected yet. It's probably asking something first (first-run"
+  echo "setup, or a one-time Remote Control confirmation; your answers are saved)."
+  echo "Answer it, wait for \"/rc active\" at the bottom, then press Ctrl+B then D"
+  echo "to leave it running."
+  read -rp "Press Enter to open it... " _
+  tmux attach -t "$(tname "$id")"
+  st=$(rc_state "$id")
+  case $st in
+    connected*) echo "Connected: it's in the Claude app as \"$title\". ${st#connected}" ;;
+    dead)       echo "That session has ended." ;;
+    *)          echo "It doesn't look connected yet. Look again with: boxen resume $NAME ${id:0:8} --attach" ;;
+  esac
 }
 
 # number, id, state, last active, preview
@@ -152,16 +214,16 @@ If it isn't in the app, run this again with --force.
 EOF
     return 1
   fi
+  local title="$NAME: $p"
+  (( ${#title} > 60 )) && title="${title:0:57}..."
   if [[ $st != open ]]; then
     echo "Continuing \"$p\"..."
-    host "$id" || return 1
+    host "$id" "$title" || { echo "Couldn't start Claude for that session." >&2; return 1; }
   fi
   if (( attach )); then
     tmux attach -t "$(tname "$id")"
   else
-    echo "It's in the Claude app now, with its history. It stays open until you"
-    echo "close it (boxen resume $NAME $pick --stop) or the container restarts."
-    echo "(To see it here: boxen resume $NAME $pick --attach; Ctrl+B then D to leave.)"
+    report "$id" "$title"
   fi
 }
 
