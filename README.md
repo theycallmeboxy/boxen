@@ -261,10 +261,12 @@ you started in a terminal with `boxen claude <name>`.
 
 Names are Claude's own session titles: the one you gave a session (with
 `/rename`, or by renaming it in the Claude app, which syncs back), otherwise
-the title Claude generated for it, otherwise its first message. In the app
-it shows as `myproj · <title>`, since the app lists every project's sessions
-together. `--name "..."` sets the app title exactly:
-`boxen resume myproj 3 --name "CSV export"`.
+the title Claude generated for it, otherwise its first message. In the app,
+resumed sessions are listed under "Remote Control", not under the project
+(only the project's own server goes there). A session that hasn't been in the
+app before is titled `myproj · <title>` (or what you pass with `--name`); one
+that has keeps the title it had there. Rename it in the app if you like; the
+new name shows up in `boxen resume` too.
 
 The first time you resume anything, Claude runs its one-time interactive
 setup (theme, a security note) and may ask you to confirm Remote Control.

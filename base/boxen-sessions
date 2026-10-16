@@ -105,9 +105,9 @@ screen_tail() {
     | grep -v '^[[:space:]]*$' | tail -"${2:-8}" | sed 's/^/    /'
 }
 
-# host ID TITLE: continue the session in tmux with Remote Control on, under
-# TITLE in the app. (Without a name, the app would title it from the
-# conversation's last message.)
+# host ID TITLE: continue the session in tmux with Remote Control on, asking
+# for TITLE in the app. The app lists it under "Remote Control", and a session
+# that was in the app before keeps the title it had there.
 host() {
   local t
   t=$(tname "$1")
@@ -128,7 +128,7 @@ report() {
   st=$(wait_rc "$id" "${BOXEN_RC_WAIT:-30}")
   case $st in
     connected*)
-      echo "It's in the Claude app as \"$title\"."
+      echo "It's in the Claude app under \"Remote Control\" (resumed sessions don't go under the project)."
       [[ $st == "connected "* ]] && echo "  ${st#connected }"
       echo "It stays open until you close it (boxen resume $NAME ${id:0:8} --stop) or the container restarts."
       return 0 ;;
@@ -158,7 +158,7 @@ report() {
   tmux attach -t "$(tname "$id")"
   st=$(rc_state "$id")
   case $st in
-    connected*) echo "Connected: it's in the Claude app as \"$title\". ${st#connected}" ;;
+    connected*) echo "Connected: it's in the Claude app under \"Remote Control\". ${st#connected}" ;;
     dead)       echo "That session has ended." ;;
     *)          echo "It doesn't look connected yet. Look again with: boxen resume $NAME ${id:0:8} --attach" ;;
   esac
