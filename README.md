@@ -249,17 +249,22 @@ boxen resume myproj
 ```
 Sessions in myproj, newest first:
 
-   1) 25m ago  "add retry to the webhook handler"   may be open in the app already
-   2) 3h ago   "fix the login redirect bug"
-   3) 6d ago   "add CSV export"
+   1) 25m ago  "Webhook retries"            may be open in the app already
+   2) 3h ago   "Fix login redirect loop"
+   3) 6d ago   "Add CSV export"
 Number to continue in the Claude app (Enter to cancel): 3
 ```
 
-Pick one and boxen waits until it's connected, then tells you. In the app's
-session list it's titled `myproj: <first thing you typed>` (the list above
-shows the same text). That covers sessions imported from a Mac, sessions from
-before a long downtime, and ones you started in a terminal with
-`boxen claude <name>`.
+Pick one and boxen waits until it's connected, then tells you. That covers
+sessions imported from a Mac, sessions from before a long downtime, and ones
+you started in a terminal with `boxen claude <name>`.
+
+Names are Claude's own session titles: the one you gave a session (with
+`/rename`, or by renaming it in the Claude app, which syncs back), otherwise
+the title Claude generated for it, otherwise its first message. In the app
+it shows as `myproj · <title>`, since the app lists every project's sessions
+together. `--name "..."` sets the app title exactly:
+`boxen resume myproj 3 --name "CSV export"`.
 
 The first time you resume anything, Claude runs its one-time interactive
 setup (theme, a security note) and may ask you to confirm Remote Control.
@@ -296,7 +301,7 @@ doesn't, and no project can be named `all`.)
 | `boxen logs <name> [-f]` | Remote Control server output |
 | `boxen shell <name>` | Bash inside the container |
 | `boxen claude <name>` | Terminal Claude session inside the container |
-| `boxen resume <name> [N]` | Pick an earlier session from a list and continue it in the Claude app (`--stop`, `--attach`) |
+| `boxen resume <name> [N]` | Pick an earlier session from a list and continue it in the Claude app (`--name`, `--stop`, `--attach`) |
 | `boxen up <name\|all>` | Start, or apply changes to `boxen.env` / `project.env` / `compose.yaml` |
 | `boxen down <name\|all>` | Stop |
 | `boxen restart <name\|all>` | Recreate the container (also picks up env changes) |

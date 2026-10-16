@@ -1,7 +1,7 @@
 #!/bin/bash
 # boxen-sessions: runs inside a boxen container (via `boxen resume`).
 #
-#   boxen-sessions resume [N|ID] [--attach] [--force] [--stop]
+#   boxen-sessions resume [N|ID] [--name TITLE] [--attach] [--force] [--stop]
 #   boxen-sessions count
 #
 # Lists this project's earlier Claude sessions and continues the one you pick
@@ -58,6 +58,20 @@ preview() {
     | grep -v '^[[:space:]]*$' | head -1 | tr '\t\n' '  ' | cut -c1-60 | sed 's/[[:space:]]*$//'
 }
 
+# title ID: the session's name. Claude keeps two in the transcript: the one
+# you gave it (/rename, or renaming it in the Claude app, which syncs back as
+# the same entry) and one it generates itself. Yours wins; with neither, the
+# first message stands in.
+title() {
+  local t
+  t=$(grep -aE '"type":"(custom-title|ai-title)"' "$(tfile "$1")" 2>/dev/null \
+        | jq -rs '(map(select(.type == "custom-title") | .customTitle) | last)
+                  // (map(select(.type == "ai-title") | .aiTitle) | last) // empty' 2>/dev/null \
+        | tr '\t\n' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [[ -n $t ]] || t=$(preview "$1")
+  printf '%s' "${t:0:60}"
+}
+
 # rc_state ID: is the session's Remote Control connected? Read off its screen.
 # Prints "connected [url]", "elsewhere", "dead" or "waiting". A connected
 # session shows "/rc active" in its footer and posts its claude.ai/code link
@@ -91,9 +105,9 @@ screen_tail() {
     | grep -v '^[[:space:]]*$' | tail -"${2:-8}" | sed 's/^/    /'
 }
 
-# host ID TITLE: continue the session in tmux with Remote Control on, under a
-# title you'll recognize in the app ("<project>: <first message>"). Without
-# one, the app titles it from the conversation's last message.
+# host ID TITLE: continue the session in tmux with Remote Control on, under
+# TITLE in the app. (Without a name, the app would title it from the
+# conversation's last message.)
 host() {
   local t
   t=$(tname "$1")
@@ -150,12 +164,12 @@ report() {
   esac
 }
 
-# number, id, state, last active, preview
+# number, id, state, last active, title
 list_rows() {
   local id st since m p i=0
   since=$(started)
   for id in $(sessions); do
-    p=$(preview "$id")
+    p=$(title "$id")
     [[ -n $p ]] || continue            # empty, never-used session
     m=$(mtime "$id")
     if alive "$id"; then st=open
@@ -168,10 +182,12 @@ list_rows() {
 }
 
 cmd_resume() {
-  local pick="" attach=0 force=0 stop=0 rows id st m p n
+  local pick="" attach=0 force=0 stop=0 name="" rows id st m p n
   while (( $# )); do
     case $1 in
       --attach) attach=1 ;; --force) force=1 ;; --stop) stop=1 ;;
+      --name) name=${2:-}; shift; [[ -n $name ]] || { echo "--name needs a title" >&2; return 1; } ;;
+      --name=*) name=${1#--name=} ;;
       *) pick=$1 ;;
     esac
     shift
@@ -196,11 +212,10 @@ cmd_resume() {
     [[ -n $pick ]] || return 0
   fi
 
-  if [[ $pick =~ ^[0-9]+$ ]]; then
-    id=$(awk -F'\t' -v n="$pick" '$1 == n { print $2 }' <<< "$rows")
-  else
-    id=$(awk -F'\t' -v s="$pick" 'index($2, s) == 1 { print $2; exit }' <<< "$rows")
-  fi
+  # A list number, or else the start of a session ID.
+  id=""
+  [[ $pick =~ ^[0-9]+$ ]] && id=$(awk -F'\t' -v n="$pick" '$1 == n { print $2 }' <<< "$rows")
+  [[ -n $id ]] || id=$(awk -F'\t' -v s="$pick" 'index($2, s) == 1 { print $2; exit }' <<< "$rows")
   [[ -n $id ]] || { echo "No session '$pick' in the list." >&2; return 1; }
   st=$(awk -F'\t' -v s="$id" '$2 == s { print $3 }' <<< "$rows")
   p=$(awk -F'\t' -v s="$id" '$2 == s { print $5 }' <<< "$rows")
@@ -219,8 +234,13 @@ If it isn't in the app, run this again with --force.
 EOF
     return 1
   fi
-  local title="$NAME: $p"
-  (( ${#title} > 60 )) && title="${title:0:57}..."
+  # In the app: "<project> · <title>", since the app lists every project's
+  # sessions together. --name sets the title exactly.
+  local title=${name:-"$NAME · $p"}
+  if [[ $st == open && -n $name ]]; then
+    echo "It's already open, so --name doesn't apply; rename it in the app or with /rename." >&2
+    title="$NAME · $p"
+  fi
   if [[ $st != open ]]; then
     echo "Continuing \"$p\"..."
     host "$id" "$title" || { echo "Couldn't start Claude for that session." >&2; return 1; }
