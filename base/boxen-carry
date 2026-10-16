@@ -1,9 +1,10 @@
 #!/bin/bash
 # boxen-carry: runs inside a boxen container, for the /carry skill.
 #
-#   boxen-carry list                              earlier sessions in this folder
-#   boxen-carry read <id-or-prefix> [--max-chars N]   one session as plain text
-#   boxen-carry memdir                            this project's auto-memory dir
+#   boxen-carry list                          earlier sessions in this folder
+#   boxen-carry info <id-or-prefix>           one session's id, title, date, turns, chars, parts
+#   boxen-carry read <id-or-prefix> [--part K]   one session as plain text (part K of M)
+#   boxen-carry memdir                        this project's auto-memory dir
 #
 # /carry reads old conversations with these and writes what they learned into
 # the project's auto memory, so later sessions start informed. The transcripts
@@ -98,14 +99,15 @@ carried() {
   echo "-"
 }
 
-# N  id8  date  turns  carried|-  title
+# N  id8  date  turns  parts  carried|-  title
 cmd_list() {
   local id p i=0
   for id in $(sessions); do
     p=$(title "$id")
     [[ -n $p ]] || continue            # empty, never-used session
     i=$((i + 1))
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "${id:0:8}" "$(sdate "$id")" "$(turns "$id")" "$(carried "$id")" "$p"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "${id:0:8}" "$(sdate "$id")" "$(turns "$id")" \
+      "$(render_convo "$id" | MODE=count parts_perl)" "$(carried "$id")" "$p"
   done
 }
 
@@ -148,37 +150,73 @@ CONVO="$JQ_DEFS"'
       end
   else empty end'
 
+render_convo() { jq -r "$CONVO" "$(tfile "$1")" 2>/dev/null; }
+
+# parts_perl: the rendered conversation (stdin) in parts of at most PART_CHARS
+# characters, cut only between messages (before a "## ..." heading); a single
+# message longer than that is a part of its own, whole. Nothing is ever left
+# out. MODE=count prints the number of parts, MODE=chars the length, MODE=part
+# prints part K with its header and continuation lines (K out of range: error).
+export PART_CHARS=60000
+parts_perl() {
+  perl -CSD -e '
+    use strict; use warnings;
+    local $/; my $t = <STDIN>; $t = "" unless defined $t;
+    my $limit = $ENV{PART_CHARS};
+    my (@parts, $cur); $cur = "";
+    for my $m (split /(?=^## (?:You|Claude|Earlier context)\b)/m, $t) {
+      next if $m eq "";
+      if ($cur ne "" && length($cur) + length($m) > $limit) { push @parts, $cur; $cur = $m }
+      else { $cur .= $m }
+    }
+    push @parts, $cur if $cur ne "";
+    @parts = ("") unless @parts;
+    my $M = scalar @parts;
+    my $mode = $ENV{MODE} // "count";
+    if ($mode eq "count") { print "$M\n"; exit }
+    if ($mode eq "chars") { print length($t), "\n"; exit }
+    my $k = $ENV{K} // 1;
+    if ($k !~ /^\d+$/ || $k < 1 || $k > $M) { print STDERR "no part $k: this session has $M part(s)\n"; exit 1 }
+    my $id8 = substr($ENV{ID}, 0, 8);
+    print "# Session $ENV{ID} \x{2014} $ENV{TITLE} \x{2014} $ENV{DATE} \x{2014} $ENV{TURNS} turns \x{2014} part $k of $M\n\n";
+    print "(continues from part ", $k - 1, ")\n\n" if $k > 1;
+    print $parts[$k - 1];
+    print "(continued in part ", $k + 1, " \x{2014} run: boxen-carry read $id8 --part ", $k + 1, ")\n" if $k < $M;'
+}
+
+cmd_info() {
+  local id
+  [[ -n ${1:-} ]] || { echo "which session? (boxen-carry list)" >&2; return 1; }
+  id=$(find_id "$1") || return 1
+  printf 'id: %s\ntitle: %s\ndate: %s\nturns: %s\n' "$id" "$(title "$id")" "$(sdate "$id")" "$(turns "$id")"
+  printf 'chars: %s\n' "$(render_convo "$id" | MODE=chars parts_perl)"
+  printf 'parts: %s\n' "$(render_convo "$id" | MODE=count parts_perl)"
+}
+
 cmd_read() {
-  local pick="" max=120000 id
+  local pick="" part=1 id
   while (( $# )); do
     case $1 in
-      --max-chars) max=${2:-}; shift ;;
-      --max-chars=*) max=${1#--max-chars=} ;;
+      --part) part=${2:-}; shift ;;
+      --part=*) part=${1#--part=} ;;
       -*) echo "unknown option: $1" >&2; return 1 ;;
       *) pick=$1 ;;
     esac
     shift
   done
   [[ -n $pick ]] || { echo "which session? (boxen-carry list)" >&2; return 1; }
-  [[ $max =~ ^[0-9]+$ ]] || { echo "--max-chars needs a number" >&2; return 1; }
+  [[ $part =~ ^[0-9]+$ ]] || { echo "--part needs a number" >&2; return 1; }
   id=$(find_id "$pick") || return 1
-  printf '# Session %s — %s — %s — %s turns\n\n' "$id" "$(title "$id")" "$(sdate "$id")" "$(turns "$id")"
-  # Keep the start (the goal) and the end (where it stands) of a long one.
-  jq -r "$CONVO" "$(tfile "$id")" 2>/dev/null | perl -CSD -0777 -ne '
-    my $max = '"$max"';
-    my $n = length;
-    if ($n <= $max) { print; exit }
-    my ($head, $tail) = (int($max * 0.4), int($max * 0.5));
-    print substr($_, 0, $head);
-    print "\n\n[\x{2026} ", $n - $head - $tail, " characters of the middle omitted \x{2026}]\n\n";
-    print substr($_, $n - $tail);'
+  render_convo "$id" \
+    | MODE=part K=$part ID=$id TITLE=$(title "$id") DATE=$(sdate "$id") TURNS=$(turns "$id") parts_perl
 }
 
 cmd_memdir() { printf '%s\n' "$MEMDIR"; }
 
 case ${1:-} in
   list)   cmd_list ;;
+  info)   shift; cmd_info "$@" ;;
   read)   shift; cmd_read "$@" ;;
   memdir) cmd_memdir ;;
-  *)      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

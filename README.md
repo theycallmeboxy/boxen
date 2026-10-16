@@ -97,10 +97,11 @@ project's earlier conversations (date, length, title, whether already
 carried), you pick some (`/carry all`, `/carry new` for the ones not yet
 carried, `/carry 1 3`), and it reads each one and writes a handoff into the
 project's auto memory: goal, what was done, decisions and why, open items,
-gotchas, key files. Auto memory is on by default here, so every later session
-in that project loads it without being asked, and `/carry` ends with where
-things stand. Transcripts aren't changed, and boxen keeps them for 365 days
-(Claude Code's default is 30; a `cleanupPeriodDays` you've set is left alone).
+gotchas, key files. Long conversations are read in full, in parts. Auto
+memory is on by default here, so every later session in that project loads
+it without being asked, and `/carry` ends with where things stand.
+Transcripts aren't changed, and boxen keeps them for 365 days (Claude Code's
+default is 30; a `cleanupPeriodDays` you've set is left alone).
 
 For an exact replay instead, `boxen resume <name>` on the VM lists the same
 sessions; pick one (or pass its number or ID) and it reopens in the Claude app
