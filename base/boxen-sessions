@@ -45,12 +45,17 @@ sessions() {
 
 # The first thing you typed in a session, for the list. Transcripts are an
 # internal format, so this is best effort and may come back empty.
+# Slash commands are stored as markup (<command-name>/model</command-name>...);
+# those show as the command if nothing you typed comes first.
 preview() {
   jq -r 'select(.type == "user") | .message.content
          | if type == "string" then . elif type == "array"
-           then (map(select(.type == "text") | .text) | join(" ")) else empty end' \
+           then (map(select(.type == "text") | .text) | join(" ")) else empty end
+         | gsub("^\\s+|\\s+$"; "")
+         | if test("<command-name>") then (capture("<command-name>(?<c>[^<]*)</command-name>").c // empty)
+           elif startswith("<") then empty else . end' \
      "$(tfile "$1")" 2>/dev/null \
-    | grep -v '^[[:space:]]*$' | grep -v '^<' | head -1 | tr '\t\n' '  ' | cut -c1-60 | sed 's/[[:space:]]*$//'
+    | grep -v '^[[:space:]]*$' | head -1 | tr '\t\n' '  ' | cut -c1-60 | sed 's/[[:space:]]*$//'
 }
 
 # rc_state ID: is the session's Remote Control connected? Read off its screen.
