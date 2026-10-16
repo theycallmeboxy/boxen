@@ -23,8 +23,22 @@ tname() { printf 's-%s' "${1:0:8}"; }
 alive() { tmux has-session -t "$(tname "$1")" 2>/dev/null \
             && [[ "$(tmux display -p -t "$(tname "$1")" '#{pane_dead}' 2>/dev/null)" != 1 ]]; }
 
-# When this container (and so its Remote Control server) started.
-started() { echo $(( $(now) - $(ps -o etimes= -p 1 | tr -d ' ') )); }
+# IDs of conversations a Claude process in this container has open right now
+# (the server's sessions, a terminal session, or one boxen resumed). Each
+# running Claude writes sessions/<pid>.json with its conversation ID, PID,
+# process start time and PID namespace. The folder is shared by every
+# project, so only entries from this container's namespace whose process is
+# still the same one (start time matches) count.
+running_ids() {
+  local ns f id pid start dom
+  ns=$(readlink /proc/self/ns/pid 2>/dev/null) || return 0
+  for f in "$CFG"/sessions/*.json; do
+    [[ -f $f ]] || continue
+    IFS=$'\t' read -r id pid start dom < <(jq -r '[.sessionId, .pid, .procStart, .pidDomain] | map(. // "" | tostring) | @tsv' "$f" 2>/dev/null) || continue
+    [[ -n $id && $pid =~ ^[0-9]+$ && $dom == *":$ns" ]] || continue
+    [[ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)" == "$start" ]] && printf '%s\n' "$id"
+  done
+}
 
 ago() {
   local s=$(( $(now) - $1 ))
@@ -166,14 +180,14 @@ report() {
 
 # number, id, state, last active, title
 list_rows() {
-  local id st since m p i=0
-  since=$(started)
+  local id st m p i=0 running
+  running=$(running_ids)
   for id in $(sessions); do
     p=$(title "$id")
     [[ -n $p ]] || continue            # empty, never-used session
     m=$(mtime "$id")
     if alive "$id"; then st=open
-    elif (( m >= since )); then st=live
+    elif grep -qxF "$id" <<<"$running"; then st=live
     else st=-; fi
     i=$((i + 1))
     printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$id" "$st" "$m" "$p"
@@ -202,7 +216,7 @@ cmd_resume() {
     while IFS=$'\t' read -r n id st m p; do
       case $st in
         open) st="in the app (resumed with boxen)" ;;
-        live) st="may be open in the app already" ;;
+        live) st="open in the app" ;;
         *)    st="" ;;
       esac
       printf '  %2s) %-8s %-62s %s\n' "$n" "$(ago "$m")" "\"$p\"" "$st"
@@ -228,9 +242,9 @@ cmd_resume() {
   if [[ $st == live ]] && (( ! force )); then
     cat >&2 <<EOF
 "$p"
-was used since $NAME started, so it's probably still open in the Claude app;
-continue it there. (Opening it twice would mix the two copies' messages.)
-If it isn't in the app, run this again with --force.
+is open in another Claude process in $NAME right now (one of the project's
+sessions in the app, or a terminal session), so continue it there. Opening it
+twice would mix the two copies' messages. To open it anyway, add --force.
 EOF
     return 1
   fi

@@ -249,7 +249,7 @@ boxen resume myproj
 ```
 Sessions in myproj, newest first:
 
-   1) 25m ago  "Webhook retries"            may be open in the app already
+   1) 25m ago  "Webhook retries"            open in the app
    2) 3h ago   "Fix login redirect loop"
    3) 6d ago   "Add CSV export"
 Number to continue in the Claude app (Enter to cancel): 3
@@ -275,9 +275,13 @@ you press Ctrl+B then D once it shows `/rc active`. Your answers are saved in
 the shared config, so later resumes go straight to the app.
 
 - `boxen resume myproj 3` skips the list.
-- A session marked "may be open in the app already" was used since the
-  project started, so continue it in the app. boxen won't open it a second
-  time (two copies would mix their messages) unless you add `--force`.
+- A session marked "open in the app" is running in a Claude process in that
+  project right now (checked against Claude's own list of running sessions),
+  so continue it there. boxen won't open it a second time (two copies would
+  mix their messages) unless you add `--force`.
+- Deleting or archiving a session in the app doesn't delete its conversation
+  on the VM, so it stays in this list (Claude removes old ones after 30
+  days).
 - A resumed session stays open until you close it with
   `boxen resume myproj 3 --stop` or the container restarts; after a restart,
   resume it again. `boxen ls` shows how many are open per project.
