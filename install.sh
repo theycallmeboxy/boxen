@@ -48,8 +48,6 @@ else
       sudo apt-get remove -y "$pkg"
     fi
   done
-  sudo apt-get update
-  sudo apt-get install -y ca-certificates curl git
   sudo install -m 0755 -d /etc/apt/keyrings
   sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   sudo chmod a+r /etc/apt/keyrings/docker.asc
@@ -97,9 +95,7 @@ fi
 cat <<EOF
 
 ==> Installed. Next:
-    1. Log out and back in (picks up the docker group and ~/.local/bin on PATH).
-    2. boxen github     (connects GitHub; sets your no-reply commit identity)
-    3. Check ~/.config/boxen/boxen.env (timezone, anything else).
-    4. Optional: bring over your personal Claude config (see README, "Your Claude config").
-    5. boxen new <name> https://github.com/<you>/<repo>.git
+    1. Log out and back in if 'boxen' isn't on your PATH yet.
+    2. boxen github                      connect GitHub
+    3. boxen new <name> [git-url]        add a project
 EOF

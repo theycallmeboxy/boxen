@@ -1,5 +1,5 @@
 # Project image for __NAME__, layered on the shared boxen base.
-# Add this project's toolchain here, then run `boxen rebuild __NAME__`.
+# Add this project's toolchain here, then run `boxen update __NAME__`.
 FROM boxen-base:latest
 
 # Example:

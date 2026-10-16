@@ -357,24 +357,15 @@ imp_apply() {
       create_project "$name" && created+=("$name")
     done < "$IMPORT_DIR/roots.tsv"
 
+    # Start them, the same way `boxen up` does. With a terminal, the one-time
+    # prompts (trust the folder; enable Remote Control) are answered here;
+    # without one, the line per project says to run 'boxen up <name>' from one.
     if (( ${#created[@]} )); then
-      local ans=n
       echo
-      if [[ -t 0 ]]; then
-        read -rp "Start the ${#created[@]} new project(s) now? You'll answer y once per project. [Y/n] " ans
-        ans=${ans:-y}
-      fi
-      if [[ $ans == [yY]* ]]; then
-        ensure_login
-        for name in "${created[@]}"; do
-          info "--- $name"
-          refresh_project "$name" || true
-          start_attached "$name"
-          check_running "$name" || true
-        done
-      else
-        info "start them later with 'boxen trust <name>' (it shows the one-time prompts)"
-      fi
+      if [[ -t 0 ]]; then ensure_login; fi
+      for name in "${created[@]}"; do
+        start_project "$name" || true
+      done
     fi
   fi
 

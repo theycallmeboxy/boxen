@@ -1,0 +1,184 @@
+#!/bin/bash
+# boxen-carry: runs inside a boxen container, for the /carry skill.
+#
+#   boxen-carry list                              earlier sessions in this folder
+#   boxen-carry read <id-or-prefix> [--max-chars N]   one session as plain text
+#   boxen-carry memdir                            this project's auto-memory dir
+#
+# /carry reads old conversations with these and writes what they learned into
+# the project's auto memory, so later sessions start informed. The transcripts
+# themselves are never changed (boxen resume still replays them).
+
+set -u
+
+CFG=${CLAUDE_CONFIG_DIR:?CLAUDE_CONFIG_DIR not set}
+# Claude Code files a folder's sessions under
+# projects/<path with every non-alphanumeric character as ->, as in boxen-sessions.
+keyof() { printf '%s/projects/%s' "$CFG" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
+KEYDIR=$(keyof "$PWD")
+# Auto memory is keyed by the git repo's main root (worktrees and subfolders
+# share it), so the handoffs go there; a folder that isn't a repo is its own.
+mem_root() {
+  local common
+  if common=$(git rev-parse --git-common-dir 2>/dev/null) && [[ -n $common ]]; then
+    [[ $common == /* ]] || common="$PWD/$common"
+    dirname "$(realpath -m "$common")"
+  else
+    printf '%s\n' "$PWD"
+  fi
+}
+MEMDIR="$(keyof "$(mem_root)")/memory"
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+tfile() { printf '%s/%s.jsonl' "$KEYDIR" "$1"; }
+
+# Session IDs in this folder, newest first.
+sessions() {
+  local f id
+  find "$KEYDIR" -maxdepth 1 -type f -name '*.jsonl' -printf '%T@ %f\n' 2>/dev/null \
+    | sort -rn | while read -r _ f; do
+        id=${f%.jsonl}
+        [[ $id =~ $UUID_RE ]] && printf '%s\n' "$id"
+      done
+}
+
+# The text you typed in a user record: its text blocks, each trimmed, minus
+# system markup (a record holds e.g. a <system-reminder> block and then your
+# message, so blocks are filtered one by one before joining). Slash commands
+# are stored as markup; those become the command name. Tool results, meta
+# records and compaction summaries aren't your messages.
+# Same as boxen-sessions preview(): keep the two in sync.
+JQ_DEFS='
+  def blocks: .message.content
+    | if type == "string" then [.] elif type == "array"
+      then map(select(.type == "text") | .text) else [] end;
+  def user_text: blocks
+    | map(gsub("^\\s+|\\s+$"; "")
+          | if test("<command-name>") then (capture("<command-name>(?<c>[^<]*)</command-name>").c // "")
+            elif startswith("<") then "" else . end)
+    | map(select(length > 0)) | join("\n");
+  def typed: select(.type == "user" and .isMeta != true and .isCompactSummary != true);'
+USER_TEXT="$JQ_DEFS typed | user_text | select(length > 0)"
+
+# preview ID: the first thing you typed, for the list (best effort).
+preview() {
+  jq -r "$JQ_DEFS first(typed | user_text | select(length > 0)) | gsub(\"\\n\"; \" \")" \
+     "$(tfile "$1")" 2>/dev/null \
+    | head -1 | tr '\t' ' ' | cut -c1-60 | sed 's/[[:space:]]*$//'
+}
+
+# title ID: the session's name: the one you gave it (/rename, or renaming it
+# in the Claude app), else the one Claude generated, else the first message.
+# Same as boxen-sessions title(): keep the two in sync.
+title() {
+  local t
+  t=$(grep -aE '"type":"(custom-title|ai-title)"' "$(tfile "$1")" 2>/dev/null \
+        | jq -rs '(map(select(.type == "custom-title") | .customTitle) | last)
+                  // (map(select(.type == "ai-title") | .aiTitle) | last) // empty' 2>/dev/null \
+        | tr '\t\n' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [[ -n $t ]] || t=$(preview "$1")
+  printf '%s' "${t:0:60}"
+}
+
+# turns ID: how many messages you typed (one marker per message, since a
+# message can span lines).
+turns() { jq -r "$USER_TEXT | \"x\"" "$(tfile "$1")" 2>/dev/null | grep -c . || true; }
+
+# sdate ID: the day the session started (its first timestamp, else the file's).
+sdate() {
+  local d
+  d=$(jq -r 'select(.timestamp) | .timestamp' "$(tfile "$1")" 2>/dev/null | head -1 | cut -c1-10)
+  [[ $d =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || d=$(date -r "$(tfile "$1")" +%F 2>/dev/null || echo "-")
+  printf '%s' "$d"
+}
+
+carried() {
+  local f
+  for f in "$MEMDIR/carried/${1:0:8}"-*.md; do [[ -e $f ]] && { echo carried; return; }; done
+  echo "-"
+}
+
+# N  id8  date  turns  carried|-  title
+cmd_list() {
+  local id p i=0
+  for id in $(sessions); do
+    p=$(title "$id")
+    [[ -n $p ]] || continue            # empty, never-used session
+    i=$((i + 1))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "${id:0:8}" "$(sdate "$id")" "$(turns "$id")" "$(carried "$id")" "$p"
+  done
+}
+
+# find_id PREFIX: the full session ID.
+find_id() {
+  local id hits=()
+  for id in $(sessions); do
+    [[ $id == "$1"* ]] && hits+=("$id")
+  done
+  case ${#hits[@]} in
+    0) echo "no session '$1' here" >&2; return 1 ;;
+    1) printf '%s' "${hits[0]}" ;;
+    *) echo "ambiguous: matches ${#hits[@]} sessions" >&2; return 1 ;;
+  esac
+}
+
+# The conversation as text: "## You" / "## Claude" turns, Claude's text
+# blocks, and a line naming the tools it used. Tool results are left out; a
+# compaction summary (Claude's own recap of an earlier, trimmed part) is kept
+# under its own heading.
+CONVO="$JQ_DEFS"'
+  if .type == "user" and .isMeta == true then empty
+  elif .type == "user" and .isCompactSummary == true then
+    (blocks | join("\n") | gsub("^\\s+|\\s+$"; "")) as $t
+    | if $t == "" then empty else "## Earlier context (compaction summary)\n\($t)\n" end
+  elif .type == "user" then
+    user_text as $t
+    | if $t == "" then empty else "## You\n\($t)\n" end
+  elif .type == "assistant" then
+    (.message.content
+     | if type == "string" then {text: ., tools: []}
+       elif type == "array" then
+         {text: (map(select(.type == "text") | .text) | join("\n")),
+          tools: (map(select(.type == "tool_use") | .name) | unique)}
+       else {text: "", tools: []} end) as $m
+    | if $m.text == "" and ($m.tools | length) == 0 then empty
+      else "## Claude\n"
+           + (if $m.text != "" then $m.text + "\n" else "" end)
+           + (if ($m.tools | length) > 0 then "[tools: \($m.tools | join(", "))]\n" else "" end)
+      end
+  else empty end'
+
+cmd_read() {
+  local pick="" max=120000 id
+  while (( $# )); do
+    case $1 in
+      --max-chars) max=${2:-}; shift ;;
+      --max-chars=*) max=${1#--max-chars=} ;;
+      -*) echo "unknown option: $1" >&2; return 1 ;;
+      *) pick=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $pick ]] || { echo "which session? (boxen-carry list)" >&2; return 1; }
+  [[ $max =~ ^[0-9]+$ ]] || { echo "--max-chars needs a number" >&2; return 1; }
+  id=$(find_id "$pick") || return 1
+  printf '# Session %s — %s — %s — %s turns\n\n' "$id" "$(title "$id")" "$(sdate "$id")" "$(turns "$id")"
+  # Keep the start (the goal) and the end (where it stands) of a long one.
+  jq -r "$CONVO" "$(tfile "$id")" 2>/dev/null | perl -CSD -0777 -ne '
+    my $max = '"$max"';
+    my $n = length;
+    if ($n <= $max) { print; exit }
+    my ($head, $tail) = (int($max * 0.4), int($max * 0.5));
+    print substr($_, 0, $head);
+    print "\n\n[\x{2026} ", $n - $head - $tail, " characters of the middle omitted \x{2026}]\n\n";
+    print substr($_, $n - $tail);'
+}
+
+cmd_memdir() { printf '%s\n' "$MEMDIR"; }
+
+case ${1:-} in
+  list)   cmd_list ;;
+  read)   shift; cmd_read "$@" ;;
+  memdir) cmd_memdir ;;
+  *)      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

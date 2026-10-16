@@ -6,6 +6,7 @@
 #   ~/.config/boxen/boxen.env         shared env for all containers (BOXEN_HOME)
 #   ~/.config/boxen/base.local.Dockerfile   optional: your additions to the base image
 #   ~/.config/boxen/projects/<name>/  compose.yaml, Dockerfile, optional project.env
+#                                     and compose.override.yaml
 #   ~/src/<name>/                     the project's code (BOXEN_SRC); same path inside
 #   docker volume claude-config       shared ~/.claude for every container
 set -euo pipefail
@@ -33,52 +34,40 @@ die()  { printf 'boxen: %s\n' "$*" >&2; exit 1; }
 warn() { printf '%sboxen: %s\n' "${QUIET:+$(date -Is) }" "$*" >&2; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
+# run_quiet LABEL cmd...: run a command with its output hidden. On failure,
+# print "LABEL failed:" and the last 40 lines of its output, and fail too.
+run_quiet() {
+  local label=$1 out rc=0
+  shift
+  out=$(mktemp)
+  "$@" >"$out" 2>&1 || rc=$?
+  if (( rc )); then
+    printf 'boxen: %s failed:\n' "$label" >&2
+    tail -n 40 "$out" >&2
+  fi
+  rm -f "$out"
+  return "$rc"
+}
+
 usage() {
   cat <<'EOF'
 Usage: boxen <command> [args]
 
-Setup
-  setup                     First-time setup: env file, config volume, base image
-  github [--reset] [--key f.pem]
-                            Connect GitHub: create/verify your GitHub App, set
-                            your no-reply commit identity, schedule token refresh
-  new <name> [git-url]      Create a project and start its container.
-                            git-url: optional HTTPS GitHub URL to clone into
-                            ~/src/<name>. Omit it for a new empty project, or
-                            when ~/src/<name> already holds your code.
-  login                     Sign in to Claude again (shared by all projects),
-                            then restart running projects
-  import <dir>              Copy CLAUDE.md, rules/, skills/, agents/, commands/
-                            from <dir> (e.g. a copy of your Mac's ~/.claude)
-                            into the shared config
-  config                    Shell in the shared ~/.claude (edit CLAUDE.md etc.)
-  import-mac                How to move your code, memory, sessions and config
-                            from a Mac (you run the export on the Mac)
-
-Day to day ("all" in place of <name> means every project)
-  ls                        List projects and container status
-  up <name|all>             Start (or apply boxen.env / project.env changes)
-  down <name|all>           Stop
-  restart <name|all>        Recreate the container (picks up env changes)
-  logs <name> [-f]          Show the Remote Control server's output
-  shell <name>              Bash shell inside the container
-  claude <name> [args]      Interactive Claude session in the container's terminal
-  resume <name> [N]         Pick an earlier session from a numbered list and
-                            continue it in the Claude app (--stop N closes it;
-                            --attach N shows it here)
-  trust <name>              Re-run the one-time trust / Remote Control prompts
-
-Maintenance
-  rebuild <name|all>        Rebuild the project image and recreate its container
-  tokens [name...|all]      Refresh GitHub tokens now (default all; cron does it
-                            every 30 min)
-  regen <name|all>          Re-render compose.yaml from the current template
-                            (old one saved as compose.yaml.bak)
-  update                    Rebuild base (fresh Ubuntu + Claude Code), then all projects
-  rm <name>                 Remove a project's container, image and config
-                            (leaves ~/src/<name> alone)
-  self-update               Pull the latest boxen and re-run its installer, then
-                            say which projects need 'regen' or 'rebuild'
+  new <name> [git-url]                            Create a project (cloning git-url if given) and start it
+  ls                                              List projects, their servers and GitHub tokens
+  up <name|all>                                   Start, or apply env/compose changes; answers pending prompts
+  down <name|all>                                 Stop
+  restart <name|all>                              Recreate the container (picks up env changes)
+  logs <name> [-f]                                The Remote Control server's output
+  shell <name>                                    Bash inside the container
+  claude <name> [args]                            Terminal Claude session inside the container
+  resume <name> [N|ID] [--stop|--attach|--force]  Continue an earlier session in the Claude app
+  rm <name>                                       Remove container, image and config (keeps the code)
+  github [--reset] [--key f.pem]                  Connect GitHub: your app, per-project tokens, commit identity
+  login                                           Sign in to Claude again (shared by every project)
+  update [name|all]                               Rebuild images: fresh base and every project, or one project
+  self-update                                     Update boxen itself and apply it to every project
+  import-mac                                      How to move your Claude Code work from a Mac
 EOF
 }
 
@@ -96,16 +85,20 @@ require_project() {
 }
 
 require_setup() {
-  [[ -f "$ENV_FILE" ]] || die "run 'boxen setup' first"
-  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die "base image missing; run 'boxen setup'"
-  docker volume inspect "$CONFIG_VOLUME" >/dev/null 2>&1 || die "volume $CONFIG_VOLUME missing; run 'boxen setup'"
+  [[ -f "$ENV_FILE" ]] || die "run $BOXEN_REPO/install.sh first"
+  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die "base image missing; run $BOXEN_REPO/install.sh first"
+  docker volume inspect "$CONFIG_VOLUME" >/dev/null 2>&1 || die "volume $CONFIG_VOLUME missing; run $BOXEN_REPO/install.sh first"
 }
 
-# docker compose scoped to one project's directory.
+# docker compose scoped to one project's directory. compose.yaml is generated;
+# the project's own settings go in compose.override.yaml, merged on top (with
+# an explicit -f, compose doesn't pick the override up by itself).
 dc() {
   local name=$1; shift
   local dir; dir=$(proj_dir "$name")
-  docker compose --project-directory "$dir" -f "$dir/compose.yaml" "$@"
+  local files=(-f "$dir/compose.yaml")
+  [[ -f "$dir/compose.override.yaml" ]] && files+=(-f "$dir/compose.override.yaml")
+  docker compose --project-directory "$dir" "${files[@]}" "$@"
 }
 
 # One-off container from the base image with the shared config mounted.
@@ -133,13 +126,12 @@ each() {
     return
   fi
   shift
-  local n failed=() any=0
-  while read -r n; do
-    any=1
-    info "--- $n"
+  local n failed=() list=()
+  mapfile -t list < <(projects)
+  (( ${#list[@]} )) || { info "no projects yet"; return 0; }
+  for n in "${list[@]}"; do
     ( "$fn" "$n" "$@" ) || failed+=("$n")
-  done < <(projects)
-  (( any )) || { info "no projects yet"; return 0; }
+  done
   (( ${#failed[@]} == 0 )) || die "failed for: ${failed[*]}"
 }
 
@@ -153,22 +145,24 @@ build_base() {
     core_extra=(--pull --no-cache)
     local_extra=(--no-cache)
   fi
-  info "building $CORE_IMAGE"
-  docker build "${core_extra[@]}" -t "$CORE_IMAGE" \
+  info "building base image..."
+  run_quiet "building $CORE_IMAGE" docker build "${core_extra[@]}" -t "$CORE_IMAGE" \
     --build-arg USERNAME="$USER_NAME" \
     --build-arg USER_UID="$USER_UID" \
     --build-arg USER_GID="$USER_GID" \
-    "$BOXEN_REPO/base"
+    "$BOXEN_REPO/base" || return 1
   if [[ -f "$LOCAL_BASE" ]]; then
-    info "applying $LOCAL_BASE"
+    info "applying base.local.Dockerfile..."
     # Built from stdin with no context, so nothing in ~/.config/boxen
     # (like boxen.env) is ever sent to the builder.
-    docker build "${local_extra[@]}" -t "$BASE_IMAGE" - < "$LOCAL_BASE"
+    run_quiet "building $BASE_IMAGE from $LOCAL_BASE" \
+      docker build "${local_extra[@]}" -t "$BASE_IMAGE" - < "$LOCAL_BASE" || return 1
   else
-    docker tag "$CORE_IMAGE" "$BASE_IMAGE"
+    run_quiet "tagging $BASE_IMAGE" docker tag "$CORE_IMAGE" "$BASE_IMAGE" || return 1
   fi
 }
 
+# Hidden command: install.sh runs it (and self-update, through install.sh).
 cmd_setup() {
   command -v docker >/dev/null || die "docker not found"
   docker compose version >/dev/null 2>&1 || die "docker compose plugin not found"
@@ -186,7 +180,7 @@ cmd_setup() {
     info "created $ENV_FILE"
   fi
 
-  build_base
+  build_base || exit 1
 
   if ! docker volume inspect "$CONFIG_VOLUME" >/dev/null 2>&1; then
     docker volume create "$CONFIG_VOLUME" >/dev/null
@@ -196,7 +190,42 @@ cmd_setup() {
   docker run --rm --user root -v "$CONFIG_VOLUME:/v" "$BASE_IMAGE" \
     chown "$USER_UID:$USER_GID" /v
 
-  info "setup done. Next: 'boxen github' to connect GitHub, then 'boxen new <name> [git-url]'"
+  install_shared_config
+}
+
+# The /carry skill goes into the shared config (every project sees it), and
+# transcripts are kept a year instead of Claude Code's 30 days, so there's
+# something to carry. Only boxen's own copy of the skill is replaced; a
+# cleanupPeriodDays you set yourself is left alone.
+install_shared_config() {
+  local args line out rc=0
+  mapfile -t args < <(base_args)
+  out=$(mktemp)
+  # shellcheck disable=SC2016  # expanded inside the container
+  run_base "${args[@]}" -v "$BOXEN_REPO/skills:/boxen-skills:ro" "$BASE_IMAGE" bash -c '
+    set -e
+    d=$CLAUDE_CONFIG_DIR/skills/carry
+    if [ ! -f "$d/SKILL.md" ]; then
+      mkdir -p "$d" && cp /boxen-skills/carry/SKILL.md "$d/SKILL.md" && echo "installed /carry skill"
+    elif head -5 "$d/SKILL.md" | grep -q boxen-managed; then
+      cp /boxen-skills/carry/SKILL.md "$d/SKILL.md"
+    fi
+    s=$CLAUDE_CONFIG_DIR/settings.json
+    if [ ! -f "$s" ]; then
+      echo "{\"cleanupPeriodDays\": 365}" > "$s" && echo "transcripts are kept for 365 days"
+    elif ! jq -e "type == \"object\"" "$s" >/dev/null 2>&1; then
+      echo "settings.json is not a JSON object; leaving it alone"
+    elif ! jq -e "has(\"cleanupPeriodDays\")" "$s" >/dev/null; then
+      jq ".cleanupPeriodDays = 365" "$s" > "$s.tmp" && mv -f "$s.tmp" "$s" && echo "transcripts are kept for 365 days"
+    fi' >"$out" 2>&1 || rc=$?
+  if (( rc )); then
+    printf 'boxen: installing shared config failed:\n' >&2
+    tail -n 40 "$out" >&2
+  else
+    while IFS= read -r line; do info "$line"; done < "$out"
+  fi
+  rm -f "$out"
+  return "$rc"
 }
 
 # ------------------------------------------------------- shared config / login
@@ -228,38 +257,15 @@ cmd_login() {
   require_setup
   do_login
   logged_in || die "sign-in didn't produce a claude.ai login"
-  local n
-  while read -r n; do
+  local n list=()
+  mapfile -t list < <(projects)
+  for n in "${list[@]}"; do
     if [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]] \
        || [[ "$(docker inspect -f '{{.State.Restarting}}' "boxen-$n" 2>/dev/null || true)" == true ]]; then
-      info "restarting $n"
       docker restart "boxen-$n" >/dev/null
     fi
-  done < <(projects)
+  done
   info "signed in"
-}
-
-cmd_import() {
-  local dir=${1:-}
-  [[ -n "$dir" && -d "$dir" ]] || die "usage: boxen import <dir>  (a directory with CLAUDE.md, rules/, skills/ ...)"
-  require_setup
-  dir=$(realpath "$dir")
-  local args; mapfile -t args < <(base_args)
-  # shellcheck disable=SC2016  # expanded inside the container
-  run_base "${args[@]}" -v "$dir:/import:ro" "$BASE_IMAGE" bash -c '
-    cd /import
-    found=0
-    for f in CLAUDE.md rules skills agents commands; do
-      if [ -e "$f" ]; then cp -a "$f" "$CLAUDE_CONFIG_DIR/" && echo "imported $f"; found=1; fi
-    done
-    [ "$found" = 1 ] || echo "nothing to import (looked for CLAUDE.md rules skills agents commands)"'
-}
-
-cmd_config() {
-  require_setup
-  local args; mapfile -t args < <(base_args)
-  info "shared ~/.claude; changes apply to every project. 'exit' when done."
-  run_base -it "${args[@]}" -w "$CHOME/.claude" "$BASE_IMAGE" bash
 }
 
 # ---------------------------------------------------------------- GitHub
@@ -340,6 +346,18 @@ mkdir_private() { mkdir -p "$1" && chmod 700 "$1"; }
 
 token_dir() { printf '%s/token' "$(proj_dir "$1")"; }
 
+# token_state NAME: for `boxen ls`, from the token file alone (no network).
+# Tokens last an hour and cron renews them every 30 minutes, so one older
+# than 55 minutes means the refresh isn't happening.
+token_state() {
+  local f
+  f="$(token_dir "$1")/gh-token"
+  project_repo "$1" >/dev/null 2>&1 || { echo "-"; return; }
+  app_configured || { echo "run boxen github"; return; }
+  [[ -f "$f" ]] || { echo "no token"; return; }
+  if (( $(date +%s) - $(stat -c %Y "$f") < 3300 )); then echo "token ok"; else echo "token stale"; fi
+}
+
 # app_account OWNER: true if the boxen app is installed on that account (you,
 # or an org you added it to). Only asked when a repo lookup fails.
 APP_ACCOUNTS=""
@@ -382,7 +400,9 @@ mint_token() {
 }
 
 # Refresh one project's token. A no-op when GitHub isn't set up; removes the
-# token when the project has no GitHub remote (yet).
+# token when the project has no GitHub remote (yet). Quiet except for
+# failures, unless `boxen tokens` asked for the per-project report
+# (TOKENS_VERBOSE).
 refresh_project() {
   local n=$1 dir repo exp
   app_configured || return 0
@@ -390,20 +410,22 @@ refresh_project() {
   mkdir_private "$dir"
   if ! repo=$(project_repo "$n"); then
     rm -f "$dir/gh-token"
-    [[ -n "${QUIET:-}" ]] || printf '  %-24s no GitHub remote; no token\n' "$n"
+    [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s no GitHub remote; no token\n' "$n"
     return 0
   fi
   local rc=0
   exp=$(mint_token "$repo" "$dir") || rc=$?
   if (( rc == 2 )); then
     rm -f "$dir/gh-token"
-    [[ -n "${QUIET:-}" ]] || printf '  %-24s %-36s not your repo: pulls work (public), no token to push\n' "$n" "$repo"
+    [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s %-36s not your repo: pulls work (public), no token to push\n' "$n" "$repo"
     return 0
   fi
   (( rc == 0 )) || return 1
-  [[ -n "${QUIET:-}" ]] || printf '  %-24s %-36s token valid until %s\n' "$n" "$repo" "$exp"
+  [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s %-36s token valid until %s\n' "$n" "$repo" "$exp"
 }
 
+# Hidden command: cron runs `tokens --quiet`; `boxen github` runs it to mint
+# tokens for existing projects.
 cmd_tokens() {
   local n rc=0 list=()
   if [[ "${1:-}" == --quiet ]]; then
@@ -413,6 +435,8 @@ cmd_tokens() {
     if [[ -f "$TOKENS_LOG" ]] && (( $(stat -c %s "$TOKENS_LOG") > 1000000 )); then
       : > "$TOKENS_LOG"
     fi
+  else
+    TOKENS_VERBOSE=1
   fi
   if ! app_configured; then
     [[ -n "${QUIET:-}" ]] || warn "GitHub isn't set up yet; run 'boxen github'"
@@ -500,7 +524,7 @@ cmd_github() {
   for c in openssl curl jq git; do
     command -v "$c" >/dev/null || die "$c is required (sudo apt install $c)"
   done
-  [[ -f "$ENV_FILE" ]] || die "run 'boxen setup' first"
+  [[ -f "$ENV_FILE" ]] || die "run $BOXEN_REPO/install.sh first"
 
   local keyfile=""
   while (( $# )); do
@@ -587,13 +611,14 @@ EOF
 
   # Commit identity for containers: your GitHub no-reply address keeps your
   # real email out of commits. Leave it alone if you've already set one.
-  local email="${uid}+${login}@users.noreply.github.com"
+  local email="${uid}+${login}@users.noreply.github.com" ident_set=0
   name=${name:-$login}
   if [[ -z "$(env_get GIT_AUTHOR_EMAIL)" ]]; then
     set_env GIT_AUTHOR_NAME "$name"
     set_env GIT_COMMITTER_NAME "$name"
     set_env GIT_AUTHOR_EMAIL "$email"
     set_env GIT_COMMITTER_EMAIL "$email"
+    ident_set=1
     info "commits from containers: $name <$email>"
   else
     info "keeping the git identity already in $ENV_FILE ($(env_get GIT_AUTHOR_EMAIL)); your no-reply address is $email"
@@ -601,16 +626,25 @@ EOF
 
   install_cron || true
 
-  local n stale=()
-  while read -r n; do
-    grep -q '/run/boxen' "$(proj_dir "$n")/compose.yaml" || stale+=("$n")
-  done < <(projects)
   info "minting tokens for existing projects"
   cmd_tokens || true
-  if (( ${#stale[@]} )); then
-    warn "these projects predate GitHub App support; run 'boxen regen all': ${stale[*]}"
+
+  # A new identity only reaches containers created after it; recreate the
+  # ones running now.
+  if (( ident_set )); then
+    local n running=()
+    while read -r n; do
+      if [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]]; then
+        running+=("$n")
+      fi
+    done < <(projects)
+    if (( ${#running[@]} )); then
+      for n in "${running[@]}"; do
+        run_quiet "restarting $n" dc "$n" up -d --force-recreate || true
+      done
+      info "restarted ${#running[@]} running project(s) so they pick up the git identity"
+    fi
   fi
-  info "GitHub is set up. Run 'boxen restart all' so running projects pick up the git identity."
 }
 
 # ------------------------------------------------------------ new project
@@ -642,17 +676,17 @@ plain_text() {
 # server_state NAME: what the project's Remote Control server is doing, read
 # from its output since the container last started. A container can be
 # "running" while the server inside sits at a question nobody can answer, so
-# `boxen ls` and the checks after starting a project use this.
+# `boxen ls` and the wait after starting a project use this.
 server_state() {
   local n=$1 started
   started=$(docker inspect -f '{{.State.StartedAt}}' "boxen-$n" 2>/dev/null) || { echo "not created"; return; }
   docker logs --since "$started" --tail 300 "boxen-$n" 2>&1 | plain_text | perl -ne '
     BEGIN { $s = "starting" }
-    if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen trust NAME" }
+    if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen up NAME" }
     elsif (/not logged in|please (log|sign) in|claude (auth )?login/i)
                                                          { $s = "not signed in: run boxen login" }
-    elsif (/Spawn mode for this project/)                { $s = "waiting for an answer: run boxen trust NAME" }
-    elsif (/\[y\/N\]\s*$|\[Y\/n\]\s*$/)                  { $s = "waiting for an answer: run boxen trust NAME" }
+    elsif (/Spawn mode for this project/)                { $s = "waiting for an answer: run boxen up NAME" }
+    elsif (/\[y\/N\]\s*$|\[Y\/n\]\s*$/)                  { $s = "waiting for an answer: run boxen up NAME" }
     elsif (/Reconnecting/)                               { $s = "reconnecting" }
     elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected" }
     END   { print "$s\n" }' | sed "s/NAME/$n/" || true
@@ -669,21 +703,21 @@ render() {
       -e "s|__SRC__|$(sed_esc "$3")|g" "$1"
 }
 
-# start_attached NAME: create the project's container and start it with this
-# terminal attached from its first line of output, so you can answer Claude's
-# one-time prompts (trust this folder; enable Remote Control) in the real
-# server. Once it prints its session URL, boxen detaches on its own and the
-# server keeps running.
-start_attached() {
+# attach_prompts NAME: the server is waiting at one of Claude's one-time
+# questions (trust this folder; enable Remote Control), which it can only
+# take from a terminal. Restart the container with this terminal attached
+# from its first line of output so you can answer; once the server prints
+# its session URL, boxen detaches on its own and the server keeps running.
+attach_prompts() {
   local n=$1 c="boxen-$1" tmp watcher
-  dc "$n" up --no-start
+  docker stop "$c" >/dev/null 2>&1 || true
+  run_quiet "creating $n" dc "$n" up --no-start || return 1
   tmp=$(mktemp -d)
   cat <<EOF
 
-==> Starting '$n'. If Claude asks, answer y to trust this folder and (first
-    time only) y to enable Remote Control. boxen detaches by itself as soon as
-    the server is up. If it ever doesn't, press Ctrl+P then Ctrl+Q to detach;
-    don't use Ctrl+C, which would stop the server.
+==> Starting '$n' with your terminal attached. Answer y to trust this folder and
+    (first time only) y to enable Remote Control; boxen detaches by itself once
+    the server is up. (If it doesn't: Ctrl+P then Ctrl+Q. Ctrl+C restarts the server.)
 
 EOF
   # Watch the attached output for the session URL, then end the attachment
@@ -708,36 +742,120 @@ EOF
   wait "$watcher" 2>/dev/null || true
   stty sane 2>/dev/null || true
   echo
-  if grep -q 'claude\.ai/code?environment=' "$tmp/out" 2>/dev/null; then
-    info "$n's Remote Control server is up"
-  fi
   rm -rf "$tmp"
 }
 
-# After `up`, make sure the server stays running instead of crash-looping.
-check_running() {
-  local n=$1 st
-  info "checking that $n stays up (15s)"
-  sleep 15
-  st=$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "boxen-$n" 2>/dev/null) || st="missing"
-  if [[ "$st" != "true 0" ]]; then
-    warn "$n isn't staying up (running/restarts: $st). Last log lines:"
-    dc "$n" logs --no-log-prefix --tail=30 claude 2>&1 | plain_text >&2 || true
-    warn "fix the cause, then 'boxen up $n'. If it's a sign-in problem: 'boxen login'."
-    return 1
-  fi
-  st=$(server_state "$n")
+# poll_server NAME: server_state, checked every second for up to 20s until it
+# settles on something other than "starting". The restart count is baselined
+# the first time the container is seen running (each call starts over, so a
+# restart during attach_prompts, e.g. from Ctrl+C, isn't a crash loop); if it
+# then exits or restarts, "not running (...)" instead.
+poll_server() {
+  local n=$1 c="boxen-$1" st run0="" run i
+  for (( i = 0; i < 20; i++ )); do
+    run=$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$c" 2>/dev/null) || run="missing"
+    if [[ "$run" == true* ]]; then
+      [[ -n "$run0" ]] || run0=$run
+      if [[ "$run" != "$run0" ]]; then
+        echo "not running (running/restarts: $run)"
+        return
+      fi
+      st=$(server_state "$n")
+      [[ "$st" == starting ]] || { echo "$st"; return; }
+    elif [[ -n "$run0" ]] || (( i >= 3 )); then
+      # Stopped after running, or never came up within a few seconds.
+      echo "not running (running/restarts: $run)"
+      return
+    fi
+    sleep 1
+  done
+  echo starting
+}
+
+# wait_server NAME [PREFIX]: after a start, wait for the project's Remote
+# Control server to connect and print one line about it ("NAME: PREFIXconnected").
+# A server stuck at a one-time question gets answered through attach_prompts
+# when there's a terminal. Returns 1 when the project still needs you.
+wait_server() {
+  local n=$1 pre=${2:-} st
+  st=$(poll_server "$n")
   case $st in
-    connected|reconnecting) info "$n is $st; it's in the Claude app's Code tab" ;;
-    starting) info "$n's server is still starting; check with 'boxen ls'" ;;
-    *) warn "$n's server is $st"; return 1 ;;
+    "not trusted"*|"waiting for an answer"*)
+      if [[ -t 0 ]]; then
+        attach_prompts "$n" || return 1
+        st=$(poll_server "$n")
+      else
+        echo "$n: ${pre}waiting for an answer — run 'boxen up $n' from a terminal"
+        return 1
+      fi ;;
   esac
+  case $st in
+    connected|reconnecting)
+      echo "$n: $pre$st" ;;
+    starting)
+      echo "$n: ${pre}still starting (check 'boxen ls' in a moment)" ;;
+    "not signed in"*)
+      echo "$n: ${pre}not signed in — run 'boxen login'"
+      return 1 ;;
+    "not running"*)
+      warn "$n isn't staying up ${st#not running }. Last log lines:"
+      dc "$n" logs --no-log-prefix --tail=30 claude 2>&1 | plain_text >&2 || true
+      warn "fix the cause, then 'boxen up $n'. If it's a sign-in problem: 'boxen login'."
+      return 1 ;;
+    *)
+      echo "$n: $pre$st"
+      return 1 ;;
+  esac
+}
+
+# start_project NAME [compose up args]: refresh the GitHub token, bring the
+# container up (output hidden unless it fails), then wait_server.
+start_project() {
+  local n=$1
+  shift
+  refresh_project "$n" || true
+  run_quiet "starting $n" dc "$n" up -d "$@" || return 1
+  wait_server "$n"
+}
+
+# write_override_example NAME: a commented compose.override.example.yaml in
+# the project dir, unless the project already has its own override.
+write_override_example() {
+  local pdir
+  pdir=$(proj_dir "$1")
+  [[ -e "$pdir/compose.override.yaml" ]] && return 0
+  render "$BOXEN_REPO/templates/compose.override.example.yaml" "$1" "$SRC_ROOT/$1" \
+    > "$pdir/compose.override.example.yaml"
+}
+
+# rerender_compose NAME [OLD_TEMPLATE]: replace the project's compose.yaml
+# with a render of the current template. A file that differs from the new
+# render and from the render of the template it came from (OLD_TEMPLATE, when
+# known) was edited by hand: it's kept as compose.yaml.old and said so. A
+# compose.yaml.bak from an older boxen goes if it's just the old template.
+rerender_compose() {
+  local n=$1 oldt=${2:-} pdir new old
+  pdir=$(proj_dir "$n")
+  new=$(mktemp)
+  old=$(mktemp)
+  render "$BOXEN_REPO/templates/compose.yaml" "$n" "$SRC_ROOT/$n" > "$new"
+  if [[ -n "$oldt" && -s "$oldt" ]]; then render "$oldt" "$n" "$SRC_ROOT/$n" > "$old"; fi
+  if ! cmp -s "$pdir/compose.yaml" "$new" && ! cmp -s "$pdir/compose.yaml" "$old"; then
+    mv -f "$pdir/compose.yaml" "$pdir/compose.yaml.old"
+    echo "$n: compose.yaml had your edits; kept as compose.yaml.old — move them to compose.override.yaml"
+  fi
+  mv -f "$new" "$pdir/compose.yaml"
+  chmod 0644 "$pdir/compose.yaml"
+  if [[ -f "$pdir/compose.yaml.bak" ]] && cmp -s "$pdir/compose.yaml.bak" "$old"; then
+    rm -f "$pdir/compose.yaml.bak"
+  fi
+  rm -f "$old"
 }
 
 # create_project NAME: write the project's compose.yaml and Dockerfile and
 # build its image. Its code folder (~/src/NAME) must already exist.
 create_project() {
-  local name=$1 pdir src
+  local name=$1 pdir src errf rc=0
   pdir=$(proj_dir "$name")
   src="$SRC_ROOT/$name"
   # Create the token dir yourself so Docker doesn't create it root-owned.
@@ -745,8 +863,13 @@ create_project() {
   mkdir_private "$(token_dir "$name")"
   render "$BOXEN_REPO/templates/compose.yaml" "$name" "$src" > "$pdir/compose.yaml"
   render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" > "$pdir/Dockerfile"
-  info "building image for $name"
-  dc "$name" build
+  write_override_example "$name"
+  printf '\033[1;34m==>\033[0m building image for %s...' "$name"
+  errf=$(mktemp)
+  run_quiet "building image for $name" dc "$name" build 2>"$errf" || rc=$?
+  if (( rc )); then echo; cat "$errf" >&2; else echo " done"; fi
+  rm -f "$errf"
+  return "$rc"
 }
 
 # Set by cmd_new so a failed or interrupted run can be retried cleanly.
@@ -788,6 +911,8 @@ cmd_new() {
 
   # Create the code dir yourself so Docker doesn't create it root-owned.
   mkdir -p "$src"
+  # Sign in before building anything, so a missing login fails fast.
+  ensure_login
   create_project "$name"
 
   if [[ -n "$url" ]]; then
@@ -805,45 +930,42 @@ cmd_new() {
       warn "GitHub isn't set up ('boxen github'); cloning a private repo will fail unless GH_TOKEN is in boxen.env"
     fi
     info "cloning $url"
-    dc "$name" run --rm --no-deps -T claude git clone "$url" .
+    run_quiet "cloning $url" dc "$name" run --rm --no-deps -T claude git clone "$url" .
   fi
-  refresh_project "$name" || true
 
-  ensure_login
-  start_attached "$name"
-
-  # From here on the project exists; keep it even if the health check fails.
+  # From here on the project exists; keep it even if the start needs a retry.
   trap - EXIT
   NEW_PDIR=""
-  check_running "$name"
-  info "done. '$name' is in the Claude app under Code. 'boxen logs $name' shows the server."
+  start_project "$name"
+  info "done: '$name' is in the Claude app under Code."
 }
 
 # -------------------------------------------------------------- day to day
 
-# Each project's container, and whether its server is actually connected
-# (a running container can hold a server stuck at a question).
+# Each project's container, whether its server is actually connected (a
+# running container can hold a server stuck at a question), and its GitHub
+# token.
 cmd_ls() {
-  printf '%-24s %-12s %s\n' PROJECT CONTAINER SERVER
-  local n c st k
+  printf '%-24s %-20s %-42s %s\n' PROJECT CONTAINER SERVER GITHUB
+  local n c st
   while read -r n; do
     c=$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "boxen-$n" 2>/dev/null) || c="-"
     st="-"
-    if [[ $c == running* ]]; then
-      st=$(server_state "$n")
-      k=$(docker exec "boxen-$n" boxen-sessions count 2>/dev/null || true)
-      [[ -n $k && $k != 0 ]] && st+=" (+$k resumed session(s))"
-    fi
+    [[ $c == running* ]] && st=$(server_state "$n")
     [[ $c == *" 0" ]] && c=${c% 0}
     [[ $c == *" "* ]] && c="${c% *} (${c##* } restarts)"
     [[ $c == "-" ]] && c="not created"
-    printf '%-24s %-12s %s\n' "$n" "$c" "$st"
+    printf '%-24s %-20s %-42s %s\n' "$n" "$c" "$st" "$(token_state "$n")"
   done < <(projects)
 }
 
-cmd_up()      { require_project "${1:-}"; refresh_project "$1" || true; dc "$1" up -d; }
-cmd_down()    { require_project "${1:-}"; dc "$1" down; }
-cmd_restart() { require_project "${1:-}"; refresh_project "$1" || true; dc "$1" up -d --force-recreate; }
+cmd_up()      { require_project "${1:-}"; start_project "$1"; }
+cmd_restart() { require_project "${1:-}"; start_project "$1" --force-recreate; }
+cmd_down() {
+  require_project "${1:-}"
+  run_quiet "stopping $1" dc "$1" down || return 1
+  echo "$1: stopped"
+}
 
 cmd_logs() {
   require_project "${1:-}"
@@ -864,7 +986,7 @@ cmd_claude() {
   docker exec -it "boxen-$n" claude "$@"
 }
 
-# resume NAME [N|ID] [--attach] [--force] [--stop]: earlier sessions, in a
+# resume NAME [N|ID] [--stop|--attach|--force]: earlier sessions, in a
 # numbered list; picking one puts it in the Claude app with its history. The
 # work happens inside the container (boxen-sessions).
 cmd_resume() {
@@ -876,69 +998,63 @@ cmd_resume() {
   docker exec -it "boxen-$n" boxen-sessions resume "$@"
 }
 
-cmd_trust() {
-  require_project "${1:-}"
-  dc "$1" down
-  refresh_project "$1" || true
-  start_attached "$1"
-  check_running "$1"
-}
-
-# ------------------------------------------------------------- maintenance
-
-rebuild_one() {
-  info "rebuilding $1"
-  refresh_project "$1" || true
-  dc "$1" build && dc "$1" up -d --force-recreate
-}
-
-cmd_rebuild() {
-  require_project "${1:-}"
-  echo "Recreating the container restarts its Remote Control server;"
-  echo "sessions reconnect on their own, but a turn in progress is interrupted."
-  rebuild_one "$1"
-}
-
-cmd_regen() {
-  require_project "${1:-}"
-  local pdir; pdir=$(proj_dir "$1")
-  cp "$pdir/compose.yaml" "$pdir/compose.yaml.bak"
-  render "$BOXEN_REPO/templates/compose.yaml" "$1" "$SRC_ROOT/$1" > "$pdir/compose.yaml"
-  info "re-rendered $pdir/compose.yaml (old one in compose.yaml.bak; diff them if you'd edited it)"
-  mkdir_private "$(token_dir "$1")"
-  refresh_project "$1" || true
-  dc "$1" up -d
-}
-
-cmd_update() {
-  build_base --fresh
-  local n failed=()
-  while read -r n; do
-    rebuild_one "$n" || failed+=("$n")
-  done < <(projects)
-  info "pruning dangling images and old build cache"
-  docker image prune -f >/dev/null
-  docker builder prune -f --filter until=720h >/dev/null
-  if (( ${#failed[@]} )); then
-    die "update finished, but these projects failed to rebuild: ${failed[*]}"
-  fi
-  info "update done"
-}
-
 cmd_rm() {
   require_project "${1:-}"
   local name=$1 ans
   read -rp "Remove container, image and config for '$name'? Code in $SRC_ROOT/$name is kept. [y/N] " ans
   [[ "$ans" == [yY] ]] || { echo "aborted"; return; }
-  dc "$name" down --rmi all
+  run_quiet "removing $name" dc "$name" down --rmi all || return 1
   rm -rf "$(proj_dir "$name")"
   info "removed '$name'. Code in $SRC_ROOT/$name and its Claude history in the shared config are kept."
 }
 
+# ------------------------------------------------------------- maintenance
+
+# update_one NAME: rebuild the project's image (cached), recreate its
+# container and wait for the server. One line of output.
+update_one() {
+  local n=$1
+  run_quiet "building image for $n" dc "$n" build || return 1
+  refresh_project "$n" || true
+  run_quiet "starting $n" dc "$n" up -d --force-recreate || return 1
+  wait_server "$n" "rebuilt, "
+}
+
+cmd_update() {
+  local n failed=() list=()
+  if [[ -n "${1:-}" && "$1" != all ]]; then
+    require_project "$1"
+    update_one "$1"
+    return
+  fi
+  build_base --fresh || exit 1
+  mapfile -t list < <(projects)
+  for n in "${list[@]}"; do
+    update_one "$n" || failed+=("$n")
+  done
+  docker image prune -f >/dev/null
+  docker builder prune -f --filter until=720h >/dev/null
+  if (( ${#failed[@]} )); then
+    die "update finished, but these projects failed: ${failed[*]}"
+  fi
+  info "update done"
+}
+
+# Hidden for one release: the previous self-update told upgraders to run
+# these. `regen` re-renders compose.yaml (hand edits kept as .old) and starts
+# the project; `rebuild` is `update`. Remove next release.
+cmd_regen() {
+  require_project "${1:-}"
+  rerender_compose "$1"
+  write_override_example "$1"
+  mkdir_private "$(token_dir "$1")"
+  start_project "$1"
+}
+
 cmd_self_update() {
-  local old new changed
+  local old new changed n list=() failed=() mode=none oldt
   old=$(git -C "$BOXEN_REPO" rev-parse HEAD)
-  git -C "$BOXEN_REPO" pull --ff-only \
+  run_quiet "git pull" git -C "$BOXEN_REPO" pull --ff-only \
     || die "couldn't fast-forward $BOXEN_REPO. If you edited files there, move those changes to ~/.config/boxen (see README, Customizing) and retry."
   new=$(git -C "$BOXEN_REPO" rev-parse HEAD)
   if [[ "$old" == "$new" ]]; then
@@ -954,16 +1070,43 @@ cmd_self_update() {
   info "running the updated installer"
   BOXEN_SELF_UPDATE=1 "$BOXEN_REPO/install.sh"
 
-  # What existing projects need. Neither step runs on its own: both restart
-  # containers (interrupting a turn in progress), and regen replaces any edits
-  # to compose.yaml (keeping a .bak).
-  [[ -n "$(projects)" ]] || return 0
-  if grep -qE '^templates/compose\.yaml$' <<<"$changed"; then
-    warn "the project compose template changed: run 'boxen regen all' (your current files are kept as compose.yaml.bak)"
+  mapfile -t list < <(projects)
+  if (( ${#list[@]} == 0 )); then
+    info "self-update done"
+    return 0
   fi
-  if grep -qE '^(base/|templates/Dockerfile$)' <<<"$changed"; then
-    warn "the base image changed: run 'boxen rebuild all' so projects use it"
+
+  # Every project's compose.yaml comes from the template (settings of your
+  # own belong in compose.override.yaml). Hand edits are kept as .old.
+  oldt=$(mktemp)
+  git -C "$BOXEN_REPO" show "$old:templates/compose.yaml" > "$oldt" 2>/dev/null || true
+  for n in "${list[@]}"; do
+    rerender_compose "$n" "$oldt"
+    write_override_example "$n"
+    mkdir_private "$(token_dir "$n")"
+  done
+  rm -f "$oldt"
+
+  # A changed base image means new project images; a changed compose template
+  # means `up` (compose recreates only what differs).
+  if grep -qE '^base/' <<<"$changed"; then
+    mode=rebuild
+  elif grep -qE '^templates/compose\.yaml$' <<<"$changed"; then
+    mode=up
   fi
+  if [[ "$mode" != none ]]; then
+    info "applying to projects (servers restart; app sessions reconnect on their own)"
+    for n in "${list[@]}"; do
+      case $mode in
+        rebuild) update_one "$n" || failed+=("$n") ;;
+        up)      start_project "$n" || failed+=("$n") ;;
+      esac
+    done
+  fi
+  if (( ${#failed[@]} )); then
+    die "self-update finished, but these projects failed: ${failed[*]}"
+  fi
+  info "self-update done"
 }
 
 # ------------------------------------------------------------------- main
@@ -971,17 +1114,7 @@ cmd_self_update() {
 cmd=${1:-help}
 shift || true
 case "$cmd" in
-  setup)    cmd_setup "$@" ;;
   new)      cmd_new "$@" ;;
-  github)   cmd_github "$@" ;;
-  tokens)   cmd_tokens "$@" ;;
-  login)    cmd_login ;;
-  import)   cmd_import "$@" ;;
-  config)   cmd_config ;;
-  import-mac)
-    # shellcheck source=lib/import-mac.sh
-    source "$BOXEN_REPO/lib/import-mac.sh"
-    cmd_import_mac "$@" ;;
   ls|list)  cmd_ls ;;
   up)       each cmd_up "$@" ;;
   down)     each cmd_down "$@" ;;
@@ -990,12 +1123,19 @@ case "$cmd" in
   shell)    cmd_shell "$@" ;;
   claude)   cmd_claude "$@" ;;
   resume)   cmd_resume "$@" ;;
-  trust)    cmd_trust "$@" ;;
-  rebuild)  each cmd_rebuild "$@" ;;
-  regen)    each cmd_regen "$@" ;;
-  update)   cmd_update ;;
   rm)       cmd_rm "$@" ;;
+  github)   cmd_github "$@" ;;
+  login)    cmd_login ;;
+  update)   cmd_update "$@" ;;
   self-update) cmd_self_update ;;
+  import-mac)
+    # shellcheck source=lib/import-mac.sh
+    source "$BOXEN_REPO/lib/import-mac.sh"
+    cmd_import_mac "$@" ;;
+  setup)    cmd_setup "$@" ;;
+  tokens)   cmd_tokens "$@" ;;
+  regen)    each cmd_regen "$@" ;;
+  rebuild)  cmd_update "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac

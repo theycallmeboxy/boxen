@@ -1,8 +1,7 @@
 #!/bin/bash
 # boxen-sessions: runs inside a boxen container (via `boxen resume`).
 #
-#   boxen-sessions resume [N|ID] [--name TITLE] [--attach] [--force] [--stop]
-#   boxen-sessions count
+#   boxen-sessions resume [N|ID] [--attach] [--force] [--stop]
 #
 # Lists this project's earlier Claude sessions and continues the one you pick
 # in a tmux session with Remote Control on, so it shows up in the Claude app
@@ -58,18 +57,24 @@ sessions() {
 }
 
 # The first thing you typed in a session, for the list. Transcripts are an
-# internal format, so this is best effort and may come back empty.
-# Slash commands are stored as markup (<command-name>/model</command-name>...);
-# those show as the command if nothing you typed comes first.
+# internal format, so this is best effort and may come back empty. A record
+# holds several text blocks (a <system-reminder>, then your message), so
+# markup is dropped block by block before joining. Slash commands are stored
+# as markup (<command-name>/model</command-name>...); those show as the
+# command. Meta records and compaction summaries aren't your messages.
+# Same as boxen-carry user_text: keep the two in sync.
 preview() {
-  jq -r 'select(.type == "user") | .message.content
-         | if type == "string" then . elif type == "array"
-           then (map(select(.type == "text") | .text) | join(" ")) else empty end
-         | gsub("^\\s+|\\s+$"; "")
-         | if test("<command-name>") then (capture("<command-name>(?<c>[^<]*)</command-name>").c // empty)
-           elif startswith("<") then empty else . end' \
+  jq -r 'first(select(.type == "user" and .isMeta != true and .isCompactSummary != true)
+         | .message.content
+         | if type == "string" then [.] elif type == "array"
+           then map(select(.type == "text") | .text) else [] end
+         | map(gsub("^\\s+|\\s+$"; "")
+               | if test("<command-name>") then (capture("<command-name>(?<c>[^<]*)</command-name>").c // "")
+                 elif startswith("<") then "" else . end)
+         | map(select(length > 0)) | join(" ")
+         | select(length > 0))' \
      "$(tfile "$1")" 2>/dev/null \
-    | grep -v '^[[:space:]]*$' | head -1 | tr '\t\n' '  ' | cut -c1-60 | sed 's/[[:space:]]*$//'
+    | head -1 | tr '\t' ' ' | cut -c1-60 | sed 's/[[:space:]]*$//'
 }
 
 # title ID: the session's name. Claude keeps two in the transcript: the one
@@ -134,11 +139,11 @@ host() {
        respawn-pane -k -t "$t" claude --resume "$1" --remote-control "$2" >/dev/null || return 1
 }
 
-# report ID TITLE: say whether the session made it into the app. If Claude is
+# report ID: say whether the session made it into the app. If Claude is
 # still waiting on a question (first-run setup, a one-time Remote Control
 # confirmation), open it here so you can answer.
 report() {
-  local id=$1 title=$2 st
+  local id=$1 st
   st=$(wait_rc "$id" "${BOXEN_RC_WAIT:-30}")
   case $st in
     connected*)
@@ -196,12 +201,11 @@ list_rows() {
 }
 
 cmd_resume() {
-  local pick="" attach=0 force=0 stop=0 name="" rows id st m p n
+  local pick="" attach=0 force=0 stop=0 rows id st m p n
   while (( $# )); do
     case $1 in
       --attach) attach=1 ;; --force) force=1 ;; --stop) stop=1 ;;
-      --name) name=${2:-}; shift; [[ -n $name ]] || { echo "--name needs a title" >&2; return 1; } ;;
-      --name=*) name=${1#--name=} ;;
+      -*) echo "unknown option: $1" >&2; return 1 ;;
       *) pick=$1 ;;
     esac
     shift
@@ -235,9 +239,12 @@ cmd_resume() {
   p=$(awk -F'\t' -v s="$id" '$2 == s { print $5 }' <<< "$rows")
 
   if (( stop )); then
-    tmux kill-session -t "$(tname "$id")" 2>/dev/null || true
-    echo "Closed \"$p\"."
-    return 0
+    if tmux kill-session -t "$(tname "$id")" 2>/dev/null; then
+      echo "Closed \"$p\"."
+      return 0
+    fi
+    echo "\"$p\" isn't open by boxen (nothing to close)."
+    return 1
   fi
   if [[ $st == live ]] && (( ! force )); then
     cat >&2 <<EOF
@@ -249,25 +256,19 @@ EOF
     return 1
   fi
   # In the app: "<project> · <title>", since the app lists every project's
-  # sessions together. --name sets the title exactly.
-  local title=${name:-"$NAME · $p"}
-  if [[ $st == open && -n $name ]]; then
-    echo "It's already open, so --name doesn't apply; rename it in the app or with /rename." >&2
-    title="$NAME · $p"
-  fi
+  # sessions together.
   if [[ $st != open ]]; then
     echo "Continuing \"$p\"..."
-    host "$id" "$title" || { echo "Couldn't start Claude for that session." >&2; return 1; }
+    host "$id" "$NAME · $p" || { echo "Couldn't start Claude for that session." >&2; return 1; }
   fi
   if (( attach )); then
     tmux attach -t "$(tname "$id")"
   else
-    report "$id" "$title"
+    report "$id"
   fi
 }
 
 case ${1:-} in
   resume) shift; cmd_resume "$@" ;;
-  count)  tmux ls -F '#S' 2>/dev/null | grep -c '^s-' || true ;;
-  *)      sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *)      sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
