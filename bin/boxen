@@ -726,20 +726,35 @@ plain_text() {
 # from its output since the container last started. A container can be
 # "running" while the server inside sits at a question nobody can answer, so
 # `boxen ls` and the wait after starting a project use this.
+#
+# The questions themselves ("Trust <dir>? [y/N] ", "Enable Remote Control?
+# (y/n) ") are readline prompts without a newline, and `docker logs` doesn't
+# deliver an unfinished line: a server waiting at the trust question shows
+# only the preamble before it ("Remote Control starts Claude Code sessions
+# in this folder…", "Quick safety check…", "Security guide: …"). So the
+# preamble counts as waiting unless something later (the session URL,
+# Connected, an error) shows the question was passed. The question lines
+# are matched too, for the case where someone typed an answer and the line
+# got completed. (The Remote Control question has no preamble in the binary;
+# on its own it can't be told from "starting".)
 server_state() {
   local n=$1 started
   started=$(docker inspect -f '{{.State.StartedAt}}' "boxen-$n" 2>/dev/null) || { echo "not created"; return; }
   docker logs --since "$started" --tail 300 "boxen-$n" 2>&1 | plain_text | perl -ne '
-    BEGIN { $s = "starting" }
-    if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen up NAME" }
+    BEGIN { $s = "starting"; $q = 0 }
+    if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen up NAME"; $q = 0 }
     elsif (/not logged in|please (log|sign) in|claude (auth )?login/i)
-                                                         { $s = "not signed in: run boxen login" }
+                                                         { $s = "not signed in: run boxen login"; $q = 0 }
     elsif (/Spawn mode for this project/)                { $s = "waiting for an answer: run boxen up NAME" }
+    elsif (/^Remote Control starts Claude Code sessions in this folder|^Quick safety check/)
+                                                         { $q = 1 }
     elsif (/^Trust .*\? \[y\/N\]$|^Enable Remote Control\? \(y\/n\)$/)
                                                          { $s = "waiting for an answer: run boxen up NAME" }
-    elsif (/Reconnecting/)                               { $s = "reconnecting" }
-    elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected" }
-    END   { print "$s\n" }' | sed "s/NAME/$n/" || true
+    elsif (/claude\.ai\/code\?environment=/)              { $q = 0 }
+    elsif (/Reconnecting/)                               { $s = "reconnecting"; $q = 0 }
+    elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected"; $q = 0 }
+    elsif (/^Error:/)                                    { $q = 0 }
+    END   { $s = "waiting for an answer: run boxen up NAME" if $q && $s eq "starting"; print "$s\n" }' | sed "s/NAME/$n/" || true
 }
 
 # Escape a value for use as a sed replacement (we use | as the delimiter).
