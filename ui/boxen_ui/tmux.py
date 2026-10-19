@@ -148,6 +148,13 @@ class Tmux:
             "sh", "-c", hold_script(argv, lock=lock))
         return rc == 0, "opened", err.strip()
 
+    async def kill_finished(self, name):
+        """Close the windows called name whose command has exited (held
+        for Enter), so they don't pile up."""
+        for w in await self.list_windows():
+            if w.name == name and w.finished:
+                await self.run("kill-window", "-t", w.id)
+
     async def kill(self, win_id):
         rc, _out, err = await self.run("kill-window", "-t", win_id)
         return rc == 0, err.strip()

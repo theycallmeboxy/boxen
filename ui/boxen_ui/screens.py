@@ -255,7 +255,8 @@ HELP = [
         ("u", "up: build and start the build container and sidecars, applying .boxen/ changes"),
         ("d", "down: stop them (asks first)"),
         ("s", "root shell in the build container (terminal window)"),
-        ("v", "shell on the VM in the project folder (terminal window)"),
+        ("v", "shell on the VM in the project folder (terminal window); the folder is the agent's: "
+              "git there won't start a repo's fsmonitor, but its hooks still run when you commit"),
         ("n", "new project"),
         ("G", "GitHub repos the project can push to: add, remove"),
         ("X", "remove the build container, image and data (asks first; keeps the code)"),

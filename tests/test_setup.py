@@ -226,6 +226,7 @@ def test_setup_with_systemd_user_services(vm):
     assert "OnUnitActiveSec=30min" in (u / "boxen-tokens.timer").read_text()
     assert "ExecStart=/bin/bash -lc 'exec \"$0\" serve --restore' \"%s\"" % BOXEN in \
         (u / "boxen-serve.service").read_text()
+    assert "After=" not in (u / "boxen-serve.service").read_text()
     log = (vm.fake / "systemctl.log").read_text().splitlines()
     assert "--user enable --now boxen-tokens.timer" in log and "--user enable boxen-serve.service" in log
     assert (vm.fake / "crontab").read_text() == "0 1 * * * mine\n"
@@ -269,3 +270,40 @@ def test_gitconfig_include_stays_last(vm):
     out = vm.tmp / "elsewhere"
     subprocess.run(["git", "init", "-q", str(out)], check=True)
     assert helpers(out)[-1] == "!echo password=GH; true"
+
+
+def test_install_cron_defers_to_the_timer(vm):
+    """With the boxen-tokens timer installed (from a systemd session), a run
+    without systemd doesn't add cron lines."""
+    t = vm.home / ".config" / "systemd" / "user"
+    t.mkdir(parents=True)
+    (t / "boxen-tokens.timer").write_text("[Timer]\n")
+    r = vm.fn("install_cron && echo rc=0")
+    assert r.stdout.endswith("rc=0\n") and not (vm.fake / "crontab").exists()
+    (t / "boxen-tokens.timer").unlink()
+    r = vm.fn("install_cron && echo rc=0")
+    assert r.stdout.endswith("rc=0\n") and "# boxen-tokens" in (vm.fake / "crontab").read_text()
+
+
+def apt_missing(vm, installed, *pkgs):
+    """install.sh's apt_missing, with a fake dpkg that knows INSTALLED."""
+    from conftest import write_exe
+    text = open(os.path.join(REPO, "install.sh")).read()
+    fn = text[text.index("apt_missing() {"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    d = vm.tmp / "dpkg-bin"
+    d.mkdir(exist_ok=True)
+    write_exe(str(d / "dpkg"), '#!/bin/sh\ncase " %s " in *" $2 "*) exit 0 ;; esac\nexit 1\n' % " ".join(installed))
+    prog = "set -euo pipefail\n%s\nmapfile -t missing < <(apt_missing %s)\necho \"${#missing[@]}\"\n" \
+           "apt_missing %s | od -c | head -3\n" % (fn, " ".join(pkgs), " ".join(pkgs))
+    return subprocess.run(["bash", "-c", prog], env=dict(vm.env, PATH="%s:%s" % (d, vm.env["PATH"])),
+                          capture_output=True, text=True)
+
+
+def test_install_apt_missing(vm):
+    r = apt_missing(vm, ["curl", "git"], "curl", "git")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "0\n0000000\n"           # nothing at all (not an empty line): no bytes
+    r = apt_missing(vm, ["curl"], "curl", "git", "jq")
+    lines = r.stdout.splitlines()
+    assert lines[0] == "2" and "g   i   t  \\n   j   q  \\n" in r.stdout

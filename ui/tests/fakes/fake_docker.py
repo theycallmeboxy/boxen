@@ -1,8 +1,7 @@
 """A stand-in for the docker CLI in boxen ui's tests. The dashboard never
-runs it itself (it asks the Engine API, and boxen for the rest; a followed
-log runs it in a tmux window, which is fake here too), so every call is
-recorded in $FAKE_DIR/docker.jsonl for the tests to see there are none,
-and fails."""
+runs it (it asks the Engine API, and boxen for the rest: sidecar logs,
+followed or not, come from `boxen env logs`), so every call is recorded in
+$FAKE_DIR/docker.jsonl for the tests to see there are none, and fails."""
 import json
 import os
 import sys

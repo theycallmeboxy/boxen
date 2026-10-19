@@ -86,6 +86,11 @@ def v1(vm):
     (sup / "compose.yaml").write_text("name: boxen-supervisor\n")
     vm.set_docker(compose_config=PG_CONFIG, v1={
         "images": ["boxen-base:latest"],
+        "containers": {"boxen-old": {"running": True, "image": "sha256:proj-old"},
+                       "boxen.old.postgres": {"running": True, "image": "sha256:postgres"},
+                       "boxen-supervisor": {"running": False, "image": "sha256:proj-sup"},
+                       "other": {"running": True, "image": "sha256:other"}},
+        "images_q": ["sha256:base", "sha256:proj-old"],
         "volumes": {
             "claude-config": {
                 "settings.json": json.dumps({
@@ -112,10 +117,18 @@ def v1(vm):
     vm.sock.close()
 
 
-def migrate(vm, *args):
-    script = 'source "$BOXEN_REPO/lib/migrate.sh"\nV1_SOCK=%s\nmigrate_main %s\n' % (
+def migrate_script(vm, args):
+    return 'source "$BOXEN_REPO/lib/migrate.sh"\nV1_SOCK=%s\nmigrate_main %s\n' % (
         vm.tmp / "system-docker.sock", " ".join(args))
-    return vm.fn(script)
+
+
+def migrate(vm, *args):
+    """boxen migrate (--yes unless args are given) with no terminal."""
+    return vm.fn(migrate_script(vm, args or ("--yes",)))
+
+
+def v1_calls(vm):
+    return [c["argv"][2:] for c in vm.docker_log() if c.get("v1")]
 
 
 def test_migrate(v1):
@@ -155,7 +168,10 @@ def test_migrate(v1):
     assert "boxen.old.pgdata:/v" in restore["argv"] and restore["stdin_members"] == ["./PG_VERSION"]
     assert not any("boxen-home-old" in json.dumps(c["argv"]) for c in log)
     # v1's containers stopped, then the build container built and started
-    assert ["-H", "unix://%s" % (vm.tmp / "system-docker.sock"), "stop", "boxen-old"] in [c["argv"] for c in log]
+    # exactly v1's running containers were stopped (one call), before anything moved
+    stops = [c for c in v1_calls(vm) if c[0] == "stop"]
+    assert stops == [["stop", "boxen-old", "boxen.old.postgres"]]
+    assert vm.load_docker()["v1"]["containers"]["other"]["running"] is True
     assert [(x["project"], x["args"][0]) for x in vm.compose_calls()] == [("old", "build"), ("old", "up")]
     assert json.loads((p / "compose.services.yaml").read_text())["services"]["postgres"]["container_name"] == \
         "boxen.old.postgres"
@@ -231,18 +247,252 @@ def test_migrate_project_without_code(v1):
     shutil.rmtree(v1.src / "old")
     r = migrate(v1)
     assert r.returncode == 0
-    assert "old: %s doesn't exist; skipping" % (v1.src / "old") in r.stderr
-    assert "these need a look: old" in r.stderr
+    assert "old: its code folder %s isn't there; put it back and run boxen migrate again, or drop the project " \
+        "with: rm -rf %s" % (v1.src / "old", v1.pdir("old")) in r.stderr
+    assert "not moved (still v1; boxen migrate again tries them again): old" in r.stderr
     assert (v1.pdir("old") / "compose.yaml").read_text().startswith("name: boxen-old")     # untouched
 
 
 def test_migrate_needs_the_system_daemon(vm):
     r = vm.fn('source "$BOXEN_REPO/lib/migrate.sh"\nV1_SOCK=%s\nmigrate_main\n' % (vm.tmp / "nosock"))
     assert r.returncode == 1 and "can't reach the system Docker daemon, where v1 lives" in r.stderr
+    for args in (["--yes", "--cleanup"], ["--yes", "x"], ["now"]):
+        r = vm.boxen("migrate", *args)
+        assert r.returncode == 1 and "usage: boxen migrate [--cleanup | --yes]" in r.stderr, args
     r = vm.boxen("migrate", "now")
-    assert r.returncode == 1 and "usage: boxen migrate [--cleanup]" in r.stderr
+    assert r.returncode == 1 and "usage: boxen migrate [--cleanup | --yes]" in r.stderr
     r = vm.boxen("migrate", "--cleanup")
     assert r.returncode == 1 and "these v1 projects haven't moved yet: old" in r.stderr
+
+
+def test_migrate_asks_before_stopping_v1(v1):
+    vm = v1
+    # no terminal, no --yes, containers running: refused, nothing touched
+    r = vm.fn(migrate_script(vm, ()))
+    assert r.returncode == 1
+    assert "migrate stops v1's containers first; run it in a terminal, or add --yes" in r.stderr
+    assert not any(c[0] == "stop" for c in v1_calls(vm))
+    assert vm.fn("v1_projects").stdout == "old\nsupervisor\n"
+    # in a terminal: lists them and asks; no
+    r = vm.fn_tty(migrate_script(vm, ()), input="n\n")
+    assert r.returncode == 0, r.stdout
+    assert "This stops v1's running containers (any Claude session in them ends):" in r.stdout
+    assert "    boxen-old\n    boxen.old.postgres\nGo ahead? [y/N]" in r.stdout and "boxen-supervisor" not in r.stdout
+    assert "aborted" in r.stdout
+    assert not any(c[0] == "stop" for c in v1_calls(vm)) and vm.fn("v1_projects").stdout == "old\nsupervisor\n"
+    # yes
+    r = vm.fn_tty(migrate_script(vm, ()), input="y\n")
+    assert r.returncode == 0 and "==> Moved." in r.stdout, r.stdout
+    assert [c for c in v1_calls(vm) if c[0] == "stop"] == [["stop", "boxen-old", "boxen.old.postgres"]]
+    assert vm.fn("v1_projects").stdout == ""
+
+
+def test_migrate_without_running_containers_doesnt_ask(v1):
+    st = v1.load_docker()
+    for c in st["v1"]["containers"].values():
+        c["running"] = False
+    v1.save_docker()
+    r = v1.fn(migrate_script(v1, ()))
+    assert r.returncode == 0, r.stderr
+    assert not any(c[0] == "stop" for c in v1_calls(v1))
+
+
+def test_migrate_through_sudo(v1):
+    """Out of the docker group already: the system daemon through sudo."""
+    st = v1.load_docker()
+    st["v1"]["needs_sudo"] = True
+    v1.save_docker()
+    r = migrate(v1)
+    assert r.returncode == 0, r.stderr
+    v1log = [c for c in v1.docker_log() if c.get("v1")]
+    ok = [c for c in v1log if c["sudo"]]
+    assert ok and all(c["sudo"] for c in v1log[1:])          # the first try, without, was refused
+    sudo = (v1.fake / "sudo.log").read_text().splitlines()
+    assert sudo[0] == "docker -H unix://%s info" % (v1.tmp / "system-docker.sock")
+    assert (v1.pdir("old") / "compose.yaml").read_text().startswith(FORMAT_MARK)
+    assert ["volume", "create", "--label", "boxen.project=old", "boxen.old.pgdata"] in v1.docker_calls()
+
+
+def test_migrate_failed_volume_copy_changes_nothing(v1):
+    vm = v1
+    p = vm.pdir("old")
+    before = sorted(os.listdir(p) + [".lock"])
+    vm.set_docker(fail_restore=["boxen.old.pgdata"])
+    r = migrate(vm)
+    assert r.returncode == 0
+    assert "old: copying volume boxen.old.pgdata failed; nothing changed for old (v1's data is untouched). Run " \
+           "boxen migrate again." in r.stderr
+    assert "not moved (still v1; boxen migrate again tries them again): old" in r.stderr
+    # still v1: nothing moved, no .boxen, the half-made volume removed
+    assert sorted(os.listdir(p)) == before
+    assert not (p / "compose.yaml").read_text().startswith(FORMAT_MARK)
+    assert not (vm.src / "old" / ".boxen").exists()
+    assert "boxen.old.pgdata" not in vm.load_docker()["volumes"]
+    assert ["volume", "rm", "boxen.old.pgdata"] in vm.docker_calls()
+    assert vm.compose_calls() == []
+    assert vm.fn("v1_projects").stdout == "old\n"
+    # again, working this time
+    vm.set_docker(fail_restore=[])
+    r = migrate(vm)
+    assert r.returncode == 0 and "these need a look" not in r.stderr, r.stderr
+    assert (p / "compose.yaml").read_text().startswith(FORMAT_MARK)
+
+
+def test_migrate_copies_env_folder(v1):
+    vm = v1
+    env = vm.pdir("old") / "env"
+    (env / "requirements.txt").write_text("flask\n")
+    (env / ".npmrc").write_text("x=1\n")
+    (env / "conf" / "sub").mkdir(parents=True)
+    (env / "conf" / "sub" / "a.conf").write_text("a\n")
+    (env / "STATUS.md").write_text("v1 status\n")
+    os.symlink("/etc/passwd", env / "passwd")
+    os.symlink(env / "conf", env / "conflink")
+    (vm.pdir("old") / "project.env").write_text("# mine\nFOO=1\n  BAR_2=x y\nnot a var\n")
+    r = migrate(vm)
+    assert r.returncode == 0, r.stderr
+    b = vm.src / "old" / ".boxen"
+    assert sorted(os.listdir(b)) == [".npmrc", "Dockerfile", "conf", "requirements.txt", "services.yaml"]
+    assert (b / "requirements.txt").read_text() == "flask\n"
+    assert (b / "conf" / "sub" / "a.conf").read_text() == "a\n"
+    assert "FROM boxen-env:latest" in (b / "Dockerfile").read_text()
+    assert "    project.env (FOO BAR_2) isn't used by v2: the agent runs on the VM now." in r.stdout
+    assert (vm.pdir("old") / "v1" / "project.env").exists()
+    assert (vm.pdir("old") / "v1" / "env" / "STATUS.md").exists()
+
+
+def test_migrate_shared(v1):
+    """v1's boxen.env commit identity and base.local.Dockerfile."""
+    vm = v1
+    (vm.bhome / "boxen.env").write_text("TZ=UTC\nGIT_AUTHOR_NAME=Boxy B\nGIT_AUTHOR_EMAIL=1+boxy@users.noreply.github.com\n")
+    (vm.bhome / "base.local.Dockerfile").write_text("FROM boxen-base:core\nUSER root\nRUN apt-get install -y vim\n"
+                                                    "USER claude\n")
+    r = migrate(vm)
+    assert r.returncode == 0, r.stderr
+    gc = str(vm.bhome / "gitconfig")
+    get = lambda k: subprocess.run(["git", "config", "-f", gc, k], capture_output=True, text=True).stdout  # noqa
+    assert get("user.name") == "Boxy B\n" and get("user.email") == "1+boxy@users.noreply.github.com\n"
+    assert "commit identity from v1: Boxy B <1+boxy@users.noreply.github.com>" in r.stdout
+    assert (vm.bhome / "env.local.Dockerfile").read_text() == "FROM boxen-env:core\nRUN apt-get install -y vim\n"
+    assert ["build", "-t", "boxen-env:latest", "-"] in vm.docker_calls()
+    assert "base.local.Dockerfile (v1's additions for every project) is now" in r.stdout
+
+
+def test_migrate_shared_keeps_whats_set(v1):
+    vm = v1
+    vm.fn("write_gitconfig Me me@example.com")
+    (vm.bhome / "boxen.env").write_text("GIT_AUTHOR_NAME=Boxy\nGIT_AUTHOR_EMAIL=b@x\n")
+    (vm.bhome / "base.local.Dockerfile").write_text("FROM boxen-base:core\n")
+    (vm.bhome / "env.local.Dockerfile").write_text("FROM boxen-env:core\n# mine\n")
+    r = migrate(vm)
+    assert r.returncode == 0, r.stderr
+    assert vm.fn("git_ident email").stdout == "me@example.com\n"
+    assert (vm.bhome / "env.local.Dockerfile").read_text() == "FROM boxen-env:core\n# mine\n"
+    assert "commit identity from v1" not in r.stdout
+    # no email in boxen.env: nothing
+    assert not any(c[:2] == ["build", "-t"] and c[-1] == "-" for c in vm.docker_calls())
+
+
+def test_migrate_claude_json_not_signed_in_on_the_vm(v1):
+    """The VM has a .claude.json but no login: v1's file, with the VM's on top."""
+    (v1.home / ".claude.json").write_text(json.dumps({"theme": "vm", "projects": {"/x": {"t": 2}},
+                                                      "tips": {"a": 1}}))
+    st = v1.load_docker()
+    st["v1"]["volumes"]["claude-config"][".claude.json"] = json.dumps(
+        {"oauthAccount": {"email": "v1@x"}, "hasCompletedOnboarding": True, "theme": "v1", "tips": {"b": 2},
+         "projects": {"/home/claude/old": {"t": 1}, "/x": {"t": 0}}})
+    v1.save_docker()
+    r = migrate(v1)
+    assert r.returncode == 0, r.stderr
+    cj = json.loads((v1.home / ".claude.json").read_text())
+    assert cj == {"oauthAccount": {"email": "v1@x"}, "hasCompletedOnboarding": True, "theme": "vm",
+                  "tips": {"a": 1, "b": 2}, "projects": {"/home/claude/old": {"t": 1}, "/x": {"t": 2}}}
+    assert json.loads((v1.home / ".claude.json.before-migrate").read_text())["theme"] == "vm"
+
+
+def cleanup(vm, answer="y\n"):
+    return vm.fn_tty('source "$BOXEN_REPO/lib/migrate.sh"\nV1_SOCK=%s\nmigrate_main --cleanup\n'
+                     % (vm.tmp / "system-docker.sock"), input=answer)
+
+
+@pytest.fixture
+def migrated(v1):
+    """v1 after a successful migrate, with v1's other files around."""
+    (v1.bhome / "boxen.env").write_text("GIT_AUTHOR_EMAIL=b@x\n")
+    (v1.bhome / "base.local.Dockerfile").write_text("FROM boxen-base:core\n")
+    (v1.bhome / "agent").mkdir()
+    (v1.bhome / "agent" / "agent.sock").write_text("")
+    (v1.bhome / "agent.log").write_text("x\n")
+    (v1.src / "supervisor").mkdir()
+    r = migrate(v1)
+    assert r.returncode == 0, r.stderr
+    assert (v1.pdir("old") / "v1").is_dir() and (v1.projects / ".v1-supervisor").is_dir()
+    v1.clear_logs()
+    return v1
+
+
+def test_cleanup(migrated):
+    vm = migrated
+    r = cleanup(vm, "n\n")
+    assert "aborted" in r.stdout and (vm.bhome / "boxen.env").exists()
+    assert not [c for c in v1_calls(vm) if c[0] in ("rm", "volume") and c[1] in ("-f", "rm")]
+    r = cleanup(vm)
+    assert r.returncode == 0, r.stdout
+    out = r.stdout
+    assert "3 container(s), 4 image(s) and the build cache" in out
+    calls = v1_calls(vm)
+    (rm,) = [c for c in calls if c[:2] == ["rm", "-f"]]
+    assert sorted(rm[2:]) == ["boxen-old", "boxen-supervisor", "boxen.old.postgres"]     # sidecars too, not "other"
+    (vrm,) = [c for c in calls if c[:2] == ["volume", "rm"]]
+    assert sorted(vrm[2:]) == ["boxen-home-old", "boxen.old.pgdata", "claude-config"]
+    (irm,) = [c for c in calls if c[:2] == ["image", "rm"]]
+    assert sorted(irm[3:]) == ["sha256:base", "sha256:postgres", "sha256:proj-old", "sha256:proj-sup"]
+    assert ["builder", "prune", "-af"] in calls and ["network", "prune", "-f"] in calls
+    for f in ("boxen.env", "base.local.Dockerfile", "agent", "agent.log"):
+        assert not (vm.bhome / f).exists(), f
+    assert not (vm.pdir("old") / "v1").exists() and not (vm.projects / ".v1-supervisor").exists()
+    assert (vm.pdir("old") / "compose.yaml").exists() and (vm.pdir("old") / "token" / "gh-token").exists()
+    assert "systemctl disable --now docker.service docker.socket containerd.service" in \
+        (vm.fake / "sudo.log").read_text()
+    assert "Kept, for you to look at or delete:" in out
+    assert "    %s" % (vm.home / ".claude" / "settings.json.v1") in out
+    assert "    %s" % (vm.src / "supervisor") in out
+    assert ".claude.json.before-migrate" not in out                  # (there was none)
+
+
+def test_cleanup_refuses_uncopied_sidecar_volume(migrated):
+    vm = migrated
+    st = vm.load_docker()
+    st["v1"]["volumes"]["boxen.old.cache"] = {"x": "1"}
+    vm.save_docker()
+    r = cleanup(vm)
+    assert r.returncode == 1
+    assert "these v1 volumes were never copied to rootless Docker: boxen.old.cache" in r.stdout
+    assert not [c for c in v1_calls(vm) if c[0] in ("rm", "image", "builder") or c[:2] == ["volume", "rm"]]
+    assert (vm.bhome / "boxen.env").exists() and (vm.pdir("old") / "v1").exists()
+
+
+def test_cleanup_without_the_daemon(migrated):
+    vm = migrated
+    vm.sock.close()
+    os.unlink(vm.tmp / "system-docker.sock")
+    r = cleanup(vm)
+    assert r.returncode == 0, r.stdout
+    assert "The system Docker daemon isn't reachable, so nothing on it is deleted" in r.stdout
+    assert v1_calls(vm) == []
+    assert not (vm.bhome / "boxen.env").exists() and not (vm.pdir("old") / "v1").exists()
+    assert "systemctl disable --now docker.service" in (vm.fake / "sudo.log").read_text()
+
+
+def test_cleanup_needs_a_terminal_and_everything_moved(vm):
+    r = vm.boxen("migrate", "--cleanup")
+    assert r.returncode == 1 and "these v1 projects haven't moved yet: old" in r.stderr
+    import shutil
+    shutil.rmtree(vm.pdir("old"))
+    r = vm.boxen("migrate", "--cleanup")
+    assert r.returncode == 1 and "--cleanup asks first; run it in a terminal" in r.stderr
+    r = vm.boxen("migrate", "--cleanup", "x")
+    assert r.returncode == 1 and "usage: boxen migrate" in r.stderr
 
 
 def doctor(vm, managed, *args):
@@ -269,6 +519,10 @@ def test_doctor_runs(vm):
     assert "takes more commands out of the sandbox" not in out and "allows without asking" not in out
     assert "agents get boxen's instructions" in out
     assert "git in %s uses boxen's tokens and identity" % vm.src in out
+    assert "warn  no commit identity for %s" % vm.src in out
+    assert 'Then /status there: "Setting sources" must list managed settings.' in out
+    vm.fn("write_gitconfig 'Boxy B' b@example.com")
+    assert "ok    commits in %s: Boxy B <b@example.com>" % vm.src in doctor(vm, managed).stdout
     assert "ok    in %s, git asks only boxen for GitHub credentials" % vm.src in out
     assert "boxen v1 projects to move: old" in out
     assert "2 v2 project(s)" in out
@@ -343,3 +597,16 @@ def test_doctor_credential_helpers(vm):
     out = doctor(vm, managed).stdout
     assert "FAIL  can't check git's credential helpers: no %s (re-run install.sh)" % vm.src in out
     assert "\nProjects\n" in out and "rc=1" in out
+
+
+def test_migrate_moved_but_not_started(v1):
+    """A project whose build fails after the move is v2 now: the summary says
+    to fix .boxen/ and `boxen up`, not to migrate again."""
+    vm = v1
+    vm.set_docker(fail=["build"])
+    r = migrate(vm)
+    assert r.returncode == 0
+    assert "old: moved, but its build container didn't start (fix" in r.stderr
+    assert "moved, but their build containers didn't start (fix .boxen/, then boxen up <name>): old" in r.stderr
+    assert "not moved" not in r.stderr
+    assert (vm.pdir("old") / "compose.yaml").read_text().startswith(FORMAT_MARK)

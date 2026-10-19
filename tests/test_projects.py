@@ -571,19 +571,37 @@ def test_shell(vm):
     assert r.returncode == 1 and "usage: boxen shell <name>" in r.stdout
 
 
+CLAUDE_SH = ["sh", "-c", 'claude "$@" || { printf "\\nclaude exited (%s); press Enter " "$?"; read -r _; }', "claude"]
+
+
 def test_claude_session_in_tmux(vm):
     a = str(vm.src / "alpha")
     conf = os.path.join(REPO, "ui", "tmux.conf")
-    r = with_tty(vm, "claude", "alpha", "--resume")
+    r = with_tty(vm, "claude", "alpha", "--resume", "it's")
     assert r.returncode == 0, r.stdout
     assert vm.tmux_calls(clear=True)[-1] == ["-L", "boxen", "-f", conf, "new-session", "-s", "boxen", "-n", "alpha",
-                                             "-c", a, "claude", "--resume"]
+                                             "-c", a] + CLAUDE_SH + ["--resume", "it's"]
     # a session there already: a new window, then attach
     (vm.fake / "tmux-session").write_text("")
     with_tty(vm, "claude", "alpha")
     calls = vm.tmux_calls(clear=True)
-    assert calls[-2:] == [["-L", "boxen", "new-window", "-t", "boxen:", "-n", "alpha", "-c", a, "claude"],
+    assert calls[-2:] == [["-L", "boxen", "new-window", "-t", "boxen:", "-n", "alpha", "-c", a] + CLAUDE_SH,
                           ["-L", "boxen", "attach-session", "-t", "boxen"]]
     # inside boxen's tmux: just the window
     with_tty(vm, "claude", "alpha", env={"TMUX": "/tmp/tmux-0/boxen,1,0"})
-    assert vm.tmux_calls() == [["-L", "boxen", "new-window", "-t", "boxen:", "-n", "alpha", "-c", a, "claude"]]
+    assert vm.tmux_calls() == [["-L", "boxen", "new-window", "-t", "boxen:", "-n", "alpha", "-c", a] + CLAUDE_SH]
+
+
+def test_claude_window_command(vm, tmp_path):
+    """The window's command: claude's arguments pass through; a failing
+    claude leaves its exit code on screen until Enter."""
+    from conftest import write_exe
+    fake = tmp_path / "fb"
+    fake.mkdir()
+    write_exe(str(fake / "claude"), '#!/bin/sh\nprintf "[%s]" "$@"; echo; exit ${CLAUDE_RC:-0}\n')
+    env = dict(vm.env, PATH="%s:%s" % (fake, vm.env["PATH"]))
+    import subprocess
+    r = subprocess.run(CLAUDE_SH + ["a b", "$X"], env=env, capture_output=True, text=True, input="")
+    assert r.returncode == 0 and r.stdout == "[a b][$X]\n"
+    r = subprocess.run(CLAUDE_SH, env=dict(env, CLAUDE_RC="3"), capture_output=True, text=True, input="\n")
+    assert r.stdout == "[]\n\nclaude exited (3); press Enter "

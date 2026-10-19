@@ -41,12 +41,19 @@ class Project:
     name: str
     path: str            # the project folder, ~/src/<name>
     container: object    # the build container: Container, or None (not created yet)
-    sessions: int        # Claude Code processes running in the folder
+    sessions: int        # interactive Claude sessions in the folder (not counting serve's)
     serve: str           # off, on, stopped (on, but its window isn't running)
     github: str
     repo: object
     sidecars: list = field(default_factory=list)
     repos: list = field(default_factory=list)    # Repo, the first one first
+    served: int = 0      # Claude processes under its serve window: the server and the sessions it started
+
+    @property
+    def app_sessions(self):
+        """Sessions started from the Claude app through serve: what's under
+        its serve window but the server itself."""
+        return max(0, self.served - 1)
 
     @property
     def env_container(self):
@@ -61,6 +68,10 @@ def _s(v, default=""):
     return v if isinstance(v, str) else default
 
 
+def _count(n):
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+
+
 def _project(d, src):
     if not isinstance(d, dict) or not isinstance(d.get("name"), str) or not d["name"]:
         return None
@@ -72,8 +83,7 @@ def _project(d, src):
         if isinstance(s, dict) and isinstance(s.get("service"), str) and s["service"]:
             sidecars.append(Sidecar(s["service"], _s(s.get("container")) or "boxen.%s.%s" % (name, s["service"]),
                                     _s(s.get("state"), "?") or "?", _s(s.get("status"))))
-    n = d.get("sessions")
-    sessions = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+    sessions, served = _count(d.get("sessions")), _count(d.get("served"))
     serve = d.get("serve") if d.get("serve") in ("off", "on", "stopped") else "off"
     path = d.get("path")
     if not isinstance(path, str) or not path.startswith("/"):
@@ -84,7 +94,7 @@ def _project(d, src):
     for r in d.get("repos") if isinstance(d.get("repos"), list) else []:
         if isinstance(r, dict) and isinstance(r.get("repo"), str) and r["repo"]:
             repos.append(Repo(r["repo"], _s(r.get("state"), "-") or "-", r.get("origin") is True))
-    return Project(name, path, cont, sessions, serve, _s(d.get("github"), "-"), repo, sidecars, repos)
+    return Project(name, path, cont, sessions, serve, _s(d.get("github"), "-"), repo, sidecars, repos, served)
 
 
 @dataclass
@@ -121,6 +131,15 @@ def state_style(state, health=None):
     if state == "running" and health == "unhealthy":
         return AMBER
     return STATE_STYLE.get(state, "")
+
+
+def sessions_short(p):
+    """The SESS column: interactive sessions, "+N" for app sessions through
+    serve ("2+1"), "-" for none."""
+    n, app = p.sessions, p.app_sessions
+    if not n and not app:
+        return "-"
+    return "%d+%d" % (n, app) if app else str(n)
 
 
 def container_short(p):

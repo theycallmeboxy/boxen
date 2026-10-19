@@ -285,3 +285,30 @@ def test_git_credential_project_option(vm):
     assert r.returncode == 0 and r.stdout == ""
     r = cred(vm, REQ % "a/b", cwd=vm.tmp, args=("--project",))
     assert r.returncode == 0 and r.stdout == ""
+
+
+def test_ls_counts_sessions_by_executable(vm):
+    """A native install's Claude runs as .../claude/versions/X.Y.Z (its
+    process name is the version): counted by what it runs."""
+    procs = []
+
+    def start(exe, cwd):
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(shutil.which("sleep"), exe)
+        p = subprocess.Popen([str(exe), "60"], cwd=cwd)
+        procs.append(p)
+        assert wait_for(lambda: os.path.exists("/proc/%d/exe" % p.pid)
+                        and os.readlink("/proc/%d/exe" % p.pid) == str(exe))
+    try:
+        start(vm.tmp / "share" / "claude" / "versions" / "1.2.3", vm.src / "alpha")
+        start(vm.tmp / "bin2" / "claude", vm.src / "alpha")                       # by name too
+        start(vm.tmp / "other" / "versions" / "1.2.3", vm.src / "alpha")          # not claude's
+        start(vm.tmp / "bin3" / "myclaude", vm.src / "alpha")
+        start(vm.tmp / "share" / "claude" / "versions" / "2.0.0", vm.src / "beta")
+        assert vm.fn("claude_counts | sort").stdout == "alpha 2 0\nbeta 1 0\n"
+        doc = ls_json(vm)
+        assert [(p["name"], p["sessions"]) for p in doc["projects"]] == [("alpha", 2), ("beta", 1)]
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()

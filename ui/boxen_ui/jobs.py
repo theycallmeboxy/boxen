@@ -57,6 +57,9 @@ class LineSplitter:
 
 
 MAX_FINISHED = 50
+# Seconds a job gets between SIGTERM and SIGKILL when it's stopped (the
+# dashboard quitting or restarting): time for boxen's own cleanup.
+GRACE = 5.0
 
 RUNNING, OK, FAILED, STOPPED = "running", "ok", "failed", "stopped"
 
@@ -76,6 +79,7 @@ class Job:
     proc: object = None
     dropped: int = 0     # lines dropped from the start (MAX_LINES)
     then: object = None  # called with the job (on the app's loop) when it succeeds
+    stopping: bool = False   # stop_all is stopping it: it ends "stopped", not "failed"
 
     @property
     def verb(self):
@@ -179,11 +183,11 @@ class JobManager:
             lines.close()
             rc = await job.proc.wait()
         except asyncio.CancelledError:
-            await procs.stop(job.proc)
+            await procs.stop(job.proc, grace=GRACE)
             self._finish(job, None, STOPPED)
             raise
         procs.forget(job.proc)
-        self._finish(job, rc)
+        self._finish(job, rc, STOPPED if job.stopping and rc != 0 else None)
 
     def _line(self, job, raw):
         line = clean_line(raw)
@@ -207,6 +211,9 @@ class JobManager:
         self.listener.job_done(job)
 
     async def stop_all(self):
-        for j in self.running():
-            if j.proc is not None:
-                await procs.stop(j.proc, grace=1.0)
+        """Stop every running job at once: SIGTERM, then SIGKILL after
+        GRACE seconds for those still going."""
+        run = [j for j in self.running() if j.proc is not None]
+        for j in run:
+            j.stopping = True
+        await asyncio.gather(*[procs.stop(j.proc, grace=GRACE) for j in run])

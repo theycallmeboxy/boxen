@@ -2,10 +2,15 @@
 
 Some of the files live where the project's agent writes (~/src/<name>/.boxen/),
 so the editor never gets the real path: the dashboard reads the file without
-following links (files.py) into a private folder (0700) and opens the editor
-on that copy in a tmux window, which runs
+following links (files.py), byte for byte, into a private folder (0700:
+in $XDG_RUNTIME_DIR, which the sandbox hides, or ~/.local/state/boxen/ui/edit;
+never /tmp, which agents can reach) and opens the editor on that copy in a
+tmux window, which runs
 
-    python -P -m boxen_ui.edit <private folder>/spec.json
+    python -P -m boxen_ui.edit <private folder>/spec.json <its sha256>
+
+spec.json says what to run and where to write; it's acted on only if it's
+still what the dashboard wrote (the hash comes on the command line).
 
 That runs the editor (vim with modelines off: a file can't set options),
 and when it exits writes the copy back: to a temp file next to the target,
@@ -27,6 +32,7 @@ import tempfile
 
 from . import files
 
+LIMIT = 1024 * 1024     # a bigger file isn't edited here (refused up front)
 VIM_NAMES = ("vim", "vi", "nvim", "view", "vim.basic", "vim.tiny", "vim.nox", "vim.gtk3")
 
 
@@ -34,25 +40,48 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest() if data is not None else None
 
 
-def private_dir(env=None):
-    env = os.environ if env is None else env
-    base = env.get("XDG_RUNTIME_DIR")
+def _own_dir(path, private=False):
+    """path is a folder (not a link) of yours that nobody else can write
+    (with private, nobody else can enter either)."""
     try:
-        st = os.stat(base) if base else None
+        st = os.lstat(path)
     except OSError:
-        st = None
-    if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-        base = None
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
+            and not st.st_mode & (0o077 if private else 0o022))
+
+
+def private_dir(env=None):
+    """A new 0700 folder for one edit: in $XDG_RUNTIME_DIR when that's
+    usable, else in ~/.local/state/boxen/ui/edit (made 0700). Never in
+    /tmp. Raises OSError when neither will do."""
+    env = os.environ if env is None else env
+    base = env.get("XDG_RUNTIME_DIR") or ""
+    if not (base.startswith("/") and _own_dir(base)):
+        home = env.get("HOME") or os.path.expanduser("~")
+        state = env.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+        base = os.path.join(state, "boxen", "ui", "edit")
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        if not _own_dir(base, private=True):
+            if _own_dir(base):          # a folder of yours, not a link: just too open
+                os.chmod(base, 0o700)
+            if not _own_dir(base, private=True):
+                raise OSError("%s isn't a private folder of yours (0700); nowhere safe for the copy" % base)
     return tempfile.mkdtemp(prefix="boxen-ui-edit-", dir=base)      # mode 0700
+
+
+def spec_sha(path):
+    with open(path, "rb") as f:
+        return _sha(f.read())
 
 
 def prepare(project, label, base, rel, editor, env=None, template=None):
     """Copy base/rel... (rel: the path's parts below base, a trusted folder)
-    into a private folder; returns the spec (a dict, also written to
-    spec.json there). A missing file's copy starts as template (bytes) or
-    empty. Raises files.Refused or OSError."""
-    text = files.read_under(base, rel, limit=1024 * 1024)
-    data = text.encode("utf-8") if text is not None else None
+    byte for byte into a private folder; returns the spec (a dict, also
+    written to spec.json there, its hash in spec["sha"]). A missing file's
+    copy starts as template (bytes) or empty. Raises files.Refused (TooBig
+    over LIMIT) or OSError."""
+    data = files.read_bytes_under(base, rel, limit=LIMIT)
     start = data if data is not None else (template or b"")
     d = private_dir(env)
     copy = os.path.join(d, rel[-1])
@@ -62,8 +91,11 @@ def prepare(project, label, base, rel, editor, env=None, template=None):
     spec = {"project": project, "label": label, "base": base, "rel": list(rel),
             "target": os.path.join(base, *rel), "copy": copy, "orig_sha": _sha(data), "start_sha": _sha(start),
             "editor": list(editor), "dir": d, "result": os.path.join(d, "result.json")}
-    with open(os.path.join(d, "spec.json"), "w") as f:
-        json.dump(spec, f)
+    raw = json.dumps(spec).encode("utf-8")
+    fd = os.open(os.path.join(d, "spec.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+    spec["sha"] = _sha(raw)
     return spec
 
 
@@ -156,8 +188,15 @@ def write_back(spec, new):
 
 
 def main(argv):
-    with open(argv[0]) as f:
-        spec = json.load(f)
+    if len(argv) != 2:
+        print("boxen ui: usage: python -m boxen_ui.edit SPEC SHA256 (restart the dashboard if it's older)")
+        return 2
+    with open(argv[0], "rb") as f:
+        raw = f.read()
+    if _sha(raw) != argv[1]:
+        print("boxen ui: %s changed after the dashboard wrote it; not acting on it" % argv[0])
+        return 1
+    spec = json.loads(raw)
     try:
         rc = subprocess.call(editor_cmd(spec["editor"], spec["copy"]))
     except OSError as e:

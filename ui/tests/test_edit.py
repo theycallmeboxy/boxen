@@ -23,7 +23,7 @@ def proj(tmp_path):
     secret = tmp_path / "app.pem"
     secret.write_text("SECRET KEY")
     return {"src": str(p), "env": p / ".boxen", "pdir": str(pdir), "secret": secret, "tmp": tmp_path,
-            "rt": {"XDG_RUNTIME_DIR": str(tmp_path / "nonexistent")}}
+            "rt": {"XDG_RUNTIME_DIR": str(tmp_path / "nonexistent"), "XDG_STATE_HOME": str(tmp_path / "state")}}
 
 
 def spec_for(proj, name="services.yaml"):
@@ -130,9 +130,10 @@ def test_main_runs_editor_and_reports(proj, tmp_path):
     s = spec_for(proj)
     s["editor"] = [str(tmp_path / "vim")]
     os.symlink(ed, tmp_path / "vim")
-    with open(os.path.join(s["dir"], "spec.json"), "w") as f:
+    spec_path = os.path.join(s["dir"], "spec.json")
+    with open(spec_path, "w") as f:
         json.dump(s, f)
-    out = subprocess.run([sys.executable, "-P", "-m", "boxen_ui.edit", os.path.join(s["dir"], "spec.json")],
+    out = subprocess.run([sys.executable, "-P", "-m", "boxen_ui.edit", spec_path, edit.spec_sha(spec_path)],
                          env=dict(os.environ, PYTHONPATH=UI_DIR), capture_output=True, text=True, cwd=str(tmp_path))
     assert out.returncode == 0, out.stderr
     assert (tmp_path / "args").read_text().startswith("--cmd set nomodeline ")
@@ -183,7 +184,7 @@ def test_write_back_race_in_container_writable_folder(tmp_path):
                 target.unlink(missing_ok=True)
                 target.write_text("v%d\n" % i)
             s = edit.prepare("p", ".boxen/Dockerfile", str(src), [".boxen", "Dockerfile"], ["vim"],
-                             env={"XDG_RUNTIME_DIR": str(tmp_path / "none")})
+                             env={"XDG_RUNTIME_DIR": str(tmp_path / "none"), "XDG_STATE_HOME": str(tmp_path / "st")})
             r = edit.write_back(s, b"edited %d\n" % i)
             counts[r["status"]] = counts.get(r["status"], 0) + 1
             if r["status"] == "written":
@@ -203,3 +204,70 @@ def test_write_back_race_in_container_writable_folder(tmp_path):
     assert secret.read_text() == "SECRET"
     assert bad == 0, counts
     assert counts.get("refused", 0) > 0, counts            # the attacker did get in sometimes
+
+
+def test_bytes_kept_exactly(proj):
+    """Not UTF-8 (a Latin-1 comment): the copy is the file's bytes, and an
+    edit is written back, not refused as changed meanwhile."""
+    target = proj["env"] / "Dockerfile"
+    target.write_bytes(b"FROM x\n# caf\xe9\n")
+    s = spec_for(proj, "Dockerfile")
+    assert open(s["copy"], "rb").read() == b"FROM x\n# caf\xe9\n"
+    assert edit.write_back(s, b"FROM x\n# caf\xe9\nRUN true\n")["status"] == "written"
+    assert target.read_bytes() == b"FROM x\n# caf\xe9\nRUN true\n"
+
+
+def test_too_big_is_refused_up_front(proj):
+    big = proj["env"] / "services.yaml"
+    big.write_bytes(b"#" * (edit.LIMIT + 1))
+    with pytest.raises(files.TooBig, match="services.yaml is over 1 MiB"):
+        spec_for(proj)
+    assert files.state_under(proj["src"], [".boxen", "services.yaml"], limit=edit.LIMIT) == \
+        ".boxen/services.yaml is over 1 MiB"
+    big.write_bytes(b"#" * edit.LIMIT)
+    assert open(spec_for(proj)["copy"], "rb").read() == b"#" * edit.LIMIT
+
+
+def test_private_dir_never_tmp(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    rt = tmp_path / "rt"
+    rt.mkdir(mode=0o700)
+    assert os.path.dirname(edit.private_dir({"XDG_RUNTIME_DIR": str(rt), "HOME": str(home)})) == str(rt)
+    # no usable runtime folder (unset, missing, open to others): the state folder, 0700
+    rt.chmod(0o777)
+    base = home / ".local" / "state" / "boxen" / "ui" / "edit"
+    for env in ({}, {"XDG_RUNTIME_DIR": str(tmp_path / "none")}, {"XDG_RUNTIME_DIR": str(rt)}):
+        d = edit.private_dir(dict(env, HOME=str(home)))
+        assert os.path.dirname(d) == str(base) and stat.S_IMODE(os.stat(base).st_mode) == 0o700
+    base.chmod(0o755)                              # too open: made private again
+    edit.private_dir({"HOME": str(home)})
+    assert stat.S_IMODE(os.stat(base).st_mode) == 0o700
+    # a link there is never used
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    st = tmp_path / "st2"
+    (st / "boxen" / "ui").mkdir(parents=True)
+    os.symlink(other, st / "boxen" / "ui" / "edit")
+    with pytest.raises(OSError):
+        edit.private_dir({"HOME": str(home), "XDG_STATE_HOME": str(st)})
+    assert os.listdir(other) == []
+
+
+def test_main_refuses_a_changed_spec(proj, tmp_path):
+    s = spec_for(proj)
+    spec_path = os.path.join(s["dir"], "spec.json")
+    sha = edit.spec_sha(spec_path)
+    assert sha == s["sha"]
+    with open(spec_path) as f:
+        evil = dict(json.load(f), editor=["sh", "-c", "touch %s/pwned" % tmp_path])
+    with open(spec_path, "w") as f:
+        json.dump(evil, f)
+    run = lambda *a: subprocess.run([sys.executable, "-P", "-m", "boxen_ui.edit", *a],  # noqa: E731
+                                    env=dict(os.environ, PYTHONPATH=UI_DIR), capture_output=True, text=True,
+                                    cwd=str(tmp_path))
+    out = run(spec_path, sha)
+    assert out.returncode == 1 and "changed after the dashboard wrote it" in out.stdout
+    out = run(spec_path)                            # no hash (an older dashboard): refused too
+    assert out.returncode == 2
+    assert not (tmp_path / "pwned").exists()

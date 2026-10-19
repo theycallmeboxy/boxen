@@ -19,7 +19,6 @@ import shlex
 import shutil
 import signal
 import socket
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,13 +30,15 @@ from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Label, Log, Select, Sparkline, Static, TabbedContent, TabPane
+from textual.worker import NoActiveWorker, get_current_worker
 
 from . import edit, files, procs, sysinfo
 from .config import PKG_DIR, Config, repo_arg, valid_name
 from .docker_api import DockerAPI, DockerError, cpu_percent, health_of, memory
 from .jobs import FAILED, OK, RUNNING, STOPPED, Busy, JobManager, fmt_elapsed
+from .jobs import GRACE as JOB_GRACE
 from .model import (AMBER, GREEN, GREY, HEALTH_STYLE, RED, RUNNING_JOB, container_short, container_style,
-                    github_short, parse_ls, repo_state, serve_short, state_style)
+                    github_short, parse_ls, repo_state, serve_short, sessions_short, state_style)
 from .screens import ConfirmScreen, GlobalMenuScreen, HelpScreen, NewProjectScreen, ReposScreen
 from .textutil import ansi_text, clean_line, text
 from .tmux import GLOBAL, Tmux, in_boxen_tmux, kind_of, serve_window, window_name
@@ -47,11 +48,17 @@ HIST = 60
 HIST_FORGET = 300           # drop a container's series after it's been gone this long
 JOB_STYLE = {RUNNING: RUNNING_JOB, OK: GREEN, FAILED: RED, STOPPED: GREY}
 LS_ACTIVE, LS_IDLE, STATS_EVERY, SYS_EVERY = 5, 60, 3, 5
+DUE_SLACK = 0.05
 SUGGEST_EVERY = 30          # `boxen repos NAME --suggest` for the selected project, at most this often
 # A Claude session, as `boxen claude` starts one. The tmux server was started
 # without DOCKER_HOST (bin/boxen), and this makes sure of it: nothing an
 # agent runs gets a way to the Docker daemon.
 CLAUDE_ARGV = ["env", "-u", "DOCKER_HOST", "claude"]
+# A shell on the VM in a project's folder, which its agent writes: no
+# Docker either, and git there doesn't start the fsmonitor program a
+# repo's config names (a git-aware prompt would run it, unsandboxed). Its
+# hooks still run when you commit.
+VM_SHELL_ENV = ["env", "-u", "DOCKER_HOST", "GIT_CONFIG_PARAMETERS='core.fsmonitor='"]
 
 PROJECT_ACTIONS = [
     # (action, palette title, description)
@@ -122,6 +129,14 @@ def window_what(kind):
 
 def _plural(n, word, words=None):
     return "%d %s" % (n, word if n == 1 else (words or word + "s"))
+
+
+def _serve_sessions_note(p):
+    """What else stops with a project's serve window."""
+    msg = "Sessions started from the Claude app through it stop with it"
+    if p.app_sessions:
+        msg += " (%d running now)" % p.app_sessions
+    return msg + "."
 
 
 def _fmt_cpu(v):
@@ -341,8 +356,11 @@ class Dashboard(Screen):
         return self.tmux.attached and self.app.app_focus
 
     def _is_due(self, what, every):
+        # A little early counts: the one-second ticks jitter by a millisecond
+        # either way, and without it a refresh due "every 1 s" skips a tick
+        # about one time in three.
         now = time.monotonic()
-        if now - self._due.get(what, -1e9) >= every:
+        if now - self._due.get(what, -1e9) >= every - DUE_SLACK:
             self._due[what] = now
             return True
         return False
@@ -609,7 +627,8 @@ class Dashboard(Screen):
             st = self._env_state(p)
             ctr_t = (Text(clean_line(st[0]), style=state_style(*st)) if st is not None
                      else Text(container_short(p), style=container_style(p)))
-        sess_t = Text(str(p.sessions), style="bold") if p.sessions else Text("-", style=GREY)
+        sess = sessions_short(p)
+        sess_t = Text(sess, style=GREY) if sess == "-" else Text(sess, style="bold")
         sv, sv_style = serve_short(p)
         st = self.stats.get(p.env_container, {}) if self._env_running(p) else {}
         cells = [name, ctr_t, sess_t, Text(sv, style=sv_style), _fmt_cpu(st.get("cpu")), _fmt_mem(st.get("mem"))]
@@ -727,7 +746,9 @@ class Dashboard(Screen):
         v = Text(no_wrap=True, overflow="ellipsis")
         if p.sessions:
             v.append(_plural(p.sessions, "Claude process", "Claude processes") + " in the folder", style="bold")
-        else:
+        if p.app_sessions:
+            v.append("%s%d from the app, via serve" % (" + " if p.sessions else "", p.app_sessions), style="bold")
+        if not p.sessions and not p.app_sessions:
             v.append("none running", style=GREY)
         nw = len(self._claude_windows(p.name))
         if nw:
@@ -1057,7 +1078,7 @@ class Dashboard(Screen):
             msg = "Ends that Claude session (its conversation is kept: claude --resume in the folder picks it up)."
         elif kind == "serve":
             msg = ("Stops the Remote Control server until it's started again (S, or the next boot while serve "
-                   "is on). To turn serve off for good: S.")
+                   "is on). %s To turn serve off for good: S." % _serve_sessions_note(p))
         else:
             msg = "Ends what runs in it."
         name = clean_line(w.name)
@@ -1158,7 +1179,7 @@ class Dashboard(Screen):
         if p is None:
             return
         for label, base, rel, kind in self._file_entries(p):
-            st = files.state_under(base, rel)
+            st = files.state_under(base, rel, limit=edit.LIMIT)
             if st == "file":
                 cell = Text("")
             elif st == "missing":
@@ -1189,10 +1210,9 @@ class Dashboard(Screen):
         template = None
         if kind == "override":
             try:
-                ex = files.read_under(base, ["compose.override.example.yaml"])
+                template = files.read_bytes_under(base, ["compose.override.example.yaml"], limit=edit.LIMIT)
             except files.Refused:
-                ex = None
-            template = ex.encode("utf-8") if ex else None
+                template = None
         try:
             spec = edit.prepare(name, label, base, rel, editor_argv(self.env), env=self.env, template=template)
         except (files.Refused, OSError) as e:
@@ -1200,7 +1220,7 @@ class Dashboard(Screen):
             return
         spec["kind"] = kind
         argv = ["env", "PYTHONPATH=" + UI_DIR, sys.executable, "-P", "-m", "boxen_ui.edit",
-                os.path.join(spec["dir"], "spec.json")]
+                os.path.join(spec["dir"], "spec.json"), spec["sha"]]
         self.pending_edits[spec["result"]] = spec
         ok, _how, err = await self.tmux.open(wname, argv)
         if not ok:
@@ -1430,13 +1450,19 @@ class Dashboard(Screen):
             if w is not None:
                 await self._select_window(w.id)
             else:
-                await self._open_window(p.name, CLAUDE_ARGV, None, p.path, True)
+                await self._new_claude(p)
         self.run_worker(go(), group="windows", exit_on_error=False)
 
     def action_claude_new(self):
         p = self._need_project()
         if p and self._tmux_ok("A Claude session") and self._need_folder(p):
-            self.open_window(p.name, CLAUDE_ARGV, cwd=p.path, new=True)
+            self.run_worker(self._new_claude(p), group="windows", exit_on_error=False)
+
+    async def _new_claude(self, p):
+        """Another Claude session window, after closing the project's
+        sessions that have exited (each is held for Enter otherwise)."""
+        await self.tmux.kill_finished(p.name)
+        await self._open_window(p.name, CLAUDE_ARGV, None, p.path, True)
 
     def action_serve(self):
         p = self._need_project()
@@ -1447,7 +1473,7 @@ class Dashboard(Screen):
         if p.serve == "on":
             self._confirm("Turn serve off for %s?" % p.name,
                           "Stops its Remote Control server (window %s): the Claude app can't start sessions "
-                          "here until it's on again." % serve_window(p.name),
+                          "here until it's on again. %s" % (serve_window(p.name), _serve_sessions_note(p)),
                           lambda: self.start_job(["serve", p.name, "--off"], project=p.name), yes="Turn off")
             return
 
@@ -1482,7 +1508,7 @@ class Dashboard(Screen):
         p = self._need_project()
         if p and self._need_folder(p):
             shell = self.env.get("SHELL") or "/bin/bash"
-            self.open_window(window_name(p.name, "vm-shell"), ["env", "-u", "DOCKER_HOST", shell], cwd=p.path)
+            self.open_window(window_name(p.name, "vm-shell"), VM_SHELL_ENV + [shell], cwd=p.path)
 
     def action_logs_tab(self):
         self.query_one("#tabs", TabbedContent).active = "logs"
@@ -1562,34 +1588,47 @@ class Dashboard(Screen):
         else:
             await self.app.shutdown()
 
+    def _jobs_note(self):
+        """For the quit and restart questions: the running jobs, by name,
+        that will be stopped; "" when there are none."""
+        run = self.jobs.running()
+        if not run:
+            return ""
+        names = ", ".join(clean_line(j.display) for j in run)
+        return (" These running jobs will be stopped (SIGTERM, then SIGKILL after %d s if they're still going): "
+                "%s." % (JOB_GRACE, names))
+
     def action_quit_all(self):
-        n = len(self.jobs.running())
+        note = self._jobs_note()
         msg = ("Stops the dashboard. Claude sessions, serve and the other windows keep running; "
-               "`boxen ui` starts it again.")
-        if n:
-            msg += " %s will be stopped." % _plural(n, "running job")
+               "`boxen ui` starts it again." + note)
 
         async def go():
             await self.app.shutdown()
-        self._confirm("Quit the dashboard?", msg, lambda: self.run_worker(go(), exit_on_error=False), warn=bool(n),
-                      yes="Quit")
+        self._confirm("Quit the dashboard?", msg, lambda: self.run_worker(go(), exit_on_error=False),
+                      warn=bool(note), yes="Quit")
 
     def action_restart_dashboard(self):
         if not in_boxen_tmux(self.env):
             self.notify("Not running under `boxen ui`; just start it again.", severity="warning", markup=False)
             return
-        n = len(self.jobs.running())
+        note = self._jobs_note()
 
-        def go():
-            try:
-                subprocess.Popen([self.cfg.boxen, "ui", "--restart"], env=self.app.env, stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            except OSError as e:
-                self.notify("couldn't restart: %s" % e, severity="error", markup=False)
+        async def go():
+            if self.jobs.running():
+                self.notify("Stopping the running jobs, then restarting…", markup=False)
+                await self.jobs.stop_all()
+            # On success tmux starts the dashboard again in this window, and
+            # this process goes (SIGHUP) as boxen ui --restart finishes.
+            rc, out, _err = await procs.run([self.cfg.boxen, "ui", "--restart"], env=self.jobs.env, timeout=30,
+                                            merge_stderr=True)
+            if rc != 0:
+                lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+                self.notify("Couldn't restart the dashboard: %s" % clean_line(lines[-1] if lines else "exit %d" % rc),
+                            severity="error", markup=False, timeout=12)
         self._confirm("Restart the dashboard?",
-                      "Starts this dashboard again%s; windows and projects keep running."
-                      % (" (stopping %s)" % _plural(n, "running job") if n else ""),
-                      go, yes="Restart")
+                      "Starts this dashboard again; windows and projects keep running." + note,
+                      lambda: self.run_worker(go(), exit_on_error=False), warn=bool(note), yes="Restart")
 
 
 class BoxenApp(App):
@@ -1636,10 +1675,18 @@ class BoxenApp(App):
         if self._shutting_down:
             return
         self._shutting_down = True
-        self.workers.cancel_all()
+        # Every worker but this one (Q runs this in a worker): cancelled, it
+        # would cut short the jobs' grace period below.
+        try:
+            me = get_current_worker()
+        except NoActiveWorker:
+            me = None
+        for w in list(self.workers):
+            if w is not me:
+                w.cancel()
         try:
             await self.dashboard.jobs.stop_all()
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
         procs.kill_all()
         self.exit()

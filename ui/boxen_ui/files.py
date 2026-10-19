@@ -18,11 +18,32 @@ _FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
+class TooBig(Refused):
+    pass
+
+
+def size_text(n):
+    return "%d MiB" % (n >> 20) if n >= 1 << 20 and not n % (1 << 20) else "%d KiB" % (n >> 10)
+
+
 def _read_fd(fd, limit):
+    """All of the regular file open on fd, as bytes; TooBig when it's over
+    limit bytes (never a part of it)."""
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise Refused("not a regular file")
-    return os.read(fd, limit).decode("utf-8", "replace")
+    if st.st_size > limit:
+        raise TooBig("over %s" % size_text(limit))
+    chunks, n = [], 0
+    while True:
+        b = os.read(fd, limit + 1 - n)
+        if not b:
+            break
+        chunks.append(b)
+        n += len(b)
+        if n > limit:          # it grew since the fstat
+            raise TooBig("over %s" % size_text(limit))
+    return b"".join(chunks)
 
 
 def open_dir(base, parts):
@@ -55,9 +76,17 @@ def open_dir(base, parts):
 
 
 def read_under(base, rel, limit=65536):
-    """The file base/rel[0]/.../rel[-1], up to limit bytes, with nothing
-    under base followed if it's a link. None when it (or a folder on the
-    way) doesn't exist; Refused for a link or anything but a plain file."""
+    """read_bytes_under, as text (invalid UTF-8 replaced): for showing a
+    file, never for writing it back."""
+    data = read_bytes_under(base, rel, limit)
+    return data.decode("utf-8", "replace") if data is not None else None
+
+
+def read_bytes_under(base, rel, limit=65536):
+    """The bytes of the file base/rel[0]/.../rel[-1], with nothing under
+    base followed if it's a link. None when it (or a folder on the way)
+    doesn't exist; Refused for a link or anything but a plain file, TooBig
+    (a Refused) when it's over limit bytes."""
     try:
         dfd = open_dir(base, rel[:-1])
     except FileNotFoundError:
@@ -72,6 +101,8 @@ def read_under(base, rel, limit=65536):
                           else (e.strerror or str(e))) from None
         try:
             return _read_fd(fd, limit)
+        except TooBig as e:
+            raise TooBig("%s is %s" % (os.path.join(*rel), e)) from None
         except Refused:
             raise Refused("%s isn't a plain file" % os.path.join(*rel)) from None
         finally:
@@ -80,9 +111,9 @@ def read_under(base, rel, limit=65536):
         os.close(dfd)
 
 
-def state_under(base, rel):
+def state_under(base, rel, limit=None):
     """For the Files tab: "file", "missing" (it, or a folder on the way,
-    isn't there), or why it would be refused."""
+    isn't there), or why it would be refused (over limit bytes, too)."""
     try:
         dfd = open_dir(base, rel[:-1])
     except FileNotFoundError:
@@ -101,4 +132,6 @@ def state_under(base, rel):
         return "%s is a symlink" % os.path.join(*rel)
     if not stat.S_ISREG(st.st_mode):
         return "%s isn't a plain file" % os.path.join(*rel)
+    if limit is not None and st.st_size > limit:
+        return "%s is over %s" % (os.path.join(*rel), size_text(limit))
     return "file"

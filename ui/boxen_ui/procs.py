@@ -7,6 +7,7 @@ import subprocess
 import time
 
 _live = set()          # asyncio.subprocess.Process
+_termed = set()        # the ones stop() has sent SIGTERM, until they're reaped
 
 
 def _killpg(proc, sig):
@@ -31,15 +32,33 @@ def forget(proc):
     _live.discard(proc)
 
 
+async def _reaped(proc, timeout):
+    """Wait up to timeout for proc to exit and be reaped; True if it was.
+    A cancellation ends the wait early and isn't passed on: the callers
+    are cleaning up, and the caller of theirs re-raises it."""
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    return proc.returncode is not None
+
+
 async def stop(proc, grace=2.0):
-    """Terminate proc's process group, then kill it if it doesn't go."""
+    """Terminate proc's process group, give it grace seconds, then kill
+    it. SIGTERM goes once however many callers stop it at the same time (a
+    second one could cut short the cleanup the first one started). proc
+    stays tracked until it's been reaped, so kill_all still sees it if
+    this is cut short."""
     if proc.returncode is None:
-        _killpg(proc, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(asyncio.shield(proc.wait()), grace)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        if proc not in _termed:
+            _termed.add(proc)
+            _killpg(proc, signal.SIGTERM)
+        if not await _reaped(proc, grace):
             _killpg(proc, signal.SIGKILL)
-    forget(proc)
+            await _reaped(proc, 1.0)
+    if proc.returncode is not None:
+        _termed.discard(proc)
+        forget(proc)
 
 
 async def run(argv, env=None, timeout=30.0, merge_stderr=False, cwd=None):
@@ -59,11 +78,8 @@ async def run(argv, env=None, timeout=30.0, merge_stderr=False, cwd=None):
         return 124, "", "%s timed out after %ds" % (os.path.basename(argv[0]), timeout)
     except asyncio.CancelledError:
         _killpg(proc, signal.SIGKILL)
-        try:
-            await asyncio.shield(proc.wait())
-        except asyncio.CancelledError:
-            pass
-        forget(proc)
+        if await _reaped(proc, 1.0):
+            forget(proc)
         raise
     forget(proc)
     return (proc.returncode,
@@ -82,6 +98,7 @@ def kill_all():
     for p in procs:
         _killpg(p, signal.SIGKILL)
     _live.clear()
+    _termed.clear()
 
 
 def live():

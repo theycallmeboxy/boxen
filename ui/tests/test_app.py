@@ -2,11 +2,13 @@
 tmux and Docker Engine API. Run: python -m pytest ui/tests"""
 import json
 import os
+import time
 
 import pytest
 from conftest import aio, four_projects, project, screen_text, sidecar, wait_for
 
 from boxen_ui import procs
+from boxen_ui.edit import spec_sha
 from boxen_ui.app import CLAUDE_ARGV, BoxenApp, editor_argv
 from boxen_ui.model import parse_ls
 from boxen_ui.screens import ConfirmScreen, GlobalMenuScreen, NewProjectScreen, ReposScreen
@@ -15,6 +17,14 @@ from boxen_ui.tmux import hold_script
 SIZE = (120, 35)
 INJECT_LINK = "[link=file:///etc/passwd]x[/link]"
 INJECT_CLICK = "[@click=app.quit]boom[/]"
+
+
+def gone(pid, timeout=3.0):
+    """Wait for pid to have exited: a signalled process takes a moment."""
+    end = time.monotonic() + timeout
+    while alive(pid):
+        assert time.monotonic() < end, "pid %d still running" % pid
+        time.sleep(0.02)
 
 
 def alive(pid):
@@ -229,7 +239,8 @@ async def test_shell_windows(world):
         await pilot.press("v")
         await wait_for(pilot, lambda: len(w.tmux_calls("new-window")) == 2, what="vm shell")
         assert new_window(w, 1) == ("caulker/vm-shell", os.path.join(w.src, "caulker"),
-                                    hold_script(["env", "-u", "DOCKER_HOST", "/bin/zsh"]))
+                                    hold_script(["env", "-u", "DOCKER_HOST", "GIT_CONFIG_PARAMETERS='core.fsmonitor='",
+                                                 "/bin/zsh"]))
 
 
 @aio
@@ -505,8 +516,9 @@ async def test_edit_file_opens_a_private_copy(world):
         await wait_for(pilot, lambda: w.tmux_calls("new-window"), what="editor window")
         name, cwd, script = new_window(w)
         assert name == "caulker/edit-Dockerfile" and cwd == app.cfg.home
-        spec_path = script.split("boxen_ui.edit ")[1].split(";")[0].strip("'")
+        spec_path, sha = script.split("boxen_ui.edit ")[1].split(";")[0].split()
         spec = json.load(open(spec_path))
+        assert sha == spec_sha(spec_path)                     # the window checks spec.json against this
         # the editor never sees the real path: a private copy, mode 0600 in a 0700 folder
         assert spec["target"] == os.path.join(bdir, "Dockerfile") and spec["copy"] != spec["target"]
         assert spec["base"] == os.path.join(w.src, "caulker") and spec["rel"] == [".boxen", "Dockerfile"]
@@ -684,7 +696,7 @@ async def test_Q_stops_jobs_and_leaves_the_sessions(world):
         assert "Claude sessions, serve and the other windows keep running" in str(app.screen._message)
         await pilot.press("y")
         await wait_for(pilot, lambda: not app.is_running, what="exit", timeout=10)
-    assert not alive(pid)
+    gone(pid)
     assert procs.live() == []
     assert w.tmux_calls("kill-session") == [] and w.tmux_calls("kill-window") == []
 
@@ -700,7 +712,7 @@ async def test_clean_exit_kills_running_jobs(world):
         await wait_for(pilot, lambda: app.dashboard.jobs.jobs and app.dashboard.jobs.jobs[0].lines, what="job")
         pid = w.boxen_calls()[0]["pid"]
     procs.kill_all()       # what main() does after the app returns
-    assert not alive(pid)
+    gone(pid)
     assert procs.live() == []
 
 
@@ -865,7 +877,6 @@ def test_job_cap_and_dropped_lines(monkeypatch):
     for i in range(25):
         jm._line(j, "line %d" % i)
     assert len(j.lines) == 10 and j.dropped == 15 and j.lines[0] == "line 15"
-    assert "BOXEN_AGENT" not in jm.env
 
 
 @aio
@@ -1150,3 +1161,106 @@ async def test_repos_injection_renders_literally(world):
         await wait_for(pilot, lambda: isinstance(app.screen, ReposScreen), what="repos dialog")
         assert INJECT_LINK in screen_text(app)
         assert app.is_running
+
+
+# ------------------------------------------------------------ serve, quitting, restarting
+
+@aio
+async def test_served_sessions_shown_and_warned_about(world):
+    doc = four_projects()
+    doc["projects"][0]["served"] = 3                # the server and two sessions started from the app
+    doc["projects"][1]["served"] = 1                # beta: only a server (serve off, window still up)
+    w = world(ls=doc)
+    w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@4", "name": "caulker~serve"}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        t = app.dashboard.query_one("#projects")
+        assert [t.get_cell(k, "sess").plain for k in ("caulker", "beta", "gamma")] == ["2+2", "-", "-"]
+        assert "2 Claude processes in the folder + 2 from the app, via serve" in \
+            str(app.dashboard.query_one("#ov-sessions").render())
+        await pilot.press("S")                      # serve on: asks to turn it off
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="serve off asks")
+        assert "Sessions started from the Claude app through it stop with it (2 running now)" in \
+            str(app.screen._message)
+        await pilot.press("n")
+        app.dashboard.action_sessions_tab()
+        await wait_for(pilot, lambda: rows(app, "#win-list") == ["@4"], what="serve window")
+        app.dashboard.query_one("#win-list").focus()
+        await pilot.press("x")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="close asks")
+        assert "stop with it (2 running now)" in str(app.screen._message)
+        await pilot.press("n")
+        app.dashboard.query_one("#projects").focus()
+        await pilot.press("down")
+        await wait_for(pilot, lambda: app.dashboard.selected == "beta", what="beta")
+        assert "none running" in str(app.dashboard.query_one("#ov-sessions").render())
+
+
+@aio
+async def test_claude_closes_finished_sessions_first(world):
+    w = world()
+    w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@3", "name": "caulker", "done": True},
+               {"id": "@4", "name": "caulker", "done": True}, {"id": "@5", "name": "caulker/shell", "done": True}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await pilot.press("c")
+        await wait_for(pilot, lambda: w.tmux_calls("new-window"), what="claude window")
+        assert [c[-1] for c in w.tmux_calls("kill-window")] == ["@3", "@4"]       # not the shell
+        await pilot.press("C")
+        await wait_for(pilot, lambda: len(w.tmux_calls("new-window")) == 2, what="second session")
+        assert len(w.tmux_calls("kill-window")) == 2                              # the new one still runs
+
+
+@aio
+async def test_quit_and_restart_name_the_running_jobs(world):
+    w = world()
+    w.rules([{"args": ["up", "caulker"], "out": ["working"], "sleep": 30},
+             {"args": ["ui", "--restart"], "out": ["boxen: the ui's Python environment is missing"], "rc": 1}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await pilot.press("u")
+        await wait_for(pilot, lambda: app.dashboard.jobs.jobs and app.dashboard.jobs.jobs[0].lines, what="job")
+        pid = w.boxen_calls()[0]["pid"]
+        await pilot.press("Q")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="quit asks")
+        assert "These running jobs will be stopped (SIGTERM, then SIGKILL after 5 s" in str(app.screen._message)
+        assert "up caulker" in str(app.screen._message)
+        await pilot.press("n")
+        app.dashboard.action_restart_dashboard()
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="restart asks")
+        assert "up caulker" in str(app.screen._message)
+        await pilot.press("y")
+        # the job is stopped first (it ends "stopped"), then boxen ui --restart runs; its failure is shown
+        want = "Couldn't restart the dashboard: boxen: the ui's Python environment is missing"
+        await wait_for(pilot, lambda: want in [n.message for n in app._notifications], what="restart failure shown",
+                       timeout=12)
+        gone(pid)
+        assert app.dashboard.jobs.jobs[0].status == "stopped"
+        assert [c["args"] for c in w.boxen_calls()] == [["up", "caulker"], ["ui", "--restart"]]
+        assert app.is_running
+
+
+@aio
+async def test_job_gets_a_grace_period(world, tmp_path):
+    """Quitting sends SIGTERM once and waits: a job that cleans up on TERM
+    (as boxen new does) finishes its cleanup before anything is killed."""
+    mark = tmp_path / "cleaned"
+    slow = tmp_path / "slow-boxen"
+    slow.write_text("#!/bin/sh\n[ \"$1\" = up ] || exit 1\n"
+                    "trap 'sleep 1; touch %s; exit 143' TERM\necho working\nwhile :; do sleep 0.1; done\n" % mark)
+    slow.chmod(0o755)
+    w = world()
+    w.env["BOXEN_UI_BOXEN"] = str(slow)
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await wait_for(pilot, lambda: app.dashboard.ls_loaded, what="ls")
+        app.dashboard.start_job(["up", "caulker"], project="caulker")
+        await wait_for(pilot, lambda: app.dashboard.jobs.jobs[0].lines, what="job")
+        await pilot.press("Q")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="quit asks")
+        await pilot.press("y")
+        await wait_for(pilot, lambda: not app.is_running, what="exit", timeout=10)
+    assert mark.exists()

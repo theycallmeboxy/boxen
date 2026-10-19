@@ -207,7 +207,8 @@ migrate_project() {
   write_compose "$n" || return 1
   mkdir_private "$(token_dir "$n")"
   seed_repos "$n"
-  start_env "$n" --build || { warn "$n: its build container didn't start (fix $src/.boxen/, then boxen up $n)"; return 1; }
+  # Moved from here on: a failed start is fixed in .boxen/, not by migrate.
+  start_env "$n" --build || { warn "$n: moved, but its build container didn't start (fix $src/.boxen/, then boxen up $n)"; return 2; }
 }
 
 # migrate_shared: what v1 kept for every project. The commit identity
@@ -216,8 +217,9 @@ migrate_project() {
 migrate_shared() {
   local envf="$BOXEN_HOME/boxen.env" name email
   if [[ -f "$envf" && -z "$(git_ident email)" ]]; then
-    name=$(sed -n 's/^GIT_AUTHOR_NAME=//p' "$envf" | tail -1)
-    email=$(sed -n 's/^GIT_AUTHOR_EMAIL=//p' "$envf" | tail -1)
+    # (values as compose's env_file read them; surrounding quotes dropped)
+    name=$(sed -n 's/^GIT_AUTHOR_NAME=//p' "$envf" | tail -1 | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
+    email=$(sed -n 's/^GIT_AUTHOR_EMAIL=//p' "$envf" | tail -1 | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
     if [[ -n "$email" ]]; then
       write_gitconfig "$name" "$email"
       info "commit identity from v1: ${name:-?} <$email>"
@@ -298,10 +300,10 @@ EOF
 }
 
 migrate_main() {
-  local n yes=0 ans list=() failed=() running=()
+  local n r yes=0 ans list=() failed=() unstarted=() running=()
   case ${1:-} in
     --cleanup) (( $# == 1 )) || die "usage: boxen migrate [--cleanup | --yes]"; migrate_cleanup; return ;;
-    --yes|-y) yes=1 ;;
+    --yes|-y) (( $# == 1 )) || die "usage: boxen migrate [--cleanup | --yes]"; yes=1 ;;
     "") ;;
     *) die "usage: boxen migrate [--cleanup | --yes]" ;;
   esac
@@ -337,10 +339,13 @@ migrate_main() {
       info "supervisor: v2 has none; its v1 files are in $PROJECTS_DIR/.v1-supervisor until --cleanup"
       continue
     fi
-    locked "$n" migrate_project "$n" || failed+=("$n")
+    r=0
+    locked "$n" migrate_project "$n" || r=$?
+    if (( r == 2 )); then unstarted+=("$n"); elif (( r )); then failed+=("$n"); fi
   done
   echo
-  (( ${#failed[@]} == 0 )) || warn "these need a look (they're still v1; boxen migrate again tries them again): ${failed[*]}"
+  (( ${#failed[@]} == 0 )) || warn "not moved (still v1; boxen migrate again tries them again): ${failed[*]}"
+  (( ${#unstarted[@]} == 0 )) || warn "moved, but their build containers didn't start (fix .boxen/, then boxen up <name>): ${unstarted[*]}"
   cat <<EOF
 ==> Moved. Next:
     1. boxen doctor                  check the sandbox and rootless Docker

@@ -57,18 +57,52 @@ def opt_vals(args, name):
 if a[:1] == ["-H"]:
     # the system daemon (boxen v1's)
     log["v1"] = True
+    # v1: {images, volumes, containers: {name: {running, image}}, images_q: [ids],
+    #      needs_sudo (answers only through the fake sudo)}
     v1 = st.get("v1")
-    if v1 is None:
-        done(1, err="Cannot connect to the Docker daemon at %s\n" % a[1])
+    log["sudo"] = bool(os.environ.get("FAKE_SUDO"))
+    if v1 is None or (v1.get("needs_sudo") and not os.environ.get("FAKE_SUDO")):
+        done(1, err="permission denied while trying to connect to the Docker daemon socket at %s\n" % a[1])
+    import re
     b = a[2:]
+    ctrs = v1.setdefault("containers", {})
+    def save_v1():
+        st["v1"] = v1
+        save()
     if b[:1] == ["info"]:
         done(0, "")
     if b[:2] == ["image", "inspect"]:
         done(0 if b[2] in v1.get("images", ["boxen-base:latest"]) else 1)
-    if b[:1] in (["stop"], ["pull"]):
+    if b[:1] == ["stop"]:
+        for n in b[1:]:
+            if n in ctrs:
+                ctrs[n]["running"] = False
+        save_v1()
+        done(0)
+    if b[:1] == ["pull"]:
         done(0)
     if b[:1] == ["ps"]:
-        done(0, "")
+        names = sorted(n for n, c in ctrs.items() if c.get("running") or "-a" in b or "-aq" in b)
+        for f in opt_vals(b, "--filter"):
+            if f.startswith("name="):
+                names = [n for n in names if re.search(f[5:], n)]
+        done(0, "".join(n + "\n" for n in names))
+    if b[:1] == ["inspect"]:
+        done(0, "".join(ctrs[n]["image"] + "\n" for n in b[3:]))
+    if b[:1] == ["images"]:
+        done(0, "".join(i + "\n" for i in v1.get("images_q", [])))
+    if b[:2] == ["rm", "-f"]:
+        for n in b[2:]:
+            ctrs.pop(n, None)
+        save_v1()
+        done(0)
+    if b[:2] == ["volume", "rm"]:
+        for n in b[2:]:
+            v1.get("volumes", {}).pop(n, None)
+        save_v1()
+        done(0)
+    if b[:2] in (["image", "rm"], ["builder", "prune"], ["network", "prune"]):
+        done(0)
     if b[:2] == ["volume", "inspect"]:
         done(0 if b[2] in v1.get("volumes", {}) else 1)
     if b[:2] == ["volume", "ls"]:
@@ -217,6 +251,9 @@ if a[:1] == ["run"]:
                 log["stdin_members"] = sorted(m.name for m in t.getmembers())
         except tarfile.TarError:
             pass
+        vol = [v.split(":")[0] for v in opt_vals(a, "-v")][0]
+        if vol in st.get("fail_restore", []):
+            done(2, err="tar: write error\n")
         done(0)
     done(0)
 if a[:1] in (["build"], ["tag"], ["builder"]) or a[:2] in (["image", "prune"], ["image", "rm"]):
@@ -233,6 +270,8 @@ if a[:1] == ["volume"]:
     if a[1] == "ls":
         done(0, "")
     if a[1] == "rm":
+        st["volumes"] = [v for v in vols if v not in a[2:]]
+        save()
         done(0)
 done(1, err="fake docker: unhandled %r\n" % a)
 '''
@@ -430,6 +469,10 @@ class VM:
         write_exe(str(self.bin / "loginctl"), "#!/bin/sh\necho no\n")
         write_exe(str(self.bin / "crontab"), FAKE_CRONTAB)
         write_exe(str(self.bin / "claude"), "#!/bin/sh\necho 'claude (fake)' \"$@\"\n")
+        # sudo: logged; docker runs (as the "root" the fake v1 daemon wants),
+        # anything else (systemctl, gpasswd) only logged
+        write_exe(str(self.bin / "sudo"), '#!/bin/sh\necho "$*" >> "$FAKE_DIR/sudo.log"\n'
+                                          '[ "$1" = docker ] || exit 0\nFAKE_SUDO=1 exec "$@"\n')
         write_exe(str(self.fake / "docker-compose"), "#!/bin/sh\nexit 0\n")
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("BOXEN_", "XDG_", "GH_", "GITHUB_", "GIT_", "CLAUDE_", "TMUX", "DOCKER_"))}
@@ -524,6 +567,9 @@ class VM:
         main section) and then SCRIPT."""
         return run_fn(script, dict(self.env, **(env or {})), cwd=cwd, input=input)
 
+    def fn_tty(self, script, input="", env=None):
+        return run_fn_tty(script, dict(self.env, **(env or {})), self.tmp, input=input)
+
 
 def boxen_functions():
     """bin/boxen without its main section, with BOXEN_BIN fixed (so it can
@@ -533,6 +579,15 @@ def boxen_functions():
     text = text[:cut].replace('BOXEN_BIN="$(readlink -f "${BASH_SOURCE[0]}")"', 'BOXEN_BIN=%s' % BOXEN, 1)
     assert "BOXEN_BIN=" + BOXEN in text
     return text
+
+
+def run_fn_tty(script, env, tmp, input=""):
+    """run_fn with a terminal (script(1)), INPUT typed into it; the output
+    is the terminal's (stdout and stderr together)."""
+    prog = tmp / ("fn-%d.sh" % time.monotonic_ns())
+    prog.write_text(boxen_functions() + "\n" + script + "\n")
+    return subprocess.run(["script", "-qec", "bash %s" % prog, "/dev/null"], env=env, input=input,
+                          capture_output=True, text=True, timeout=60)
 
 
 def run_fn(script, env, cwd=None, input=None):
