@@ -205,3 +205,27 @@ def test_gitconfig_applies_in_projects(vm):
     subprocess.run(["git", "init", "-q", str(outside)], check=True)
     assert git(outside, "config", "user.email").stdout == "me@example.com\n"
     assert git(outside, "config", "--get-all", "credential.https://github.com.helper").stdout == ""
+
+
+def test_setup_with_systemd_user_services(vm):
+    """With a systemd user session: the token timer and the serve service,
+    and cron lines from an earlier boxen are dropped."""
+    from conftest import write_exe
+    write_exe(str(vm.bin / "systemctl"), '#!/bin/sh\necho "$*" >> "$FAKE_DIR/systemctl.log"\n')
+    (vm.fake / "crontab").write_text("0 1 * * * mine\n*/30 * * * * old boxen tokens # boxen-tokens\n")
+    vm.ok("setup")
+    u = vm.home / ".config" / "systemd" / "user"
+    svc = (u / "boxen-tokens.service").read_text()
+    assert 'Environment="BOXEN_HOME=%s" "BOXEN_SRC=%s"' % (vm.bhome, vm.src) in svc
+    assert "ExecStart=/bin/sh -c 'exec \"$0\" tokens --quiet >>\"$1\" 2>&1' \"%s\" \"%s\"" % (
+        BOXEN, vm.bhome / "tokens.log") in svc
+    assert "OnUnitActiveSec=30min" in (u / "boxen-tokens.timer").read_text()
+    assert "ExecStart=/bin/bash -lc 'exec \"$0\" serve --restore' \"%s\"" % BOXEN in \
+        (u / "boxen-serve.service").read_text()
+    log = (vm.fake / "systemctl.log").read_text().splitlines()
+    assert "--user enable --now boxen-tokens.timer" in log and "--user enable boxen-serve.service" in log
+    assert (vm.fake / "crontab").read_text() == "0 1 * * * mine\n"
+    # unchanged units aren't rewritten
+    m = (u / "boxen-tokens.service").stat().st_mtime_ns
+    vm.ok("setup")
+    assert (u / "boxen-tokens.service").stat().st_mtime_ns == m
