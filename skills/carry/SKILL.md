@@ -16,10 +16,11 @@ This conversation's own id: ${CLAUDE_SESSION_ID}
 
 ## Setup
 
-1. `MEMDIR=$(boxen-carry memdir); mkdir -p "$MEMDIR/carried"`. If
-   `boxen-carry` isn't found, this container predates /carry: ask the user to
-   run `boxen self-update` (from the supervisor project or a VM terminal; it
-   rebuilds this container). Stop.
+1. `boxen-carry memdir` prints MEMDIR, this project's auto-memory folder. If
+   `boxen-carry` isn't found, ask the user to run `boxen self-update` on the
+   VM, then stop. Every file under MEMDIR is written with the Write and Edit
+   tools (they create folders), never with shell commands: the sandbox
+   doesn't let the shell write there.
 2. `boxen-carry list`: tab-separated `N id8 date turns parts state title`,
    newest first (turns = messages the user typed; a part is up to 60k chars).
    The state is `live` (open in a running Claude right now, never carried;
@@ -42,8 +43,9 @@ This conversation's own id: ${CLAUDE_SESSION_ID}
 
 1. `boxen-carry info <id8>`: `id`, `title`, `date`, `turns`, `chars`, `parts`
    (M). NOTES = `$MEMDIR/carried/.<id8>.notes.md`.
-2. If NOTES exists: say you're resuming, read it, and continue from the part
-   after its first line `last part read: K`. Otherwise start at part 1.
+2. If NOTES exists and its first line isn't `done`: say you're resuming, read
+   it, and continue from the part after its first line `last part read: K`.
+   Otherwise start at part 1.
 3. M == 1: `boxen-carry read <id8>`. M > 1: `boxen-carry read <id8> --part K`
    for each K in order (the footer names the next command). After every part
    rewrite NOTES: `last part read: K`, then bullets under the headings below,
@@ -61,8 +63,8 @@ This conversation's own id: ${CLAUDE_SESSION_ID}
    about, 60 chars max), everywhere below.
 6. Write `$MEMDIR/carried/<id8>-<slug>.md` (slug: title lowercased, runs of
    anything but letters and digits as `-`, trimmed of `-`, 40 chars max). If
-   another `<id8>-*.md` exists, `mv` it onto the new name first: one file per
-   session. Exactly this structure:
+   a `<id8>-*.md` exists already, overwrite that file under its existing name
+   instead: one file per session. Exactly this structure:
 
    ```
    ---
@@ -87,7 +89,7 @@ This conversation's own id: ${CLAUDE_SESSION_ID}
      promised last and whether it was done.
    - 1-8 bullets per section; drop a section only if it is empty. A session
      that was all exploration gets two bullets saying so. Quote, don't guess.
-   - Then delete NOTES.
+   - Then overwrite NOTES with the single line `done` (it can't be deleted).
 7. `$MEMDIR/MEMORY.md`: under `## Carried over from earlier sessions` (create
    it at the end; create the file if missing) one line
    `- [<title>](carried/<file>) — <date>: <description>`, replacing the line
@@ -103,8 +105,7 @@ was carried this time, then ask what to pick up. Don't re-list every file.
 
 ## Rules
 
-- Never modify or delete transcript files (`*.jsonl`). Never delete a carried
-  file except by renaming it for the same session.
+- Never modify or delete transcript files (`*.jsonl`) or carried files.
 - Check NOTES before part 1; a resumed carry continues, it doesn't start over.
 - Sections hold what the transcript says, in its words: no invented
   decisions, no reconstructed commands.

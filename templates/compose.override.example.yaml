@@ -1,12 +1,16 @@
-# Your settings for the __NAME__ container. Copy this file to
-# compose.override.yaml (next to compose.yaml), keep what you need, and apply
-# with `boxen up __NAME__`. Docker merges it over compose.yaml, which boxen
-# regenerates on self-update; this file is yours and is never touched.
-services:
-  claude:
-    # Keep one project from starving the others.
-    # mem_limit: 8g
-    # cpus: 4
-
-    # Give each session its own git worktree instead of working in the folder.
-    # command: ["claude", "remote-control", "--name", "__NAME__", "--spawn=worktree"]
+# Example compose.override.yaml for __NAME__. Copy this file to
+# compose.override.yaml (same folder) and edit; `boxen up __NAME__` applies
+# it. Only you can edit it: the project's agent can't write this folder.
+#
+# services:
+#   env:
+#     # Open a dev server to the VM (and so the LAN): http://<vm>:3000
+#     ports:
+#       - "3000:3000"
+#     # Limits (memory and CPU need cgroup v2 delegation; install.sh sets it up)
+#     mem_limit: 8g
+#     cpus: 4
+#   # A sidecar from services.yaml, by its service name:
+#   postgres:
+#     ports:
+#       - "127.0.0.1:5432:5432"

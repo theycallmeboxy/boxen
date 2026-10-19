@@ -14,16 +14,17 @@ rewritten to this project's own named volumes, and every string has its $
 doubled so compose interpolates nothing from the VM's environment when it
 reads the output. Containers and volumes are named boxen.<project>.<name>:
 the dot can't appear in a project, service or volume name, so two projects
-can never produce the same name (and nothing can spell a project's own
-container, boxen-<project>, or its home volume, boxen-home-<project>).
+can never produce the same name. The project's own build container
+(boxen.<project>.env) and its home volume (boxen.<project>.home) are
+reserved: no sidecar is called env, no volume home.
 
 bin/boxen runs `docker compose config` in a throwaway container that sees
 only the file, so `include:` and `extends: {file: ...}` can't read other
 files on the VM; anything of the kind that survives into the JSON is
 refused here too.
 
-The file is written by the project's own Claude, from inside its container,
-so this is the boundary: a sidecar may use the network, CPU, memory and its
+The file is written by the project's own agent (it's in the project folder,
+.boxen/services.yaml), so this is the boundary: a sidecar may use the network, CPU, memory and its
 own named volumes, and nothing of the VM (no host paths, no published
 ports, no privileges, no Docker socket).
 
@@ -122,6 +123,8 @@ def check_volume(v, project, problems):
             return None
     if not is_str(src) or not VOLUME_NAME.match(src):
         problems.append("volumes: volume name %r must match %s" % (src, VOLUME_NAME.pattern))
+    elif src == "home":
+        problems.append("volumes: 'home' is the build container's own volume (boxen.<project>.home); pick another name")
         return None
     if not is_str(tgt) or not tgt.startswith("/"):
         problems.append("volumes: mount path %r must be absolute" % (tgt,))
@@ -276,8 +279,8 @@ def sanitize(doc, project):
         local = []
         if not SERVICE_NAME.match(name):
             local.append("name must match %s" % SERVICE_NAME.pattern)
-        elif name == "claude":
-            local.append("'claude' is this project's own container")
+        elif name in ("env", "claude"):
+            local.append("'%s' is this project's own build container" % name)
         elif name.startswith("boxen"):
             local.append("names starting with 'boxen' are reserved")
         svc = check_service(name, services[name], names, project, local) if not local else None

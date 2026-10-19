@@ -1,67 +1,51 @@
 #!/usr/bin/env bash
-# boxen: manage per-project Claude Code containers on this VM.
+# boxen: Claude Code agents on this VM, one project folder each, each
+# project's builds in its own container (rootless Docker).
 #
 # Layout:
-#   <clone>/                          this repo: script, base image, templates
-#   ~/.config/boxen/boxen.env         shared env for all containers (BOXEN_HOME)
-#   ~/.config/boxen/base.local.Dockerfile   optional: your additions to the base image
-#   ~/.config/boxen/projects/<name>/  compose.yaml, env/ (Dockerfile, services.yaml,
-#                                     STATUS.md: the project's own environment, /boxen inside),
-#                                     compose.services.yaml (rendered from it),
-#                                     optional project.env and compose.override.yaml
-#   ~/src/<name>/                     the project's code (BOXEN_SRC); same path inside
-#   docker volume claude-config       shared ~/.claude for every container
+#   <clone>/                          this repo
+#   ~/src/<name>/                     a project: its agent's folder (BOXEN_SRC)
+#   ~/src/<name>/.boxen/              its build container: Dockerfile, services.yaml
+#                                     (the agent may edit these)
+#   ~/.config/boxen/projects/<name>/  boxen's (agents can't write here): compose.yaml
+#                                     (generated), compose.services.yaml (rendered from
+#                                     services.yaml), compose.override.yaml (yours),
+#                                     repos and token/ (GitHub), serve (marker)
+#   ~/.config/boxen/gitconfig         git settings for repos under ~/src: the token
+#                                     helper and the commit identity
+#   ~/.claude/                        Claude Code, shared: boxen keeps the sandbox
+#                                     settings and boxen.md there
 set -euo pipefail
 
 # The repo is wherever this script really lives (it's usually symlinked into ~/.local/bin).
-BOXEN_REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+BOXEN_BIN="$(readlink -f "${BASH_SOURCE[0]}")"
+BOXEN_REPO="$(cd "$(dirname "$BOXEN_BIN")/.." && pwd)"
 BOXEN_HOME="${BOXEN_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/boxen}"
 SRC_ROOT="$(realpath -m "${BOXEN_SRC:-$HOME/src}")"
 PROJECTS_DIR="$BOXEN_HOME/projects"
-ENV_FILE="$BOXEN_HOME/boxen.env"
-LOCAL_BASE="$BOXEN_HOME/base.local.Dockerfile"
-CORE_IMAGE="boxen-base:core"
-BASE_IMAGE="boxen-base:latest"
-CONFIG_VOLUME="claude-config"
+CORE_IMAGE="boxen-env:core"
+ENV_IMAGE="boxen-env:latest"
+LOCAL_ENV="$BOXEN_HOME/env.local.Dockerfile"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+GITCONFIG="$BOXEN_HOME/gitconfig"
+FORMAT_MARK="# boxen-format: 2"
 
-# Identity for the container user. Use the passwd entry for the GID: under
-# `sg docker` (install.sh), plain `id -g` would report the docker group.
-USER_NAME="$(id -un)"
 USER_UID="$(id -u)"
-USER_GID="$(id -g "$USER_NAME")"
-CHOME="/home/$USER_NAME"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$USER_UID}"
+DOCKER_SOCK="$RUNTIME_DIR/docker.sock"
+# boxen only ever talks to your rootless Docker, never the system daemon
+# (BOXEN_DOCKER_HOST points it elsewhere, for tests).
+export DOCKER_HOST="${BOXEN_DOCKER_HOST:-unix://$DOCKER_SOCK}"
+
+# Sessions and the dashboard live in a tmux server of boxen's own. It's
+# started without DOCKER_HOST, so nothing in it inherits boxen's.
+TMUX_CMD=(env -u DOCKER_HOST tmux -L boxen)
+TMUX_CONF="$BOXEN_REPO/ui/tmux.conf"
 
 die()  { printf 'boxen: %s\n' "$*" >&2; exit 1; }
-# In cron runs (QUIET set), stamp warnings with the time for tokens.log.
+# In timer runs (QUIET set), stamp warnings with the time for tokens.log.
 warn() { printf '%sboxen: %s\n' "${QUIET:+$(date -Is) }" "$*" >&2; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-
-# Agent mode (BOXEN_AGENT=1): boxen is being run by boxen-agentd for the
-# supervisor project, with no terminal and nobody at the keyboard. Nothing may
-# stop to ask; a command that needs a person either fails (need_tty, exit 2)
-# or reports the exact question for someone to answer in the app and exits 3
-# (approval_needed). Interactive use is unchanged.
-agent_mode() { [[ "${BOXEN_AGENT:-}" == 1 ]]; }
-need_tty() {
-  agent_mode || return 0
-  printf 'boxen: %s needs a terminal\n' "$1" >&2
-  exit 2
-}
-# approval_needed KIND NAME COMMAND, with the question's text on stdin: print
-# it in the fixed form the supervisor looks for, then return 3.
-approval_needed() {
-  printf 'boxen: approval needed (%s) for %s:\n' "$1" "$2"
-  sed 's/^/    /'
-  printf 'boxen: to approve, run: %s\n' "$3"
-  return 3
-}
-# Set from `--approve trust` (up, restart, new): answer the trust question
-# in agent mode instead of reporting it.
-APPROVE_TRUST=0
-# Set from `--prepare` (restart, update): validate and build only, don't
-# recreate anything; the project's own agent socket runs this first so the
-# session asking sees the errors before its container goes away.
-PREPARE=0
 
 # run_quiet LABEL cmd...: run a command with its output hidden. On failure,
 # print "LABEL failed:" and the last 40 lines of its output, and fail too.
@@ -82,25 +66,29 @@ usage() {
   cat <<'EOF'
 Usage: boxen <command> [args]
 
-  new <name> [git-url]                            Create a project (cloning git-url if given) and start it
-  supervisor                                      Create/start the supervisor: runs boxen for you from the app
-  ui [--restart]                                  The dashboard: projects, jobs, logs and terminals (in tmux)
-  ls [--json]                                     List projects, their servers and GitHub tokens
-  up <name|all>                                   Start, or apply env/compose changes; answers pending prompts
-  down <name|all>                                 Stop
-  restart <name|all> [--prepare]                  Recreate the container (picks up env changes; --prepare: only check)
-  logs <name> [-f] [--tail N]                     The Remote Control server's output
-  show <name>                                     The project's environment: sidecars, Dockerfile, services.yaml
-  shell <name>                                    Bash inside the container
-  claude <name> [args]                            Terminal Claude session inside the container
-  resume <name> [N|ID] [--stop|--attach|--force]  Continue an earlier session in the Claude app
-  rm <name> [--yes]                               Remove container, image, config, tool installs and sidecar data (keeps the code)
-  github [--reset] [--key f.pem]                  Connect GitHub: your app, per-project tokens, commit identity
-  repos <name> [add|rm <owner/repo>...]           The GitHub repos a project's tokens cover (and ones found, unlisted)
-  login                                           Sign in to Claude again (shared by every project)
-  update [name|all] [--prepare]                   Rebuild images: fresh base and every project, or one project (--prepare: only build)
-  self-update                                     Update boxen itself and apply it to every project
-  import-mac                                      How to move your Claude Code work from a Mac
+Projects (~/src/<name>)
+  new <name> [git-url]            Create a project (cloning git-url if given) and its build container
+  ls [--json]                     Projects: build container, Claude sessions, serve, GitHub tokens
+  claude <name> [args]            A Claude session in the project, in a tmux window (also in the app)
+  serve [<name> [--off]]          Keep a Remote Control server up for a project, to start sessions from the app
+  ui [--restart]                  The dashboard: projects, sessions, files and terminals (tmux)
+  shell <name>                    A root shell in the project's build container
+  up <name|all>                   Start a build container and its sidecars, applying any changes
+  down <name|all>                 Stop them
+  rm <name> [--yes]               Remove the build container, image, sidecars and their data (keeps the code)
+  repos <name> [add|rm <owner/repo>...]   The GitHub repos a project's tokens cover
+
+In a project folder (what agents use; they act on the folder they're in)
+  run [-C dir] cmd...             Run a command in the project's build container
+  run -d NAME cmd... | --logs NAME [-f] | --stop NAME | --ps   Background processes there
+  env apply | show | logs <sidecar> [--tail N]   Apply .boxen/ changes; status; a sidecar's logs
+
+Setup and upkeep
+  github [--reset] [--key f.pem]  Connect GitHub: your app, per-project tokens, commit identity
+  doctor [--lan <host:port>]      Check rootless Docker, the sandbox and isolation on this VM
+  migrate [--cleanup]             Move a boxen v1 install (agents in containers) to this layout
+  update                          Rebuild the base image and every project's build container
+  self-update                     Update boxen itself and apply it
 EOF
 }
 
@@ -109,29 +97,23 @@ valid_name() {
     || die "invalid project name '$1' (lowercase letters and digits, single '-' or '_' between them, max 40 chars)"
 }
 
-# Names boxen ui uses for its own tmux windows ("dashboard") and window
-# prefixes: a new project can't take them. (One made before they were
-# reserved keeps working.)
-RESERVED_NAMES=(global dashboard ui)
+# Names that mean something else to boxen or boxen ui.
+RESERVED_NAMES=(all global dashboard ui)
 not_reserved() {
   local r
   for r in "${RESERVED_NAMES[@]}"; do
-    [[ "$1" != "$r" ]] || die "'$1' is reserved (boxen ui uses it); pick another name"
+    [[ "$1" != "$r" ]] || die "'$1' is reserved; pick another name"
   done
 }
 
+# ---------------------------------------------------------------- locks
+#
 # lock_project NAME: hold the project's lock (projects/NAME/.lock) for the
 # rest of this process (or subshell), so two boxen commands never change a
-# project at once (a terminal, boxen ui and the supervisor's agent all run
-# this same script). Never waits: if it's held, say so and exit 2
-# (LOCK_BUSY_RC: `locked` uses its own code so a loop can tell busy from
-# failed).
-#
-# The lock lives as long as its file descriptor is open, in this process
-# and in anything it starts. Every descriptor is kept in LOCK_FDS, and
-# whatever might outlive boxen or run long (install.sh and what it starts,
-# git, script and the attached docker client) runs through nolocks, so no
-# daemon can end up holding a project, or every project, locked.
+# project at once. Doesn't wait: if it's held, say so and exit 2
+# (LOCK_BUSY_RC). Every descriptor is kept in LOCK_FDS, and whatever might
+# outlive boxen (install.sh, tmux) runs through nolocks, so no daemon ends
+# up holding a lock.
 LOCK_FDS=()
 LOCK_BUSY_RC=2
 lock_project() {
@@ -139,28 +121,22 @@ lock_project() {
   d=$(proj_dir "$1")
   mkdir -p "$d"
   exec {fd}>>"$d/.lock"
-  flock -n "$fd" || {
-    printf 'boxen: %s is busy (another boxen command is running for it)\n' "$1" >&2
-    exit "$LOCK_BUSY_RC"
-  }
+  if [[ "${LOCK_WAIT:-0}" != 0 ]]; then
+    flock -w "$LOCK_WAIT" "$fd" || { printf 'boxen: %s is busy (another boxen command has held it for %ss)\n' "$1" "$LOCK_WAIT" >&2; exit "$LOCK_BUSY_RC"; }
+  else
+    flock -n "$fd" || { printf 'boxen: %s is busy (another boxen command is running for it)\n' "$1" >&2; exit "$LOCK_BUSY_RC"; }
+  fi
   LOCK_FDS+=("$fd")
 }
 
-# lock_global: the same for commands that touch every project (update,
-# self-update), which then also take each project's lock as they get to it.
 lock_global() {
   local fd
   mkdir -p "$BOXEN_HOME"
   exec {fd}>>"$BOXEN_HOME/.global.lock"
-  flock -n "$fd" || {
-    printf 'boxen: busy (another update or self-update is running)\n' >&2
-    exit 2
-  }
+  flock -n "$fd" || { printf 'boxen: busy (another update or self-update is running)\n' >&2; exit 2; }
   LOCK_FDS+=("$fd")
 }
 
-# nolocks cmd...: run cmd (a command or a function) in a subshell with
-# every lock descriptor closed.
 nolocks() {
   (
     local fd
@@ -171,8 +147,7 @@ nolocks() {
 }
 
 # locked NAME cmd...: run cmd in a subshell holding NAME's lock, for loops
-# over every project: a busy one is skipped with exit 75 (BUSY_RC), told
-# apart from a failure, and the loop goes on.
+# over every project: a busy one is skipped with exit 75 (BUSY_RC).
 BUSY_RC=75
 locked() {
   local n=$1
@@ -180,75 +155,8 @@ locked() {
   ( LOCK_BUSY_RC=$BUSY_RC; lock_project "$n"; "$@" )
 }
 
-# loop_summary WHAT BUSY... -- FAILED...: the end of an update over every
-# project: skipped (busy) ones are a warning, failures an error.
-loop_summary() {
-  local what=$1 busy=() failed=()
-  shift
-  while (( $# )) && [[ "$1" != -- ]]; do busy+=("$1"); shift; done
-  shift || true
-  failed=("$@")
-  (( ${#busy[@]} == 0 )) || warn "$what: skipped, busy (another boxen command was running for them): ${busy[*]}"
-  (( ${#failed[@]} == 0 )) || die "$what finished, but these projects failed: ${failed[*]}"
-  (( ${#busy[@]} == 0 )) || exit 2
-}
-
-proj_dir() { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
-
-require_project() {
-  [[ -n "${1:-}" ]] || die "missing project name (see 'boxen help')"
-  valid_name "$1"
-  [[ -f "$(proj_dir "$1")/compose.yaml" ]] || die "no such project: $1"
-}
-
-require_setup() {
-  [[ -f "$ENV_FILE" ]] || die "run $BOXEN_REPO/install.sh first"
-  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || die "base image missing; run $BOXEN_REPO/install.sh first"
-  docker volume inspect "$CONFIG_VOLUME" >/dev/null 2>&1 || die "volume $CONFIG_VOLUME missing; run $BOXEN_REPO/install.sh first"
-}
-
-# docker compose scoped to one project's directory. compose.yaml is generated;
-# compose.services.yaml (the sidecars boxen rendered from env/services.yaml,
-# see render_services) comes next; the project's own settings go in
-# compose.override.yaml, merged last (with an explicit -f, compose doesn't
-# pick the override up by itself).
-dc() {
-  local name=$1; shift
-  local dir; dir=$(proj_dir "$name")
-  fresh_compose "$name" || return 1
-  local files=(-f "$dir/compose.yaml")
-  [[ -f "$dir/compose.services.yaml" ]] && files+=(-f "$dir/compose.services.yaml")
-  [[ -f "$dir/compose.override.yaml" ]] && files+=(-f "$dir/compose.override.yaml")
-  docker compose --project-directory "$dir" "${files[@]}" "$@"
-}
-
-# One-off container from the base image with the shared config mounted.
-run_base() {
-  docker run --rm "$@"
-}
-base_args() {
-  printf '%s\n' -v "$CONFIG_VOLUME:$CHOME/.claude" -e "CLAUDE_CONFIG_DIR=$CHOME/.claude"
-}
-
-# The supervisor project (the one that runs boxen for you from the app) goes
-# last, so an "all" that restarts it has finished everything else first.
-projects() {
-  shopt -s nullglob
-  local d n
-  for d in "$PROJECTS_DIR"/*/; do
-    d=${d%/}
-    n=${d##*/}
-    [[ "$n" != supervisor ]] && printf '%s\n' "$n"
-  done
-  [[ -d "$PROJECTS_DIR/supervisor" ]] && echo supervisor
-  return 0
-}
-
-# each <cmd_fn> <name|all> [args...]: run a per-project command for one
-# project, or for every project when the name is "all". Each project runs in
-# a subshell, so one failing doesn't stop the rest; failures are listed at
-# the end (exit 3 if any of them was only waiting for an approval).
-EACH_ALL=0
+# each <fn> <name|all> [args...]: a per-project command for one project, or
+# every project; failures and busy ones are listed at the end.
 each() {
   local fn=$1
   shift
@@ -257,1457 +165,246 @@ each() {
     return
   fi
   shift
-  EACH_ALL=1
-  local n rc=0 r failed=() busy=() list=()
+  local n r rc=0 failed=() busy=() list=()
   mapfile -t list < <(projects)
   (( ${#list[@]} )) || { info "no projects yet"; return 0; }
   for n in "${list[@]}"; do
     r=0
     ( LOCK_BUSY_RC=$BUSY_RC; "$fn" "$n" "$@" ) || r=$?
-    if (( r == BUSY_RC )); then
-      busy+=("$n")
-      (( rc )) || rc=2
-    elif (( r )); then
-      if (( r == 3 && rc != 1 )); then rc=3; else rc=1; fi
-      failed+=("$n")
-    fi
+    if (( r == BUSY_RC )); then busy+=("$n"); (( rc )) || rc=2
+    elif (( r )); then failed+=("$n"); rc=1; fi
   done
   (( ${#busy[@]} == 0 )) || warn "skipped, busy (another boxen command was running for them): ${busy[*]}"
   (( ${#failed[@]} == 0 )) || warn "failed for: ${failed[*]}"
   (( rc == 0 )) || exit "$rc"
 }
 
-# The compose template a project is rendered from: the supervisor has its own.
-compose_template() {
-  if [[ "$1" == supervisor ]]; then
-    printf '%s/templates/compose.supervisor.yaml\n' "$BOXEN_REPO"
-  else
-    printf '%s/templates/compose.yaml\n' "$BOXEN_REPO"
-  fi
+# ---------------------------------------------------------------- paths
+
+proj_dir() { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
+src_dir()  { printf '%s/%s' "$SRC_ROOT" "$1"; }
+bdir()     { printf '%s/%s/.boxen' "$SRC_ROOT" "$1"; }
+
+is_v2() { [[ -f "$(proj_dir "$1")/compose.yaml" ]] && grep -qxF "$FORMAT_MARK" "$(proj_dir "$1")/compose.yaml"; }
+
+require_project() {
+  [[ -n "${1:-}" ]] || die "missing project name (see 'boxen help')"
+  valid_name "$1"
+  [[ -f "$(proj_dir "$1")/compose.yaml" ]] || die "no such project: $1"
+  is_v2 "$1" || die "$1 is a boxen v1 project (agent in a container); run 'boxen migrate' first"
 }
 
-# ---------------------------------------------------------------- setup
-
-build_base() {
-  # --fresh: re-pull Ubuntu and skip the cache so apt picks up new
-  # packages (including Claude Code) in both layers.
-  local core_extra=() local_extra=()
-  if [[ "${1:-}" == "--fresh" ]]; then
-    core_extra=(--pull --no-cache)
-    local_extra=(--no-cache)
-  fi
-  info "building base image..."
-  run_quiet "building $CORE_IMAGE" docker build "${core_extra[@]}" -t "$CORE_IMAGE" \
-    --build-arg USERNAME="$USER_NAME" \
-    --build-arg USER_UID="$USER_UID" \
-    --build-arg USER_GID="$USER_GID" \
-    "$BOXEN_REPO/base" || return 1
-  if [[ -f "$LOCAL_BASE" ]]; then
-    info "applying base.local.Dockerfile..."
-    # Built from stdin with no context, so nothing in ~/.config/boxen
-    # (like boxen.env) is ever sent to the builder.
-    run_quiet "building $BASE_IMAGE from $LOCAL_BASE" \
-      docker build "${local_extra[@]}" -t "$BASE_IMAGE" - < "$LOCAL_BASE" || return 1
-  else
-    run_quiet "tagging $BASE_IMAGE" docker tag "$CORE_IMAGE" "$BASE_IMAGE" || return 1
-  fi
+# projects: every v2 project, by name. v1_projects: the ones migrate converts.
+projects() {
+  shopt -s nullglob
+  local d n
+  for d in "$PROJECTS_DIR"/*/; do
+    d=${d%/}; n=${d##*/}
+    is_v2 "$n" && printf '%s\n' "$n"
+  done
+  return 0
 }
-
-# Hidden command: install.sh runs it (and self-update, through install.sh).
-cmd_setup() {
-  command -v docker >/dev/null || die "docker not found"
-  docker compose version >/dev/null 2>&1 || die "docker compose plugin not found"
-  docker info >/dev/null 2>&1 || die "can't talk to the docker daemon (is your user in the docker group?)"
-
-  mkdir -p "$PROJECTS_DIR" "$SRC_ROOT"
-
-  if [[ ! -f "$ENV_FILE" ]]; then
-    cp "$BOXEN_REPO/templates/boxen.env" "$ENV_FILE"
-    chmod 600 "$ENV_FILE"
-    # Containers use the VM's timezone.
-    local tz
-    tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
-    if [[ -n "$tz" ]]; then set_env TZ "$tz"; fi
-    info "created $ENV_FILE"
-  fi
-
-  build_base || exit 1
-
-  if ! docker volume inspect "$CONFIG_VOLUME" >/dev/null 2>&1; then
-    docker volume create "$CONFIG_VOLUME" >/dev/null
-    info "created volume $CONFIG_VOLUME"
-  fi
-  # Make sure the shared config volume belongs to you, not root.
-  docker run --rm --user root -v "$CONFIG_VOLUME:/v" "$BASE_IMAGE" \
-    chown "$USER_UID:$USER_GID" /v
-
-  install_shared_config
-
-  # Projects from before env/ existed: move their Dockerfile there now, so
-  # the compose template that expects it works. Projects from before repo
-  # lists get theirs, from their origin as it is now (seed_repos). Done here
-  # (and not only in self-update) because a self-update started by the
-  # previous boxen runs the new installer, and so this, before it
-  # re-renders every project.
-  local n
-  while read -r n; do
-    [[ -f "$(proj_dir "$n")/compose.yaml" ]] || continue
-    migrate_env "$n"
-    fresh_compose "$n"
-    seed_repos "$n"
-  done < <(projects)
+v1_projects() {
+  shopt -s nullglob
+  local d n
+  for d in "$PROJECTS_DIR"/*/; do
+    d=${d%/}; n=${d##*/}
+    [[ -f "$d/compose.yaml" ]] && ! is_v2 "$n" && printf '%s\n' "$n"
+  done
   return 0
 }
 
-# The /carry skill goes into the shared config (every project sees it), and
-# transcripts are kept a year instead of Claude Code's 30 days, so there's
-# something to carry. Only boxen's own copy of the skill is replaced; a
-# cleanupPeriodDays you set yourself is left alone. boxen.md (how a project's
-# Claude changes its own environment: /boxen, sidecars, `boxen restart`) is
-# installed next to the shared CLAUDE.md and imported from it with a
-# `@boxen.md` line; the rest of CLAUDE.md is yours and never touched.
-install_shared_config() {
-  local args line out rc=0
-  mapfile -t args < <(base_args)
-  out=$(mktemp)
-  # shellcheck disable=SC2016  # expanded inside the container
-  run_base "${args[@]}" -v "$BOXEN_REPO/skills:/boxen-skills:ro" \
-    -v "$BOXEN_REPO/templates:/boxen-templates:ro" "$BASE_IMAGE" bash -c '
-    set -e
-    d=$CLAUDE_CONFIG_DIR/skills/carry
-    if [ ! -f "$d/SKILL.md" ]; then
-      mkdir -p "$d" && cp /boxen-skills/carry/SKILL.md "$d/SKILL.md" && echo "installed /carry skill"
-    elif head -5 "$d/SKILL.md" | grep -q boxen-managed; then
-      cp /boxen-skills/carry/SKILL.md "$d/SKILL.md"
-    fi
-    b=$CLAUDE_CONFIG_DIR/boxen.md
-    if [ ! -f "$b" ]; then
-      cp /boxen-templates/boxen.md "$b" && echo "installed boxen.md instructions"
-    elif head -1 "$b" | grep -q boxen-managed; then
-      cp /boxen-templates/boxen.md "$b"
-    fi
-    c=$CLAUDE_CONFIG_DIR/CLAUDE.md
-    if [ ! -f "$c" ]; then
-      printf "@boxen.md\n" > "$c"
-    elif ! grep -qx "@boxen.md" "$c"; then
-      [ ! -s "$c" ] || [ -z "$(tail -c 1 "$c")" ] || printf "\n" >> "$c"
-      printf "\n@boxen.md\n" >> "$c"
-    fi
-    s=$CLAUDE_CONFIG_DIR/settings.json
-    if [ ! -f "$s" ]; then
-      echo "{\"cleanupPeriodDays\": 365}" > "$s" && echo "transcripts are kept for 365 days"
-    elif ! jq -e "type == \"object\"" "$s" >/dev/null 2>&1; then
-      echo "settings.json is not a JSON object; leaving it alone"
-    elif ! jq -e "has(\"cleanupPeriodDays\")" "$s" >/dev/null; then
-      jq ".cleanupPeriodDays = 365" "$s" > "$s.tmp" && mv -f "$s.tmp" "$s" && echo "transcripts are kept for 365 days"
-    fi' >"$out" 2>&1 || rc=$?
-  if (( rc )); then
-    printf 'boxen: installing shared config failed:\n' >&2
-    tail -n 40 "$out" >&2
-  else
-    while IFS= read -r line; do info "$line"; done < "$out"
-  fi
-  rm -f "$out"
-  return "$rc"
-}
-
-# ------------------------------------------------------- shared config / login
-
-# True when the shared config holds a claude.ai login, which Remote Control
-# requires (API keys and setup-token tokens don't work for it).
-logged_in() {
-  local args; mapfile -t args < <(base_args)
-  run_base "${args[@]}" "$BASE_IMAGE" \
-    sh -c 'claude auth status 2>/dev/null | jq -e ".authMethod == \"claude.ai\"" >/dev/null'
-}
-
-do_login() {
-  need_tty login
-  local args; mapfile -t args < <(base_args)
-  echo "    Open the URL it prints on any device and sign in with your claude.ai account."
-  echo "    Then paste the code it gives you here and press Enter. Nothing appears on"
-  echo "    screen while you paste; that's normal."
-  run_base -it "${args[@]}" "$BASE_IMAGE" claude auth login
-}
-
-ensure_login() {
-  logged_in && return
-  if agent_mode; then
-    printf 'boxen: login needs a terminal (Claude isn'"'"'t signed in yet; run '"'"'boxen login'"'"' on the VM)\n' >&2
-    exit 2
-  fi
-  info "Claude isn't signed in (with a claude.ai account) yet. Every project shares this login."
-  do_login
-  logged_in || die "still not signed in with a claude.ai account; run 'boxen login' to retry"
-}
-
-cmd_login() {
-  require_setup
-  do_login
-  logged_in || die "sign-in didn't produce a claude.ai login"
-  local n list=()
-  mapfile -t list < <(projects)
-  for n in "${list[@]}"; do
-    if [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]] \
-       || [[ "$(docker inspect -f '{{.State.Restarting}}' "boxen-$n" 2>/dev/null || true)" == true ]]; then
-      docker restart "boxen-$n" >/dev/null
-    fi
-  done
-  info "signed in"
-}
-
-# ---------------------------------------------------------------- GitHub
-#
-# A private GitHub App you own mints short-lived tokens (1 hour). Which repos
-# a project's tokens cover is a list you keep on the VM,
-# projects/<name>/repos (see `boxen repos`), which is never mounted into a
-# container: the project's git remotes, which its own Claude can change,
-# don't decide what it can reach. One token per owner (you, an org) in the
-# list, scoped to that owner's listed repos, in projects/<name>/token:
-# gh-token.<owner>, gh-token (the default: the first listed repo's owner's)
-# and state.json (each listed repo's state). The app's private key stays on
-# the VM. A container sees only its own token folder, read-only at
-# /run/boxen, and cron refreshes it every 30 minutes.
-
-GH_DIR="$BOXEN_HOME/github"
-GH_KEY="$GH_DIR/app.pem"
-GH_CONF="$GH_DIR/app.conf"
-TOKENS_LOG="$BOXEN_HOME/tokens.log"
-GH_API="https://api.github.com"
-GITSCAN="$BOXEN_REPO/bin/boxen-gitscan"
-
-app_configured() { [[ -s "$GH_KEY" && -s "$GH_CONF" ]]; }
-app_conf() { sed -n "s/^$1=//p" "$GH_CONF" 2>/dev/null | tail -1; }
-set_app_conf() {
-  local tmp="$GH_CONF.tmp"
-  { grep -v "^$1=" "$GH_CONF" 2>/dev/null || true; printf '%s=%s\n' "$1" "$2"; } > "$tmp"
-  mv -f "$tmp" "$GH_CONF"
-}
-app_install_url() { printf 'https://github.com/apps/%s/installations/new' "$(app_conf APP_SLUG)"; }
-
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-
-# RS256 JWT identifying the app, valid for 9 minutes (iat backdated 60s for
-# clock drift, as GitHub recommends).
-make_jwt() {
-  local now h p s
-  now=$(date +%s)
-  h=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
-  p=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$(app_conf CLIENT_ID)" | b64url)
-  s=$(printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -sign "$GH_KEY" -binary | b64url)
-  printf '%s.%s.%s' "$h" "$p" "$s"
-}
-
-# gh_app_api METHOD PATH [JSON]: call the GitHub API as the app. Prints the
-# JSON reply; on failure it still prints JSON with a .message, and fails.
-gh_app_api() {
-  local out rc=0
-  local args=(-s --fail-with-body -X "$1"
-              -H "Authorization: Bearer $(make_jwt)"
-              -H "Accept: application/vnd.github+json"
-              -H "X-GitHub-Api-Version: 2022-11-28")
-  if [[ -n "${3:-}" ]]; then args+=(-H "Content-Type: application/json" -d "$3"); fi
-  out=$(curl "${args[@]}" "$GH_API$2") || rc=$?
-  if (( rc )) && [[ -z "$out" ]]; then
-    out=$(printf '{"message":"no reply from GitHub (curl exit %d)"}' "$rc")
-  fi
-  printf '%s\n' "$out"
-  return "$rc"
-}
-gh_msg() { jq -r '.message // empty' <<<"$1" 2>/dev/null || true; }
-# gh_unreachable REPLY: a failed gh_app_api got no answer from GitHub at all
-# (the network, an outage page) rather than GitHub saying no.
-gh_unreachable() {
-  [[ "$(gh_msg "$1")" == "no reply from GitHub"* ]] || ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$1"
-}
-
-# owner and repo: GitHub's own shape (start alphanumeric, no trailing . or -), and no ".."
-REPO_SEG='[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9_])?'
-repo_shape() { [[ $1 =~ ^$REPO_SEG/$REPO_SEG$ && $1 != *..* ]]; }
-
-# github.com remote URL (https or ssh form) -> owner/repo
-github_repo() {
-  local u=${1%/}
-  u=${u%.git}
-  case $u in
-    https://github.com/*)   u=${u#https://github.com/} ;;
-    git@github.com:*)       u=${u#git@github.com:} ;;
-    ssh://git@github.com/*) u=${u#ssh://git@github.com/} ;;
-    *)
-      # https://user@github.com/ (no / in the user part)
-      [[ $u =~ ^https://[^/@]+@github\.com/ ]] || return 1
-      u=${u#"${BASH_REMATCH[0]}"} ;;
+# project_of_dir DIR: the project DIR (a physical path) is in, if any.
+project_of_dir() {
+  local rel n
+  case "$1/" in
+    "$SRC_ROOT"/?*/*) ;;
+    *) return 1 ;;
   esac
-  repo_shape "$u" || return 1
-  printf '%s\n' "$u"
+  rel=${1#"$SRC_ROOT"/}
+  n=${rel%%/*}
+  [[ "$n" =~ ^[a-z0-9]+([_-][a-z0-9]+)*$ ]] && is_v2 "$n" || return 1
+  printf '%s\n' "$n"
 }
 
-# repo_arg ARG: owner/repo from what someone typed: owner/repo, or a
-# github.com URL.
-repo_arg() {
-  case $1 in
-    *://*|*@*) github_repo "$1" ;;
-    *)         github_repo "https://github.com/$1" ;;
-  esac
+# project_here: the project of the current folder, in HERE (or die).
+HERE=""
+project_here() {
+  HERE=$(project_of_dir "$(pwd -P)") \
+    || die "not in a boxen project folder (~/src/<project>); boxen run and boxen env act on the folder you're in"
 }
 
-mkdir_private() { mkdir -p "$1" && chmod 700 "$1"; }
+# ---------------------------------------------------------------- Docker
 
-token_dir() { printf '%s/token' "$(proj_dir "$1")"; }
-repos_file() { printf '%s/repos' "$(proj_dir "$1")"; }
-
-# listed_repos NAME: the project's repo list, one owner/repo per line as
-# written there, the first one first. Comments (#), blank lines and lines
-# that aren't a repo are skipped; a repo listed twice (in any case) counts
-# once. No list: nothing.
-listed_repos() {
-  local f line seen=" "
-  f=$(repos_file "$1")
-  [[ -f "$f" && ! -L "$f" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line=${line%%#*}
-    line=${line//[[:space:]]/}
-    line=${line%.git}
-    repo_shape "$line" || continue
-    [[ "$seen" != *" ${line,,} "* ]] || continue
-    seen+="${line,,} "
-    printf '%s\n' "$line"
-  done < "$f"
+# require_docker: the rootless daemon answers. Build containers run as root,
+# which is only your own user under rootless Docker; under a system daemon
+# it would be root on the VM, so boxen refuses one.
+require_docker() {
+  command -v docker >/dev/null || die "docker isn't installed; run $BOXEN_REPO/install.sh"
+  local so
+  if ! so=$(docker info -f '{{json .SecurityOptions}}' 2>/dev/null); then
+    # The socket is there but can't be reached: most likely a Claude Code
+    # sandbox, which blocks it (boxen run/env are excluded only when they
+    # are the whole command line).
+    [[ ! -S "$DOCKER_SOCK" ]] || die "can't reach Docker. In a Claude session: make 'boxen run ...' the whole command line (no 'cd ... &&', pipes, redirects or \$(...)); otherwise check 'systemctl --user status docker'"
+    die "can't reach rootless Docker at $DOCKER_HOST (systemctl --user start docker; or re-run $BOXEN_REPO/install.sh)"
+  fi
+  [[ "$so" == *rootless* ]] || die "the Docker daemon at $DOCKER_HOST isn't rootless; boxen's build containers need it to be (see install.sh)"
 }
 
-# bad_repo_lines NAME: lines of the list that aren't a repo (hand edits).
-bad_repo_lines() {
-  local f line r
-  f=$(repos_file "$1")
-  [[ -f "$f" && ! -L "$f" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    r=${line%%#*}
-    r=${r//[[:space:]]/}
-    [[ -z "$r" ]] || repo_shape "${r%.git}" || printf '%s\n' "$line"
-  done < "$f"
+require_setup() {
+  require_docker
+  docker image inspect "$ENV_IMAGE" >/dev/null 2>&1 || die "base image $ENV_IMAGE missing; run $BOXEN_REPO/install.sh"
 }
 
-repos_header() {
-  cat <<EOF
-# GitHub repos the $1 project's tokens cover, one owner/repo per line; the
-# first is the default for gh. Written by boxen: change it with
-# 'boxen repos $1 add|rm owner/repo'. The project's git remotes never change it.
-EOF
-}
-
-# write_repos NAME < content: replace the list atomically (a temp file in
-# the project dir, then mv).
-write_repos() {
-  local f tmp
-  f=$(repos_file "$1")
-  tmp=$(mktemp -p "$(proj_dir "$1")" .repos.XXXXXX) || return 1
-  cat > "$tmp"
-  chmod 0644 "$tmp"
-  mv -fT "$tmp" "$f" || { rm -f "$tmp"; return 1; }
-}
-
-# origin_repo NAME: owner/repo of the project's origin, if it's on GitHub,
-# read from the code folder's git config as text by boxen-gitscan (git is
-# never run on a folder the container controls).
-origin_repo() { "$GITSCAN" origin "$SRC_ROOT/$1" 2>/dev/null || true; }
-
-# found_repos NAME: every GitHub repo the code folder's git configs name:
-# all remotes, nested repos, submodules (boxen-gitscan; at most 2 s). Written
-# by the container, so untrusted, but only ever owner/repo.
-found_repos() { "$GITSCAN" scan "$SRC_ROOT/$1" 2>/dev/null || true; }
-
-# unlisted_repos NAME: found_repos that aren't in the list.
-unlisted_repos() {
-  local r listed
-  listed=" $(listed_repos "$1" | tr '\n' ' ') "
-  listed=${listed,,}
-  while IFS= read -r r; do
-    repo_shape "$r" || continue
-    [[ "$listed" == *" ${r,,} "* ]] || printf '%s\n' "$r"
-  done < <(found_repos "$1")
-}
-
-# seed_repos NAME [REPO]: a project without a list gets one: REPO (what
-# `new` clones; none if empty), else the project's origin now if that's on
-# GitHub, else an empty list. Happens once (`new`, `setup`, or else the
-# first token refresh); after that, origin is never asked again.
-seed_repos() {
-  local n=$1 repo=${2-} f
-  [[ "$n" != supervisor && -d "$(proj_dir "$n")" ]] || return 0
-  f=$(repos_file "$n")
-  [[ ! -e "$f" && ! -L "$f" ]] || return 0
-  (( $# > 1 )) || repo=$(origin_repo "$n")
-  { repos_header "$n"; [[ -z "$repo" ]] || printf '%s\n' "$repo"; } | write_repos "$n"
-}
-
-# repo_states NAME REPO...: each repo's state from token/state.json, a
-# line each: ok, not-installed, no-access, error, or - (not known yet).
-repo_states() {
-  local n=$1 f r out
+# docker compose for one project: the generated compose.yaml, the sidecars
+# rendered from services.yaml, and your compose.override.yaml, in that order.
+dc() {
+  local n=$1 d files
   shift
-  (( $# )) || return 0
-  f="$(token_dir "$n")/state.json"
-  if [[ -f "$f" ]] && out=$(jq -r '(if type == "object" then . else {} end) as $s | $ARGS.positional[]
-        | ($s[ascii_downcase] // "-")
-        | if IN("ok", "not-installed", "no-access", "error") then . else "-" end' "$f" --args "$@" 2>/dev/null); then
-    printf '%s\n' "$out"
-    return 0
-  fi
-  for r in "$@"; do echo "-"; done
+  d=$(proj_dir "$n")
+  files=(-f "$d/compose.yaml")
+  [[ -f "$d/compose.services.yaml" ]] && files+=(-f "$d/compose.services.yaml")
+  [[ -f "$d/compose.override.yaml" ]] && files+=(-f "$d/compose.override.yaml")
+  docker compose --project-directory "$d" "${files[@]}" "$@"
 }
 
-# github_state NAME STATE...: the GITHUB column of `boxen ls`, from the
-# listed repos' states (repo_states) and the token files' age, no network:
-# "-" with nothing listed; "token ok" when every listed repo is covered,
-# "token partial" when some are, "no token" when none is; "token stale" when
-# a token is older than 55 minutes (tokens last an hour and cron renews them
-# every 30 minutes, so the refresh isn't happening).
-github_state() {
-  local n=$1 s ok=0 dir
-  shift
-  (( $# )) || { echo "-"; return; }
-  app_configured || { echo "run boxen github"; return; }
-  dir=$(token_dir "$n")
-  for s in "$@"; do [[ "$s" != ok ]] || ok=$((ok + 1)); done
-  # A token from a boxen before repo lists: renewed at the next refresh.
-  if [[ ! -f "$dir/state.json" && -f "$dir/gh-token" ]]; then ok=$#; fi
-  (( ok )) || { echo "no token"; return; }
-  if [[ -n "$(find "$dir" -maxdepth 1 -type f \( -name gh-token -o -name 'gh-token.*' \) -mmin +55 2>/dev/null)" ]]; then
-    echo "token stale"
-  elif (( ok == $# )); then
-    echo "token ok"
+env_name() { printf 'boxen.%s.env' "$1"; }
+running() { [[ "$(docker inspect -f '{{.State.Running}}' "$(env_name "$1")" 2>/dev/null || true)" == true ]]; }
+
+build_base() {
+  # --fresh: re-pull Ubuntu and skip the cache so apt picks up new packages.
+  local core_extra=() local_extra=()
+  if [[ "${1:-}" == --fresh ]]; then
+    core_extra=(--pull --no-cache)
+    local_extra=(--no-cache)
+  fi
+  info "building the base image ($ENV_IMAGE)..."
+  run_quiet "building $CORE_IMAGE" docker build "${core_extra[@]}" -t "$CORE_IMAGE" "$BOXEN_REPO/image" || return 1
+  if [[ -f "$LOCAL_ENV" ]]; then
+    info "applying env.local.Dockerfile..."
+    # From stdin with no context: nothing in ~/.config/boxen reaches the builder.
+    run_quiet "building $ENV_IMAGE from $LOCAL_ENV" \
+      docker build "${local_extra[@]}" -t "$ENV_IMAGE" - < "$LOCAL_ENV" || return 1
   else
-    echo "token partial"
+    run_quiet "tagging $ENV_IMAGE" docker tag "$CORE_IMAGE" "$ENV_IMAGE" || return 1
   fi
 }
 
-# installations: "login id" lines (login in lower case) in INSTALLS, every
-# account the app is installed on (you, orgs you added it to). Asked once
-# per run; fails when GitHub couldn't be asked. Call it directly, never in
-# $( ), or the answer isn't kept.
-INSTALLS="" INSTALLS_RC=""
-installations() {
-  local out
-  if [[ -z "$INSTALLS_RC" ]]; then
-    INSTALLS_RC=1
-    if out=$(gh_app_api GET "/app/installations?per_page=100") \
-       && INSTALLS=$(jq -r '.[] | "\(.account.login | ascii_downcase) \(.id)"' <<<"$out" 2>/dev/null); then
-      INSTALLS_RC=0
-    fi
-  fi
-  return "$INSTALLS_RC"
-}
+# ------------------------------------------------------- templates, .boxen/
 
-# Per repo (lower case) after a mint: ok, not-installed, no-access or error
-# (see mint_owner); per owner (lower case): its token's expiry.
-declare -A RSTATE=() OWNER_EXP=()
-set_state() {
-  local s=$1 r
-  shift
-  for r in "$@"; do RSTATE[${r,,}]=$s; done
-}
-
-# write_token DIR FILE TOKEN: atomically (a reader never sees half a
-# token), mode 0600.
-write_token() {
-  (umask 077; printf '%s\n' "$3" > "$1/.$2.tmp") && mv -f "$1/.$2.tmp" "$1/$2"
-}
-
-# mint_request INSTALLATION REPO...: a token covering just those repos.
-mint_request() {
-  local inst=$1
-  shift
-  gh_app_api POST "/app/installations/$inst/access_tokens" \
-    "$(jq -nc '{repositories: $ARGS.positional}' --args "${@#*/}")"
-}
-
-# mint_owner DIR OWNER REPO...: one token for the REPOs (owner/repo, all
-# OWNER's) in DIR/gh-token.<owner>, with one request. Each repo's state goes
-# in RSTATE: ok; not-installed (the app isn't on that account: someone
-# else's repo, so no token is possible; not an error); no-access (it is,
-# but the installation doesn't include this repo); error (GitHub couldn't
-# be asked; a token already there is kept). When GitHub refuses the request
-# (it does, whole, if any repo is out of reach), each repo is asked about
-# alone, and the token is for the rest. Fails on errors only.
-mint_owner() {
-  local dir=$1 owner=$2 ol=${2,,} inst="" out="" tok r rc=0 ok=()
-  shift 2
-  if installations; then
-    inst=$(awk -v o="$ol" '$1 == o { print $2; exit }' <<<"$INSTALLS")
-    if [[ -z "$inst" ]]; then
-      set_state not-installed "$@"
-      rm -f "$dir/gh-token.$ol"
-      return 0
-    fi
-  else
-    # No list of installations: ask about the first repo.
-    if out=$(gh_app_api GET "/repos/$1/installation"); then inst=$(jq -r '.id // empty' <<<"$out"); fi
-  fi
-  if ! [[ "$inst" =~ ^[0-9]+$ ]]; then
-    warn "$owner: couldn't find the GitHub App's installation ($(gh_msg "$out")); keeping the token there was"
-    set_state error "$@"
-    return 1
-  fi
-  if (( $# > 500 )); then
-    warn "$owner: more than 500 repos listed; only the first 500 get a token"
-    set_state error "${@:501}"
-    set -- "${@:1:500}"
-    rc=1
-  fi
-  if out=$(mint_request "$inst" "$@"); then
-    ok=("$@")
-  elif gh_unreachable "$out"; then
-    warn "$owner: couldn't get a token ($(gh_msg "$out")); keeping the one there was"
-    set_state error "$@"
-    return 1
-  else
-    for r in "$@"; do
-      if out=$(gh_app_api GET "/repos/$r/installation") && [[ "$(jq -r '.id // empty' <<<"$out")" == "$inst" ]]; then
-        ok+=("$r")
-      elif gh_unreachable "$out"; then
-        set_state error "$r"
-        rc=1
-      else
-        set_state no-access "$r"
-        warn "$r: the boxen GitHub App can't access it ($(gh_msg "$out")). Add it to the app's installation: $(app_install_url)"
-      fi
-    done
-    if (( ${#ok[@]} )) && ! out=$(mint_request "$inst" "${ok[@]}"); then
-      warn "$owner: couldn't get a token ($(gh_msg "$out"))"
-      set_state error "${ok[@]}"
-      return 1
-    fi
-  fi
-  if (( ${#ok[@]} == 0 )); then
-    (( rc )) || rm -f "$dir/gh-token.$ol"
-    return "$rc"
-  fi
-  tok=$(jq -r '.token // empty' <<<"$out")
-  if [[ -z "$tok" ]]; then
-    warn "$owner: GitHub's reply had no token"
-    set_state error "${ok[@]}"
-    return 1
-  fi
-  write_token "$dir" "gh-token.$ol" "$tok"
-  OWNER_EXP[$ol]=$(jq -r '.expires_at // empty' <<<"$out")
-  set_state ok "${ok[@]}"
-  return "$rc"
-}
-
-# mint_project NAME: a token per owner in the project's list (mint_owner),
-# the default gh-token (the first listed repo's owner's, or if that has
-# none, the next one's that has), no token file for an owner no longer
-# listed, and state.json: each listed repo's state. Fails when minting
-# failed for some owner.
-mint_project() {
-  local n=$1 dir r ol def="" f rc=0 args=()
-  local -a repos=() owners=()
-  local -A by=()
-  dir=$(token_dir "$n")
-  mkdir_private "$dir"
-  RSTATE=() OWNER_EXP=()
-  mapfile -t repos < <(listed_repos "$n")
-  for r in "${repos[@]}"; do
-    ol=${r%%/*}
-    ol=${ol,,}
-    if [[ -z "${by[$ol]+x}" ]]; then owners+=("$ol"); by[$ol]=""; fi
-    by[$ol]+="$r "
-  done
-  for ol in "${owners[@]}"; do
-    # shellcheck disable=SC2086  # owner/repo never has a space
-    mint_owner "$dir" "$ol" ${by[$ol]} || rc=1
-  done
-  for r in "${repos[@]}"; do
-    ol=${r%%/*}
-    ol=${ol,,}
-    if [[ -s "$dir/gh-token.$ol" ]]; then def=$ol; break; fi
-  done
-  if [[ -n "$def" ]]; then
-    write_token "$dir" gh-token "$(cat "$dir/gh-token.$def")"
-  else
-    rm -f "$dir/gh-token"
-  fi
-  for f in "$dir"/gh-token.*; do
-    [[ -e "$f" ]] || continue
-    ol=${f##*/gh-token.}
-    [[ -n "${by[$ol]+x}" ]] || rm -f "$f"
-  done
-  for r in "${repos[@]}"; do args+=("${r,,}" "${RSTATE[${r,,}]:-error}"); done
-  (umask 077
-   jq -n '$ARGS.positional as $a | [range(0; $a | length; 2) | {key: $a[.], value: $a[. + 1]}] | from_entries' \
-     --args "${args[@]}" > "$dir/.state.json.tmp") && mv -f "$dir/.state.json.tmp" "$dir/state.json"
-  return "$rc"
-}
-
-# repo_state_text STATE: what a repo's state means, in a few words.
-repo_state_text() {
-  case $1 in
-    ok)            echo "ok" ;;
-    not-installed) echo "not your repo" ;;
-    no-access)     echo "no access" ;;
-    error)         echo "no token right now" ;;
-    *)             if app_configured; then echo "not checked yet"; else echo "run boxen github"; fi ;;
-  esac
-}
-
-# Refresh one project's tokens (mint_project), first giving it a repo list
-# if it has none (seed_repos). A no-op when GitHub isn't set up, and for the
-# supervisor, which has no token. Quiet except for failures, unless `boxen
-# tokens` asked for the per-project report (TOKENS_VERBOSE).
-refresh_project() {
-  local n=$1 r ol rc=0 msg repos=()
-  [[ "$n" != supervisor ]] || return 0
-  seed_repos "$n"
-  app_configured || return 0
-  mint_project "$n" || rc=1
-  [[ -n "${TOKENS_VERBOSE:-}" ]] || return "$rc"
-  mapfile -t repos < <(listed_repos "$n")
-  if (( ${#repos[@]} == 0 )); then
-    printf '  %-24s no GitHub repos listed; no token (boxen repos %s add owner/repo)\n' "$n" "$n"
-  fi
-  for r in "${repos[@]}"; do
-    ol=${r%%/*}
-    case ${RSTATE[${r,,}]:-error} in
-      ok)            msg="token valid until ${OWNER_EXP[${ol,,}]:-?}" ;;
-      not-installed) msg="not your repo: pulls work (public), no token to push" ;;
-      no-access)     msg="no access: add it to the app's installation" ;;
-      *)             msg="no token right now (see above)" ;;
-    esac
-    printf '  %-24s %-36s %s\n' "$n" "$r" "$msg"
-  done
-  return "$rc"
-}
-
-# Hidden command: cron runs `tokens --quiet`; `boxen github` runs it to mint
-# tokens for existing projects.
-cmd_tokens() {
-  local n rc=0 list=()
-  if [[ "${1:-}" == --quiet ]]; then
-    # From cron: output goes to tokens.log, so stay silent unless something fails.
-    QUIET=1
-    shift
-    if [[ -f "$TOKENS_LOG" ]] && (( $(stat -c %s "$TOKENS_LOG") > 1000000 )); then
-      : > "$TOKENS_LOG"
-    fi
-  else
-    TOKENS_VERBOSE=1
-  fi
-  if ! app_configured; then
-    [[ -n "${QUIET:-}" ]] || warn "GitHub isn't set up yet; run 'boxen github'"
-    return 0
-  fi
-  if [[ "${1:-}" == all ]]; then shift; fi
-  if (( $# )); then
-    for n in "$@"; do require_project "$n"; list+=("$n"); done
-  else
-    mapfile -t list < <(projects)
-  fi
-  for n in "${list[@]}"; do
-    refresh_project "$n" || rc=1
-  done
-  return "$rc"
-}
-
-install_cron() {
-  if ! command -v crontab >/dev/null; then
-    warn "cron isn't installed, so tokens won't refresh on their own. Install it (sudo apt install cron) and re-run 'boxen github'."
-    return 1
-  fi
-  local tag="# boxen-tokens" job current
-  job="BOXEN_HOME=\"$BOXEN_HOME\" BOXEN_SRC=\"$SRC_ROOT\" \"$BOXEN_REPO/bin/boxen\" tokens --quiet >>\"$TOKENS_LOG\" 2>&1"
-  # Read your existing crontab in full first, then rewrite it with our lines
-  # replaced (everything else kept as is).
-  current=$(crontab -l 2>/dev/null || true)
-  {
-    if [[ -n "$current" ]]; then grep -vF "$tag" <<<"$current" || true; fi
-    printf '*/30 * * * * %s %s\n' "$job" "$tag"
-    printf '@reboot sleep 30 && %s %s\n' "$job" "$tag"
-  } | crontab -
-  info "cron refreshes tokens every 30 minutes and at boot (problems go to $TOKENS_LOG)"
-}
-
-env_get() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -1; }
-
-# set_env KEY VALUE in boxen.env: replace an existing (or commented-out) line,
-# else append.
-set_env() {
-  if grep -qE "^#?$1=" "$ENV_FILE"; then
-    sed -i -E "s|^#?$1=.*|$1=$(sed_esc "$2")|" "$ENV_FILE"
-  else
-    printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE"
-  fi
-}
-
-# read_key DEST [FILE]: copy a PEM private key from FILE, or read one pasted
-# into the terminal. A pasted key isn't echoed (it would sit in your scrollback);
-# a * appears for each line received instead.
-read_key() {
-  local dest=$1 src=${2:-} line n=0 started=0 tty=0
-  (umask 077; : > "$dest")
-  if [[ -n "$src" ]]; then
-    src=${src/#\~/$HOME}
-    [[ -f $src ]] || { rm -f "$dest"; die "no such file: $src"; }
-    cat "$src" > "$dest"
-  else
-    if [[ -t 0 ]]; then
-      tty=1
-      stty -echo
-      trap 'stty echo 2>/dev/null' EXIT
-    fi
-    while IFS= read -r line; do
-      # Ignore anything before the BEGIN line (stray whitespace, etc).
-      if (( ! started )); then
-        [[ $line == -----BEGIN* ]] || continue
-        started=1
-      fi
-      printf '%s\n' "$line" >> "$dest"
-      n=$((n + 1))
-      printf '*' >&2
-      [[ $line == -----END* ]] && break
-    done
-    if (( tty )); then stty echo; trap - EXIT; fi
-    printf '\n' >&2
-    (( n )) || { rm -f "$dest"; die "no key received"; }
-    info "received $n lines"
-  fi
-  openssl pkey -in "$dest" -noout 2>/dev/null || { rm -f "$dest"; die "that isn't a valid private key"; }
-}
-
-cmd_github() {
-  need_tty github
-  local c
-  for c in openssl curl jq git; do
-    command -v "$c" >/dev/null || die "$c is required (sudo apt install $c)"
-  done
-  [[ -f "$ENV_FILE" ]] || die "run $BOXEN_REPO/install.sh first"
-
-  local keyfile=""
-  while (( $# )); do
-    case $1 in
-      --reset) rm -f "$GH_KEY" "$GH_CONF"; info "forgot the GitHub App; setting it up again" ;;
-      --key)   keyfile=${2:-}; [[ -n "$keyfile" ]] || die "--key needs a path to the .pem file"; shift ;;
-      *)       die "usage: boxen github [--reset] [--key file.pem]" ;;
-    esac
-    shift
-  done
-  mkdir_private "$GH_DIR"
-
-  # Who you are on GitHub: from the VM's gh login if there is one.
-  local uid="" login="" name="" user
-  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    login=$(gh api user --jq .login)
-  else
-    read -rp "Your GitHub username: " login
-  fi
-  [[ -n "$login" ]] || die "need your GitHub username"
-  user=$(curl -fsS "$GH_API/users/$login") || die "couldn't look up GitHub user '$login'"
-  uid=$(jq -r .id <<<"$user")
-  name=$(jq -r '.name // empty' <<<"$user")
-
-  if ! app_configured; then
-    local cid url
-    url="https://github.com/settings/apps/new?name=boxen-$login"
-    url+="&description=Short-lived%20per-repo%20tokens%20for%20boxen%20containers"
-    url+="&url=https://github.com/$login&public=false&webhook_active=false"
-    url+="&contents=write&pull_requests=write&issues=write"
-    url+="&actions=read&checks=read&statuses=read&metadata=read"
-    cat <<EOF
-
-Step 1 of 2: create your private GitHub App. Open this link, signed in to
-GitHub as $login. It pre-fills the name and permissions:
-
-  $url
-
-Click "Create GitHub App" at the bottom. On the page that follows:
-  - copy the Client ID (near the top)
-  - under "Private keys", click "Generate a private key" (a .pem file downloads)
-
-EOF
-    read -rp "Client ID: " cid
-    cid=${cid//[[:space:]]/}
-    [[ -n "$cid" ]] || die "need the Client ID"
-    if [[ -n "$keyfile" ]]; then
-      read_key "$GH_KEY.tmp" "$keyfile"
-    else
-      echo "Now paste the private key: open the downloaded .pem file, copy all of it"
-      echo "(BEGIN through END line), and paste here. It won't be shown; you'll see"
-      echo "a * per line. (Or re-run with --key /path/to/file.pem if it's on this VM.)"
-      read_key "$GH_KEY.tmp"
-    fi
-    mv -f "$GH_KEY.tmp" "$GH_KEY"
-    set_app_conf CLIENT_ID "$cid"
-  fi
-
-  local app slug
-  app=$(gh_app_api GET /app) || \
-    die "GitHub rejected the app's credentials ($(gh_msg "$app")). Check the Client ID and key, then run 'boxen github --reset'."
-  slug=$(jq -r .slug <<<"$app")
-  set_app_conf APP_SLUG "$slug"
-  info "GitHub App: $slug"
-
-  local installs
-  installs=$(gh_app_api GET /app/installations | jq length) || die "couldn't list the app's installations"
-  if [[ "$installs" == 0 ]]; then
-    cat <<EOF
-
-Step 2 of 2: install the app on your account:
-
-  $(app_install_url)
-
-Choose "All repositories" so repos you create later are covered too, or pick
-specific ones (then add new repos to it as you go).
-
-EOF
-    read -rp "Press Enter once it's installed... " _
-    installs=$(gh_app_api GET /app/installations | jq length) || die "couldn't list the app's installations"
-    [[ "$installs" != 0 ]] || die "the app isn't installed yet; install it, then re-run 'boxen github'"
-  fi
-  info "app is installed"
-
-  # Commit identity for containers: your GitHub no-reply address keeps your
-  # real email out of commits. Leave it alone if you've already set one.
-  local email="${uid}+${login}@users.noreply.github.com" ident_set=0
-  name=${name:-$login}
-  if [[ -z "$(env_get GIT_AUTHOR_EMAIL)" ]]; then
-    set_env GIT_AUTHOR_NAME "$name"
-    set_env GIT_COMMITTER_NAME "$name"
-    set_env GIT_AUTHOR_EMAIL "$email"
-    set_env GIT_COMMITTER_EMAIL "$email"
-    ident_set=1
-    info "commits from containers: $name <$email>"
-  else
-    info "keeping the git identity already in $ENV_FILE ($(env_get GIT_AUTHOR_EMAIL)); your no-reply address is $email"
-  fi
-
-  install_cron || true
-
-  info "minting tokens for existing projects"
-  cmd_tokens || true
-
-  # A new identity only reaches containers created after it; recreate the
-  # ones running now.
-  if (( ident_set )); then
-    local n running=()
-    while read -r n; do
-      if [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]]; then
-        running+=("$n")
-      fi
-    done < <(projects)
-    if (( ${#running[@]} )); then
-      for n in "${running[@]}"; do
-        render_services "$n" || continue
-        run_quiet "restarting $n" dc "$n" up -d --force-recreate || true
-      done
-      info "restarted ${#running[@]} running project(s) so they pick up the git identity"
-    fi
-  fi
-}
-
-# repos NAME [--suggest | add REPO... [--yes] | rm REPO...]: the GitHub repos
-# the project's tokens cover (see the GitHub section above).
-#   repos NAME            the list, each with its state, and the repos found in
-#                         the project folder that aren't listed
-#   repos NAME --suggest  just those found ones, one owner/repo per line
-#   repos NAME add|rm     change the list (owner/repo or https://github.com/...)
-#                         and mint the tokens again at once
-# In agent mode, `add` widens what a project can reach, so it's a question
-# for a person (approval_needed, kind repos) unless --yes; `rm` only
-# narrows it and needs none.
-cmd_repos() {
-  local usage="usage: boxen repos <name> [--suggest | add <owner/repo>... [--yes] | rm <owner/repo>...]"
-  require_project "${1:-}"
-  local n=$1
-  [[ "$n" != supervisor ]] || die "the supervisor has no GitHub token; repos are per project"
-  case ${2:-} in
-    "")        (( $# == 1 )) || die "$usage"; repos_show "$n" ;;
-    --suggest) (( $# == 2 )) || die "$usage"; unlisted_repos "$n" ;;
-    add|rm)    repos_change "$@" ;;
-    *)         die "$usage" ;;
-  esac
-}
-
-# repos_show NAME: the list with each repo's state (from the last token
-# refresh), the origin marked, then what's in the folder but not listed.
-repos_show() {
-  local n=$1 origin i r mark line repos=() states=() found=() bad=()
-  mapfile -t repos < <(listed_repos "$n")
-  mapfile -t states < <(repo_states "$n" "${repos[@]}")
-  mapfile -t bad < <(bad_repo_lines "$n")
-  origin=$(origin_repo "$n")
-  echo "$n: GitHub repos (its tokens cover only these):"
-  (( ${#repos[@]} )) || echo "    none (add one: boxen repos $n add owner/repo)"
-  for i in "${!repos[@]}"; do
-    r=${repos[i]}
-    mark=""
-    [[ "${r,,}" != "${origin,,}" ]] || mark="  (origin)"
-    printf '    %-40s %s%s\n' "$r" "$(repo_state_text "${states[i]:--}")" "$mark"
-  done
-  for line in "${bad[@]}"; do
-    printf '    ignored (not owner/repo): %s\n' "$line"
-  done
-  if [[ -n "$origin" && " ${repos[*],,} " != *" ${origin,,} "* ]]; then
-    echo "$n: origin $origin isn't listed: pushes to it won't work"
-  fi
-  mapfile -t found < <(unlisted_repos "$n")
-  if (( ${#found[@]} )); then
-    echo "Found in the project folder but not listed:"
-    printf '    %s\n' "${found[@]}"
-    echo "  to add: boxen repos $n add <owner/repo>"
-  fi
-}
-
-# repos_change NAME add|rm ARG... [--yes]
-repos_change() {
-  local n=$1 op=$2 yes=0 a r seen=" " listed want=() keep=() missing=() line
-  shift 2
-  for a in "$@"; do
-    case $a in
-      --yes|-y) yes=1 ;;
-      -*) die "unknown option '$a'" ;;
-      *)
-        r=$(repo_arg "$a") || die "'$a' isn't a GitHub repo (owner/repo or https://github.com/owner/repo)"
-        [[ "$seen" == *" ${r,,} "* ]] || { want+=("$r"); seen+="${r,,} "; } ;;
-    esac
-  done
-  (( ${#want[@]} )) || die "usage: boxen repos $n $op <owner/repo>..."
-  lock_project "$n"
-  seed_repos "$n"
-  listed=" $(listed_repos "$n" | tr '\n' ' ') "
-  listed=${listed,,}
-  if [[ "$op" == add ]]; then
-    for r in "${want[@]}"; do
-      [[ "$listed" == *" ${r,,} "* ]] || missing+=("$r")
-    done
-    if (( ${#missing[@]} == 0 )); then
-      echo "$n: already listed: ${want[*]}"
-      repos_show "$n"
-      return 0
-    fi
-    # GitHub mints a token for at most 500 repos.
-    local -A per=()
-    while IFS= read -r r; do
-      a=${r%%/*}
-      per[${a,,}]=$(( ${per[${a,,}]:-0} + 1 ))
-      (( per[${a,,}] <= 500 )) || die "$a: at most 500 repos per owner"
-    done < <(listed_repos "$n"; printf '%s\n' "${missing[@]}")
-    if agent_mode && (( ! yes )); then
-      r=$(printf '%s, ' "${want[@]}")
-      approval_needed repos "$n" "boxen repos $n add ${want[*]} --yes" \
-        <<<"Let $n push to: ${r%, }? Its token will cover these repos." || return $?
-    fi
-    { cat "$(repos_file "$n")"; printf '%s\n' "${missing[@]}"; } | write_repos "$n"
-    echo "$n: added ${missing[*]}"
-  else
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      r=${line%%#*}
-      r=${r//[[:space:]]/}
-      r=${r%.git}
-      if [[ -n "$r" && "$seen" == *" ${r,,} "* ]]; then continue; fi
-      keep+=("$line")
-    done < "$(repos_file "$n")"
-    for r in "${want[@]}"; do
-      [[ "$listed" == *" ${r,,} "* ]] || warn "$n: $r isn't listed"
-    done
-    printf '%s\n' "${keep[@]}" | write_repos "$n"
-    echo "$n: removed ${want[*]}"
-  fi
-  if app_configured; then
-    refresh_project "$n" || true
-  else
-    warn "GitHub isn't set up yet ('boxen github'): no tokens until it is"
-  fi
-  write_status "$n" >/dev/null || true
-  repos_show "$n"
-}
-
-# ------------------------------------------------------------ new project
-
-# Turn the server's terminal output into plain text: strip control sequences
-# (colors, cursor moves, clears, window titles) and stray control characters.
-# The server redraws its status box in place (cursor up, then repaint), which
-# in a log becomes the same lines over and over; after a redraw, lines already
-# shown in the previous or current paint are skipped, so you see changes only.
-# perl works on raw bytes, so this behaves the same in any locale (sed's
-# character ranges don't under en_US.UTF-8).
-plain_text() {
-  LC_ALL=C perl -ne '
-    BEGIN { $| = 1; our ($redraw, %prev, %cur) = (0) }
-    if (/\e\[[0-9]*A/) { $redraw = 1; %prev = %cur; %cur = () }
-    s/\e\[[0-9;?<>=!]*[ -\/]*[@-~]//g;      # CSI: colors, cursor, clears
-    s/\e\][^\a\e]*(?:\a|\e\\)//g;           # OSC: window titles, links
-    s/\e[()*+][0-9A-Za-z]//g;               # charset selection
-    s/\e[=>78DEHMNOZc]//g;                  # other short escapes
-    for my $l (split /\r|\n/) {
-      $l =~ tr/\000-\010\013-\037\177//d;
-      $l =~ s/\s+$//;
-      next unless $l =~ /\S/;
-      if ($redraw) { my $seen = $prev{$l} || $cur{$l}; $cur{$l} = 1; next if $seen }
-      print "$l\n";
-    }'
-}
-
-# server_state NAME: what the project's Remote Control server is doing, read
-# from its output since the container last started. A container can be
-# "running" while the server inside sits at a question nobody can answer, so
-# `boxen ls` and the wait after starting a project use this.
-#
-# The questions themselves ("Trust <dir>? [y/N] ", "Enable Remote Control?
-# (y/n) ") are readline prompts without a newline, and `docker logs` doesn't
-# deliver an unfinished line: a server waiting at the trust question shows
-# only the preamble before it ("Remote Control starts Claude Code sessions
-# in this folder…", "Quick safety check…", "Security guide: …"). So the
-# preamble counts as waiting unless something later (the session URL,
-# Connected, an error) shows the question was passed. The question lines
-# are matched too, for the case where someone typed an answer and the line
-# got completed. (The Remote Control question has no preamble in the binary;
-# on its own it can't be told from "starting".)
-server_state() {
-  local started
-  started=$(docker inspect -f '{{.State.StartedAt}}' "boxen-$1" 2>/dev/null) || { echo "not created"; return; }
-  server_state_since "$1" "$started"
-}
-
-# server_state_since NAME STARTED: server_state from the output since
-# STARTED (the container's StartedAt, known already).
-server_state_since() {
-  local n=$1 started=$2 st
-  st=$(docker logs --since "$started" --tail 300 "boxen-$n" 2>&1 | plain_text | perl -ne '
-    BEGIN { $s = "starting"; $q = 0 }
-    if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen up NAME"; $q = 0 }
-    elsif (/not logged in|please (log|sign) in|claude (auth )?login/i)
-                                                         { $s = "not signed in: run boxen login"; $q = 0 }
-    elsif (/Spawn mode for this project/)                { $s = "waiting for an answer: run boxen up NAME" }
-    elsif (/^Remote Control starts Claude Code sessions in this folder|^Quick safety check/)
-                                                         { $q = 1 }
-    elsif (/^Trust .*\? \[y\/N\]$|^Enable Remote Control\? \(y\/n\)$/)
-                                                         { $s = "waiting for an answer: run boxen up NAME" }
-    elsif (/claude\.ai\/code\?environment=/)              { $q = 0 }
-    elsif (/Reconnecting/)                               { $s = "reconnecting"; $q = 0 }
-    elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected"; $q = 0 }
-    elsif (/^Error:/)                                    { $q = 0 }
-    END   { $s = "waiting for an answer: run boxen up NAME" if $q && $s eq "starting"; print "$s\n" }' || true)
-  printf '%s\n' "${st//NAME/$n}"
-}
-
-# server_state_cached NAME ID STARTED: server_state for `ls`, which runs
-# every few seconds under boxen ui, so it mustn't read every server's log
-# each time. The last answer is kept in projects/NAME/.state-cache with the
-# container's id and StartedAt: while those are unchanged and the server
-# was connected (or reconnecting), that answer stands for up to 60 s; any
-# other state (starting, waiting at a question, not trusted…) is still
-# settling, so the log is read again every time.
-server_state_cached() {
-  local n=$1 id=$2 started=$3 f c_id c_started c_at c_state now st
-  f="$(proj_dir "$n")/.state-cache"
-  printf -v now '%(%s)T' -1
-  if [[ -f "$f" && ! -L "$f" ]] && IFS=' ' read -r c_id c_started c_at c_state < "$f" \
-     && [[ "$c_id" == "$id" && "$c_started" == "$started" && "$c_at" =~ ^[0-9]+$ ]] \
-     && [[ "$c_state" == connected || "$c_state" == reconnecting ]] && (( now - c_at < 60 )); then
-    printf '%s\n' "$c_state"
-    return
-  fi
-  st=$(server_state_since "$n" "$started")
-  # One small write; a reader that catches it half done just reads the log.
-  { printf '%s %s %s %s\n' "$id" "$started" "$now" "$st" > "$f"; } 2>/dev/null || true
-  printf '%s\n' "$st"
-}
-
-# Escape a value for use as a sed replacement (we use | as the delimiter).
+# Escape a value for use as a sed replacement (| is the delimiter).
 sed_esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 
+vm_tz() {
+  local tz
+  tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
+  [[ "$tz" =~ ^[A-Za-z0-9_+/-]+$ ]] || tz=UTC
+  printf '%s\n' "$tz"
+}
+
+# render TEMPLATE NAME: the template with the project's values filled in. A
+# placeholder this code doesn't know (a template newer than the running
+# script) is never written out.
 render() {
-  # $1 template, $2 name, $3 source dir. A placeholder this render doesn't
-  # know (a template newer than the running script) is never written out.
   local out left
   out=$(sed -e "s|__NAME__|$(sed_esc "$2")|g" \
-            -e "s|__USER__|$(sed_esc "$USER_NAME")|g" \
-            -e "s|__UID__|$USER_UID|g" \
-            -e "s|__GID__|$USER_GID|g" \
-            -e "s|__CHOME__|$(sed_esc "$CHOME")|g" \
-            -e "s|__BOXEN_HOME__|$(sed_esc "$BOXEN_HOME")|g" \
-            -e "s|__SRC__|$(sed_esc "$3")|g" "$1")
+            -e "s|__SRC__|$(sed_esc "$(src_dir "$2")")|g" \
+            -e "s|__TZ__|$(sed_esc "$(vm_tz)")|g" "$1")
   if left=$(grep -oE '__[A-Z_]+__' <<<"$out" | head -1) && [[ -n "$left" ]]; then
     die "template $1 has unfilled placeholder $left"
   fi
   printf '%s\n' "$out"
 }
 
-# fresh_compose NAME: a compose.yaml with placeholders left in it was
-# written by an older boxen from a newer template (a self-update renders
-# with the code that started it); re-render it with this code before
-# compose sees it. Called from dc, so any command heals it.
-fresh_compose() {
-  local pdir
-  pdir=$(proj_dir "$1")
-  [[ -f "$pdir/compose.yaml" ]] || return 0
-  grep -qE '__[A-Z_]+__' "$pdir/compose.yaml" || return 0
-  render "$(compose_template "$1")" "$1" "$SRC_ROOT/$1" > "$pdir/compose.yaml.new" || return 1
-  mv -f "$pdir/compose.yaml.new" "$pdir/compose.yaml"
-  chmod 0644 "$pdir/compose.yaml"
-  printf '%s: compose.yaml was stale; re-rendered\n' "$1" >&2
-}
-
-# attach_prompts NAME: the server is waiting at one of Claude's one-time
-# questions (trust this folder; enable Remote Control), which it can only
-# take from a terminal. Restart the container with this terminal attached
-# from its first line of output so you can answer; once the server prints
-# its session URL, boxen detaches on its own and the server keeps running.
-attach_prompts() {
-  local n=$1 c="boxen-$1" tmp watcher
-  docker stop "$c" >/dev/null 2>&1 || true
-  run_quiet "creating $n" dc "$n" up --no-start || return 1
-  tmp=$(mktemp -d)
-  cat <<EOF
-
-==> Starting '$n' with your terminal attached. Answer y to trust this folder and
-    (first time only) y to enable Remote Control; boxen detaches by itself once
-    the server is up. (If it doesn't: Ctrl+P then Ctrl+Q. Ctrl+C restarts the server.)
-
-EOF
-  # Watch the attached output for the session URL, then end the attachment
-  # (the docker client, not the container). Gives up after 10 minutes.
-  (
-    for fd in "${LOCK_FDS[@]}"; do exec {fd}>&-; done
-    for _ in $(seq 600); do
-      # The session URL (claude.ai/code?environment=...), not just any mention
-      # of claude.ai/code: the server's one-time questions mention it too.
-      if [[ -s "$tmp/pid" ]] && grep -q 'claude\.ai/code?environment=' "$tmp/out" 2>/dev/null; then
-        sleep 1    # let the rest of the banner arrive
-        kill -9 "$(cat "$tmp/pid")" 2>/dev/null || true
-        exit 0
-      fi
-      sleep 1
-    done
-  ) &
-  watcher=$!
-  # script(1) gives the attachment a terminal and copies its output to a file
-  # we can watch. The shell records its PID, then becomes the docker client.
-  nolocks script -qfec "echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" || true
-  kill "$watcher" 2>/dev/null || true
-  wait "$watcher" 2>/dev/null || true
-  stty sane 2>/dev/null || true
-  echo
-  rm -rf "$tmp"
-}
-
-# drive_prompts NAME: attach_prompts for agent mode, where nobody is at a
-# keyboard. The container is started attached under script(1) as above, but
-# its input is a pipe boxen writes to, and its output is watched for the
-# server's one-time questions:
-#   - the line "Enable Remote Control? (y/n)", exactly, is answered y:
-#     starting Remote Control servers is what boxen is for.
-#   - any other question ("Trust <folder>? [y/N]", preceded by what trusting
-#     means for this folder: hooks, MCP servers, settings it brings; or
-#     anything else ending in [y/N], [Y/n] or (y/n)) is answered y only with
-#     `--approve trust`. Otherwise its text is reported for a person to see,
-#     the container is stopped so it doesn't sit at the prompt, and this
-#     returns 3. The exact match matters: the preamble quotes text from the
-#     repo (server names, rules), which must not be able to look like the
-#     question boxen answers by itself.
-# The pty gets a size first: Claude refuses to ask ("did not report its
-# size") on a 0x0 terminal. Returns 0 once the session URL appears or the
-# container stops by itself; wait_server then reports the state as usual.
-# 3 after 180s without a URL or a known question (whatever is on screen is
-# shown).
-# The coprocess's variables vanish once it exits, so test for it this way.
-drv_alive() { [[ -n "${DRV_PID:-}" ]] && kill -0 "$DRV_PID" 2>/dev/null; }
-
-drive_prompts() {
-  local n=$1 c="boxen-$1" tmp seg last off=0 size i state="" answer rc=0
-  docker stop "$c" >/dev/null 2>&1 || true
-  run_quiet "creating $n" dc "$n" up --no-start || return 1
-  tmp=$(mktemp -d)
-  : > "$tmp/out"
-  # DRV[1] is the pty's input. script's own stdout is discarded: the file
-  # has everything. A write to a pty whose reader is gone must not end boxen.
-  trap '' PIPE
-  # (The coprocess closes the lock descriptors itself: it's a subshell that
-  # lives as long as the attachment, and must not keep the project locked.)
-  coproc DRV {
-    for fd in "${LOCK_FDS[@]}"; do exec {fd}>&-; done
-    exec script -qfec "stty rows 50 cols 200; stty size > '$tmp/size'; echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" >/dev/null 2>&1
-  }
-  for (( i = 0; i < 180; i++ )); do
-    sleep 1
-    if [[ ! -s "$tmp/size" ]]; then continue; fi
-    if [[ "$(cat "$tmp/size")" == "0 0" ]]; then state=nosize; break; fi
-    # Only what arrived since the last answer, so an answered question isn't
-    # seen again: exactly the bytes from off to size, as it stood before the
-    # read. script's own "Script started on ..." header isn't output.
-    size=$(stat -c %s "$tmp/out")
-    seg=$(tail -c +$((off + 1)) "$tmp/out" | head -c $((size - off)) | plain_text | grep -v '^Script \(started\|done\) on ' || true)
-    if grep -q 'claude\.ai/code?environment=' <<<"$seg"; then
-      state=connected
-      break
+# write_compose NAME: compose.yaml from the template, and the override
+# example. A compose.yaml you edited by hand (it differs from both the new
+# render and OLD, the render of the template it came from, when known) is
+# kept as compose.yaml.old.
+write_compose() {
+  local n=$1 old=${2:-} pdir new prev
+  pdir=$(proj_dir "$n")
+  mkdir -p "$pdir"
+  new=$(mktemp -p "$pdir" .compose.XXXXXX)
+  render "$BOXEN_REPO/templates/compose.yaml" "$n" > "$new"
+  if [[ -f "$pdir/compose.yaml" ]] && ! cmp -s "$pdir/compose.yaml" "$new"; then
+    prev=$(mktemp)
+    if [[ -n "$old" && -s "$old" ]]; then render "$old" "$n" > "$prev" 2>/dev/null || true; fi
+    if ! cmp -s "$pdir/compose.yaml" "$prev"; then
+      cp -f "$pdir/compose.yaml" "$pdir/compose.yaml.old"
+      echo "$n: compose.yaml had your edits; kept as compose.yaml.old (they belong in compose.override.yaml)"
     fi
-    last=$(tail -n 1 <<<"$seg")
-    answer=0
-    if [[ "$last" == "Enable Remote Control? (y/n)" ]]; then
-      answer=1
-    else
-      case $last in
-        *"(y/n)"|*"[y/N]"|*"[Y/n]") state=trust ;;
-      esac
-    fi
-    if [[ "$state" == trust ]] && (( APPROVE_TRUST )); then state="" answer=1; fi
-    [[ "$state" != trust ]] || break
-    if (( answer )); then
-      off=$size
-      if drv_alive && [[ -n "${DRV[1]:-}" ]]; then
-        printf 'y\n' >&"${DRV[1]}" || true
-      fi
-      continue
-    fi
-    # The container stopped (crashed, or exited) on its own.
-    drv_alive || { state=exited; break; }
-  done
-  if [[ "$state" == connected ]]; then sleep 1; fi    # the rest of the banner
-  # End the attachment (the docker client), not the container.
-  if [[ -s "$tmp/pid" ]]; then kill -9 "$(cat "$tmp/pid")" 2>/dev/null || true; fi
-  wait "${DRV_PID:-}" 2>/dev/null || true
-  trap - PIPE
-  [[ -s "$tmp/size" ]] || state=nosize
-  case $state in
-    trust)
-      # The question as the server put it, from the line that introduces
-      # what trusting means (or the first line, if that changed) to the question.
-      docker stop "$c" >/dev/null 2>&1 || true
-      if grep -q '^Remote Control starts' <<<"$seg"; then
-        seg=$(sed -n '/^Remote Control starts/,$p' <<<"$seg")
-      fi
-      approval_needed trust "$n" "boxen up $n --approve trust" <<<"$seg" || rc=$? ;;
-    nosize)
-      docker stop "$c" >/dev/null 2>&1 || true
-      warn "couldn't give $n's server a terminal with a size, so it can't ask its questions; run 'boxen up $n' from a terminal on the VM"
-      rc=1 ;;
-    "")
-      docker stop "$c" >/dev/null 2>&1 || true
-      printf 'boxen: %s is waiting at an unrecognized question:\n' "$n"
-      tail -n 10 <<<"$seg" | sed 's/^/    /'
-      printf 'boxen: answer it with '"'"'boxen up %s'"'"' from a terminal on the VM\n' "$n"
-      rc=3 ;;
-  esac
-  rm -rf "$tmp"
-  return "$rc"
+    rm -f "$prev"
+  fi
+  chmod 0644 "$new"
+  mv -f "$new" "$pdir/compose.yaml"
+  render "$BOXEN_REPO/templates/compose.override.example.yaml" "$n" > "$pdir/compose.override.example.yaml"
 }
 
-# poll_server NAME: server_state, checked every second for up to 20s until it
-# settles on something other than "starting". The restart count is baselined
-# the first time the container is seen running (each call starts over, so a
-# restart during attach_prompts, e.g. from Ctrl+C, isn't a crash loop); if it
-# then exits or restarts, "not running (...)" instead.
-poll_server() {
-  local n=$1 c="boxen-$1" st run0="" run i
-  for (( i = 0; i < 20; i++ )); do
-    run=$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$c" 2>/dev/null) || run="missing"
-    if [[ "$run" == true* ]]; then
-      [[ -n "$run0" ]] || run0=$run
-      if [[ "$run" != "$run0" ]]; then
-        echo "not running (running/restarts: $run)"
-        return
-      fi
-      st=$(server_state "$n")
-      [[ "$st" == starting ]] || { echo "$st"; return; }
-    elif [[ -n "$run0" ]] || (( i >= 3 )); then
-      # Stopped after running, or never came up within a few seconds.
-      echo "not running (running/restarts: $run)"
-      return
-    fi
-    sleep 1
-  done
-  echo starting
-}
-
-# wait_server NAME [PREFIX]: after a start, wait for the project's Remote
-# Control server to connect and print one line about it ("NAME: PREFIXconnected").
-# A server stuck at a one-time question gets answered through attach_prompts
-# when there's a terminal, or drive_prompts in agent mode. Returns 1 when
-# the project still needs you (3 when it needs an approval).
-wait_server() {
-  local n=$1 pre=${2:-} st
-  st=$(poll_server "$n")
-  case $st in
-    "not trusted"*|"waiting for an answer"*)
-      if agent_mode && [[ "$n" == supervisor ]]; then
-        # drive_prompts stops the container to report the question, and
-        # nothing in the app could start the supervisor again.
-        echo "supervisor: needs an answer at a question; run 'boxen up supervisor' from a terminal on the VM"
-        return 3
-      elif agent_mode; then
-        drive_prompts "$n" || return $?
-        st=$(poll_server "$n")
-      elif [[ -t 0 ]]; then
-        attach_prompts "$n" || return 1
-        st=$(poll_server "$n")
-      else
-        echo "$n: ${pre}waiting for an answer — run 'boxen up $n' from a terminal"
-        return 1
-      fi ;;
-  esac
-  case $st in
-    connected|reconnecting)
-      echo "$n: $pre$st" ;;
-    starting)
-      echo "$n: ${pre}still starting (check 'boxen ls' in a moment)" ;;
-    "not signed in"*)
-      echo "$n: ${pre}not signed in — run 'boxen login'"
-      return 1 ;;
-    "not running"*)
-      warn "$n isn't staying up ${st#not running }. Last log lines:"
-      dc "$n" logs --no-log-prefix --tail=30 claude 2>&1 | plain_text >&2 || true
-      warn "fix the cause, then 'boxen up $n'. If it's a sign-in problem: 'boxen login'."
-      return 1 ;;
-    *)
-      echo "$n: $pre$st"
-      return 1 ;;
-  esac
-}
-
-# start_project NAME [compose up args]: render the sidecars (a rejected
-# services.yaml stops here, exit 2), refresh the GitHub token, bring the
-# container up (output hidden unless it fails), then wait_server.
-start_project() {
-  local n=$1 sc
-  shift
-  fresh_compose "$n" || return 1
-  render_services "$n" || return $?
-  refresh_project "$n" || true
-  write_status "$n" || return $?
-  # --remove-orphans: a sidecar dropped from services.yaml is stopped.
-  run_quiet "starting $n" dc "$n" up -d --remove-orphans "$@" || return 1
-  sc=$(sidecar_names "$n")
-  [[ -z "$sc" ]] || echo "$n: sidecars: $sc"
-  wait_server "$n"
-}
-
-# write_override_example NAME: a commented compose.override.example.yaml in
-# the project dir, unless the project already has its own override.
-write_override_example() {
-  local pdir
-  pdir=$(proj_dir "$1")
-  [[ -e "$pdir/compose.override.yaml" ]] && return 0
-  render "$BOXEN_REPO/templates/compose.override.example.yaml" "$1" "$SRC_ROOT/$1" \
-    > "$pdir/compose.override.example.yaml"
-}
-
-# ------------------------------------------------- project environment
-#
-# A project's own environment lives in <pdir>/env: Dockerfile (its image),
-# services.yaml (sidecars) and STATUS.md (facts boxen writes at each start,
-# see write_status). The container sees that folder at /boxen,
-# read-write, so the project's Claude can change its environment itself and
-# apply it through its own agent socket (`boxen update` / `boxen restart`
-# from inside; see boxen-agentd). The Dockerfile builds whatever it likes
-# into the image (no sudo at run time, same as before); services.yaml is
-# checked by bin/boxen-services before anything starts, so a sidecar can't
-# reach the VM (no host paths, ports, privileges). The supervisor has an
-# env/Dockerfile too, but no services.yaml and no /boxen mount.
-
-env_dir() { printf '%s/env' "$(proj_dir "$1")"; }
-
-# env_path NAME FILE: the path of env/FILE, after checking that neither
-# env/ nor the file is a symlink (or anything but a plain file) and that it
-# resolves inside env/. The container can write env/ as it likes, so a
-# link planted there must never make boxen read or write a VM file. Every
-# read of an env file goes through this; writes then go to a temp file in
-# the project dir and are moved onto the target (mv replaces a link rather
-# than following it). Prints the refusal and returns 1.
+# env_path NAME FILE: the path of .boxen/FILE, after checking that neither
+# .boxen nor the file is a symlink or anything but a plain file. The agent
+# writes .boxen/, so a link there must never make boxen read a file outside
+# it. Prints the refusal and returns 1.
 env_path() {
   local n=$1 f=$2 d p
-  d=$(env_dir "$n")
+  d=$(bdir "$n")
   p="$d/$f"
   if [[ -L "$d" ]] || { [[ -e "$d" && ! -d "$d" ]]; }; then
-    printf 'boxen: %s: env is a symlink; refusing\n' "$n" >&2
+    printf 'boxen: %s: .boxen is a symlink or not a folder; refusing\n' "$n" >&2
     return 1
   fi
-  if [[ -L "$p" ]] || { [[ -e "$p" && ! -f "$p" ]]; } \
-     || [[ "$(realpath -m "$p")" != "$(realpath -m "$d")/$f" ]]; then
-    printf 'boxen: %s: env/%s is a symlink; refusing\n' "$n" "$f" >&2
+  if [[ -L "$p" ]] || { [[ -e "$p" && ! -f "$p" ]]; }; then
+    printf 'boxen: %s: .boxen/%s is a symlink or not a plain file; refusing\n' "$n" "$f" >&2
     return 1
   fi
   printf '%s\n' "$p"
 }
 
-# env_read NAME FILE: the contents of env/FILE on stdout. The path check
-# (env_path) can be raced by the container swapping the file for a link
-# between the check and the read, so the file is opened first and the open
-# descriptor is checked: what it really points at (readlink of the fd) must
-# be the regular file <project dir>/env/FILE, resolved from the project dir
-# (boxen's, not the container's). The contents come from that descriptor,
-# never from the path again. Returns 1 when the file doesn't exist, 2 when
-# it's refused (message printed).
+# env_read NAME FILE: the contents of .boxen/FILE, read through a descriptor
+# that's checked to be that very file (a swap for a link after env_path's
+# check is caught). 1: no such file; 2: refused.
 env_read() {
   local n=$1 f=$2 p fd real want
-  p="$(env_dir "$n")/$f"
-  env_path "$n" "$f" >/dev/null || return 2
+  p=$(env_path "$n" "$f") || return 2
   [[ -e "$p" ]] || return 1
-  # (the redirection on the group is temporary; the one in exec stays)
   { exec {fd}<"$p"; } 2>/dev/null || return 1
   real=$(readlink "/proc/$BASHPID/fd/$fd" 2>/dev/null || true)
-  want="$(realpath -m "$(proj_dir "$n")")/env/$f"
+  want="$(realpath -m "$(bdir "$n")")/$f"
   if [[ ! -f "/proc/$BASHPID/fd/$fd" || "$real" != "$want" ]]; then
     exec {fd}<&-
-    printf 'boxen: %s: env/%s is a symlink; refusing\n' "$n" "$f" >&2
+    printf 'boxen: %s: .boxen/%s is a symlink; refusing\n' "$n" "$f" >&2
     return 2
   fi
   cat <&"$fd"
   exec {fd}<&-
 }
 
-# write_env NAME FILE < content: replace env/FILE through a temp file in
-# the project dir (see env_path). mv -T replaces a link planted meanwhile
-# rather than following it, and fails on a directory.
-write_env() {
-  local n=$1 f=$2 p tmp
-  p=$(env_path "$n" "$f") || return 1
-  tmp=$(mktemp -p "$(proj_dir "$n")") || return 1
-  cat > "$tmp"
-  chmod 0644 "$tmp"
-  mv -fT "$tmp" "$p" || { rm -f "$tmp"; return 1; }
+# env_files NAME: .boxen/ with a Dockerfile and services.yaml, from the
+# templates where they're missing (an existing file is never touched).
+env_files() {
+  local n=$1 f p tmp
+  env_path "$n" Dockerfile >/dev/null || return 1
+  mkdir -p "$(bdir "$n")"
+  for f in Dockerfile services.yaml; do
+    p=$(env_path "$n" "$f") || return 1
+    [[ ! -e "$p" ]] || continue
+    tmp=$(mktemp -p "$(bdir "$n")" ".$f.XXXXXX")
+    render "$BOXEN_REPO/templates/$f" "$n" > "$tmp"
+    chmod 0644 "$tmp"
+    mv -n "$tmp" "$p"
+    rm -f "$tmp"
+  done
 }
 
-write_services_template() {
-  local p
-  [[ "$1" != supervisor ]] || return 0
-  p=$(env_path "$1" services.yaml) || return 1
-  [[ ! -e "$p" ]] || return 0
-  render "$BOXEN_REPO/templates/services.yaml" "$1" "$SRC_ROOT/$1" | write_env "$1" services.yaml
-}
-
-# migrate_env NAME: a project from before env/ had its Dockerfile in the
-# project dir; move it, add services.yaml, and make sure the agent socket's
-# folder exists (the container mounts it, so it must be there before `up`).
-migrate_env() {
-  local n=$1 pdir p
-  pdir=$(proj_dir "$n")
-  if [[ -L "$pdir/env" ]]; then
-    printf 'boxen: %s: env is a symlink; refusing\n' "$n" >&2
-    return 1
-  fi
-  if [[ -f "$pdir/Dockerfile" && ! -L "$pdir/Dockerfile" && ! -e "$pdir/env" ]]; then
-    mkdir "$pdir/env"
-    p=$(env_path "$n" Dockerfile) || return 1
-    mv "$pdir/Dockerfile" "$p"
-    echo "$n: moved Dockerfile to env/Dockerfile (the container sees it as /boxen/Dockerfile)"
-  fi
-  mkdir -p "$pdir/env"
-  write_services_template "$n" || return 1
-  [[ "$n" == supervisor ]] || mkdir_private "$pdir/agent"
-}
-
-# services_declared < content: true when services.yaml says anything
-# beyond comments and bare `services:` / `volumes:` headings. The template
-# is all comments, and `docker compose config` refuses an empty file, so
-# this is checked first; a file with content goes through compose and the
-# validator.
+# services_declared < content: services.yaml says anything beyond comments
+# and bare `services:` / `volumes:` headings.
 services_declared() {
   grep -vE '^[[:space:]]*(#|$)' | grep -qvE '^(services|volumes):[[:space:]]*(\{\}[[:space:]]*)?$'
 }
 
-# The compose plugin's binary: run on its own (it's a standalone program
-# too) inside a throwaway container, so parsing a project's services.yaml
-# can't read anything else on the VM. Where the docker CLI says it is,
-# else the usual places.
+# The compose plugin's binary, run on its own (it's a standalone program
+# too) in a throwaway container, so parsing services.yaml can't read any
+# other file on the VM.
 compose_plugin() {
   local p
   p=$(docker info --format '{{range .ClientInfo.Plugins}}{{if eq .Name "compose"}}{{.Path}}{{end}}{{end}}' 2>/dev/null || true)
@@ -1718,21 +415,15 @@ compose_plugin() {
   return 1
 }
 
-# render_services NAME: env/services.yaml -> compose.services.yaml, the
-# sidecars compose will run next to the project (dc adds the file when it
-# exists). Run before every `up`. The file is normalized by `docker compose
-# config` (in a container with no network that sees only a copy of the
-# file: `include:` and `extends:` can't pull in other files) and checked
-# by boxen-services, which rewrites volumes to this project's own and
-# refuses anything that could reach the VM. On a problem the errors are
-# printed and this returns 2; the container is left as it is. No services:
-# the rendered file is removed. The supervisor has none.
+# render_services NAME: .boxen/services.yaml -> compose.services.yaml (dc
+# adds it when it exists). The file is normalized by `docker compose
+# config` in a container with no network that sees only a copy of it
+# (`include:` and `extends:` can't pull in other files), then checked by
+# boxen-services, which renames volumes to this project's and refuses
+# anything that could reach the VM. Problems are printed, rc 2.
 render_services() {
   local n=$1 pdir sf json out err rc=0 tmpd plugin
-  [[ "$n" != supervisor ]] || return 0
   pdir=$(proj_dir "$n")
-  # Read once, through the checked descriptor; that copy is what compose
-  # sees and what the emptiness check looks at.
   tmpd=$(mktemp -d)
   sf="$tmpd/services.yaml"
   env_read "$n" services.yaml > "$sf" || rc=$?
@@ -1745,7 +436,7 @@ render_services() {
   rc=0
   plugin=$(compose_plugin) || { rm -rf "$tmpd"; return 1; }
   json=$(mktemp); out=$(mktemp); err=$(mktemp)
-  if ! run_base --network none -v "$tmpd:/w:ro" -w /w -v "$plugin:/compose:ro" "$BASE_IMAGE" \
+  if ! docker run --rm --network none -v "$tmpd:/w:ro" -w /w -v "$plugin:/compose:ro" "$ENV_IMAGE" \
          /compose -f services.yaml config --format json --no-interpolate >"$json" 2>"$err"; then
     sed 's/^/services.yaml: /' "$err" >&2
     rc=2
@@ -1754,339 +445,653 @@ render_services() {
     rc=2
   fi
   if (( rc )); then
-    printf 'boxen: %s: services.yaml rejected; nothing restarted\n' "$n" >&2
+    printf 'boxen: %s: services.yaml rejected; nothing changed\n' "$n" >&2
   elif [[ "$(jq -r '.services | length' "$out")" == 0 ]]; then
     rm -f "$pdir/compose.services.yaml"
   else
+    chmod 0644 "$out"
     mv -f "$out" "$pdir/compose.services.yaml"
-    chmod 0644 "$pdir/compose.services.yaml"
   fi
   rm -rf "$json" "$out" "$err" "$tmpd"
   return "$rc"
 }
 
-# check_image_user NAME: after a build, warn when the image's last USER
-# isn't you (a `USER root` in env/Dockerfile without the switch back). The
-# container runs as your uid regardless: compose.yaml pins `user`.
-check_image_user() {
-  local n=$1 u
-  u=$(docker image inspect -f '{{.Config.User}}' "boxen-proj-$n:latest" 2>/dev/null || true)
-  case $u in
-    "$USER_NAME"|"$USER_UID"|"$USER_UID:$USER_GID"|"$USER_NAME:$USER_GID") ;;
-    *) warn "$n: the image ends as user '${u:-root}' (env/Dockerfile doesn't switch back with USER $USER_NAME); the container still runs as $USER_NAME, but builds on top of it will run as '${u:-root}'" ;;
-  esac
-}
-
-# sidecar_names NAME: the sidecars in the last rendered compose.services.yaml.
 sidecar_names() {
   local f
   f="$(proj_dir "$1")/compose.services.yaml"
   [[ -f "$f" ]] || return 0
-  jq -r '.services | keys | join(", ")' "$f" 2>/dev/null || true
+  jq -r '.services | keys[]' "$f" 2>/dev/null || true
 }
 
-# write_status NAME: env/STATUS.md, the project's live facts for the Claude
-# inside it (/boxen/STATUS.md): code path, the GitHub repos it can push to
-# (its list, each with its state from the last token refresh), whether its
-# origin is one of them, repos in its folder that aren't, sidecars,
-# timezone, boxen version. Rewritten at every start and `boxen repos` change.
-write_status() {
-  local n=$1 pdir ver tz origin r i mark found=() repos=() states=()
-  pdir=$(proj_dir "$n")
-  [[ -d "$pdir/env" || -L "$pdir/env" ]] || mkdir "$pdir/env"
-  env_path "$n" STATUS.md >/dev/null || return 2
-  ver=$(git -C "$BOXEN_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
-  if [[ "$n" == supervisor ]]; then
-    {
-      echo "# supervisor"
-      echo
-      echo "This is the boxen supervisor project: it runs boxen for the user from the app (see CLAUDE.md)."
-      echo "boxen version: $ver"
-      echo
-      echo "generated $(date -Is) by boxen; do not edit"
-    } | write_env "$n" STATUS.md
-    return
+# start_env NAME [--build]: check .boxen/, render the sidecars, (with
+# --build) build the image, and bring the build container and sidecars up;
+# compose recreates whatever changed. Every problem is printed before
+# anything is replaced. Call with the project's lock held.
+start_env() {
+  local n=$1 f sc
+  for f in Dockerfile services.yaml; do env_path "$n" "$f" >/dev/null || return 2; done
+  [[ -f "$(bdir "$n")/Dockerfile" ]] || { printf 'boxen: %s: .boxen/Dockerfile is missing\n' "$n" >&2; return 2; }
+  render_services "$n" || return $?
+  if [[ "${2:-}" == --build ]] || ! docker image inspect "boxen-env-$n:latest" >/dev/null 2>&1; then
+    run_quiet "building $n's build container (.boxen/Dockerfile)" dc "$n" build || return 1
   fi
-  mapfile -t repos < <(listed_repos "$n")
-  mapfile -t states < <(repo_states "$n" "${repos[@]}")
-  origin=$(origin_repo "$n")
-  mapfile -t found < <(unlisted_repos "$n")
-  tz=$(env_get TZ)
-  {
-    echo "# $n"
-    echo
-    echo "- Project: $n"
-    echo "- Code: $SRC_ROOT/$n (same path on the VM)"
-    echo "- GitHub repos (this project can push to):"
-    if (( ${#repos[@]} == 0 )); then
-      echo "    none: ask the user to add one (on the VM: boxen repos $n add owner/repo)"
-    fi
-    for i in "${!repos[@]}"; do
-      r=${repos[i]}
-      mark=""
-      [[ "${r,,}" != "${origin,,}" ]] || mark=" (origin)"
-      case ${states[i]:--} in
-        ok)            echo "    - $r — ok: the token covers it$mark" ;;
-        not-installed) echo "    - $r — not your repo: the GitHub App isn't on that account, so no token; pulls work if it's public$mark" ;;
-        no-access)     echo "    - $r — no access: the GitHub App isn't installed on this repo; the user adds it to the app's installation$mark" ;;
-        error)         echo "    - $r — no token right now (see 'boxen ls' on the VM); push may fail$mark" ;;
-        *)             if app_configured; then echo "    - $r — not checked yet$mark"
-                       else echo "    - $r — GitHub isn't connected on the VM yet ('boxen github'); push needs that$mark"; fi ;;
-      esac
-    done
-    if [[ -n "$origin" && " ${repos[*],,} " != *" ${origin,,} "* ]]; then
-      echo "- origin $origin is not in this project's list: pushes to it won't work; ask the user to add it"
-    fi
-    if (( ${#found[@]} )); then
-      r=$(printf '%s, ' "${found[@]:0:5}")
-      r=${r%, }
-      (( ${#found[@]} <= 5 )) || r+=", and $(( ${#found[@]} - 5 )) more"
-      echo "- Found in the project folder but not listed: $r"
-    fi
-    echo "- Sidecars (hostname = name, on this project's network):"
-    if [[ -f "$pdir/compose.services.yaml" ]]; then
-      jq -r '.services | to_entries[] | "    - \(.key) — \(.value.image) — reachable as hostname \(.key)"' "$pdir/compose.services.yaml" 2>/dev/null || echo "    (unreadable)"
-    else
-      echo "    none"
-    fi
-    if [[ -f "$pdir/compose.override.yaml" ]]; then
-      echo "- compose.override.yaml: present (user-managed on the VM, not visible here)"
-    else
-      echo "- compose.override.yaml: none (the user can add ports or host mounts there)"
-    fi
-    echo "- Timezone: ${tz:-UTC}"
-    echo "- boxen version: $ver"
-    echo
-    echo "generated $(date -Is) by boxen; do not edit"
-  } | write_env "$n" STATUS.md
+  run_quiet "starting $n" dc "$n" up -d --remove-orphans || return 1
+  sc=$(sidecar_names "$n" | paste -sd, - | sed 's/,/, /g')
+  echo "$n: build container up${sc:+; sidecars: $sc}"
 }
 
-# rerender_compose NAME [OLD_TEMPLATE]: replace the project's compose.yaml
-# with a render of the current template. A file that differs from the new
-# render and from the render of the template it came from (OLD_TEMPLATE, when
-# known) was edited by hand: it's kept as compose.yaml.old and said so. A
-# compose.yaml.bak from an older boxen goes if it's just the old template.
-rerender_compose() {
-  local n=$1 oldt=${2:-} pdir new old
-  pdir=$(proj_dir "$n")
-  new=$(mktemp)
-  old=$(mktemp)
-  render "$(compose_template "$n")" "$n" "$SRC_ROOT/$n" > "$new"
-  if [[ -n "$oldt" && -s "$oldt" ]]; then render "$oldt" "$n" "$SRC_ROOT/$n" > "$old"; fi
-  if ! cmp -s "$pdir/compose.yaml" "$new" && ! cmp -s "$pdir/compose.yaml" "$old"; then
-    mv -f "$pdir/compose.yaml" "$pdir/compose.yaml.old"
-    echo "$n: compose.yaml had your edits; kept as compose.yaml.old — move them to compose.override.yaml"
+# ensure_running NAME: start the build container if it isn't running,
+# waiting (up to 10 minutes) for another boxen command that holds the
+# project, such as an apply. Output goes to stderr, keeping stdout for the
+# command boxen run is about to run.
+ensure_running() {
+  running "$1" && return 0
+  require_setup
+  ( LOCK_WAIT=600; lock_project "$1"; running "$1" || { echo "boxen: starting $1's build container..."; start_env "$1"; } ) >&2
+}
+
+# ---------------------------------------------------------------- GitHub
+
+# shellcheck source=lib/github.sh
+source "$BOXEN_REPO/lib/github.sh"
+GITSCAN="$BOXEN_REPO/bin/boxen-gitscan"
+
+# git_ident name|email: the commit identity in boxen's git config.
+git_ident() { git config -f "$GITCONFIG" --get "user.$1" 2>/dev/null || true; }
+
+# write_gitconfig [NAME EMAIL]: boxen's git settings for repos under ~/src,
+# included from your ~/.gitconfig (includeIf gitdir): GitHub credentials
+# come only from boxen (each project's own tokens, never another helper or
+# your own login), GitHub SSH URLs are fetched over https (nobody here has
+# SSH keys), and commits carry the boxen identity. Without NAME/EMAIL the
+# identity already there is kept.
+write_gitconfig() {
+  local name=${1:-$(git_ident name)} email=${2:-$(git_ident email)} tmp helper inc
+  mkdir -p "$BOXEN_HOME"
+  tmp=$(mktemp -p "$BOXEN_HOME" .gitconfig.XXXXXX)
+  printf '%s\n' "# Written by boxen (boxen setup, boxen github); rewritten each time." \
+                "# Git settings for repos under $SRC_ROOT, included from ~/.gitconfig." > "$tmp"
+  printf -v helper '!%q git-credential' "$BOXEN_BIN"
+  git config -f "$tmp" credential.https://github.com.helper ""
+  git config -f "$tmp" --add credential.https://github.com.helper "$helper"
+  git config -f "$tmp" credential.https://github.com.useHttpPath true
+  git config -f "$tmp" url.https://github.com/.insteadOf git@github.com:
+  git config -f "$tmp" --add url.https://github.com/.insteadOf ssh://git@github.com/
+  [[ -z "$name" ]] || git config -f "$tmp" user.name "$name"
+  [[ -z "$email" ]] || git config -f "$tmp" user.email "$email"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$GITCONFIG"
+  inc="includeIf.gitdir:$SRC_ROOT/.path"
+  if ! git config --global --get-all "$inc" 2>/dev/null | grep -qxF "$GITCONFIG"; then
+    git config --global --add "$inc" "$GITCONFIG"
+    info "$HOME/.gitconfig: repos under $SRC_ROOT use boxen's git settings ($GITCONFIG)"
   fi
-  mv -f "$new" "$pdir/compose.yaml"
-  chmod 0644 "$pdir/compose.yaml"
-  if [[ -f "$pdir/compose.yaml.bak" ]] && cmp -s "$pdir/compose.yaml.bak" "$old"; then
-    rm -f "$pdir/compose.yaml.bak"
+}
+
+# git-credential [--project NAME] get: the credential helper for github.com
+# in repos under ~/src (see write_gitconfig). The project is the one git
+# runs in (or NAME, for `new`'s clone); the token is the one for the
+# repo's owner, else the project's default. Prints nothing when there's no
+# token, so git fails with GitHub's own error. Runs inside the agent's
+# sandbox: it only reads.
+cmd_git_credential() {
+  local proj="" op line host="" path="" protocol="" owner dir token=""
+  if [[ "${1:-}" == --project ]]; then proj=${2:-}; shift 2 || true; fi
+  op=${1:-}
+  while IFS= read -r line && [[ -n "$line" ]]; do
+    case $line in
+      host=*) host=${line#host=} ;;
+      path=*) path=${line#path=} ;;
+      protocol=*) protocol=${line#protocol=} ;;
+    esac
+  done
+  [[ "$op" == get && "$host" == github.com && ( -z "$protocol" || "$protocol" == https ) ]] || return 0
+  if [[ -z "$proj" ]]; then proj=$(project_of_dir "$(pwd -P)") || return 0; fi
+  [[ "$proj" =~ ^[a-z0-9]+([_-][a-z0-9]+)*$ ]] || return 0
+  dir=$(token_dir "$proj")
+  owner=${path%%/*}
+  owner=${owner,,}
+  if [[ "$owner" =~ ^[a-z0-9]([a-z0-9_.-]{0,37}[a-z0-9_])?$ && -s "$dir/gh-token.$owner" ]]; then
+    token=$(head -n 1 "$dir/gh-token.$owner" 2>/dev/null || true)
   fi
-  rm -f "$old"
+  if [[ -z "$token" && -s "$dir/gh-token" ]]; then token=$(head -n 1 "$dir/gh-token" 2>/dev/null || true); fi
+  [[ -n "$token" ]] || return 0
+  printf 'username=x-access-token\npassword=%s\n' "$token"
 }
 
-# create_project NAME: write the project's compose.yaml, env/Dockerfile and
-# env/services.yaml and build its image. Its code folder (~/src/NAME) must
-# already exist.
-create_project() {
-  local name=$1 pdir src errf rc=0
-  pdir=$(proj_dir "$name")
-  src="$SRC_ROOT/$name"
-  # Create the mounted dirs (token, env, agent) yourself so Docker doesn't
-  # create them root-owned; agent/ before compose.yaml, so boxen-agentd's
-  # socket is there by the time the container starts.
-  mkdir -p "$pdir/env"
-  mkdir_private "$(token_dir "$name")"
-  [[ "$name" == supervisor ]] || mkdir_private "$pdir/agent"
-  render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" | write_env "$name" Dockerfile || return 1
-  write_services_template "$name" || return 1
-  render "$(compose_template "$name")" "$name" "$src" > "$pdir/compose.yaml"
-  write_override_example "$name"
-  printf '\033[1;34m==>\033[0m building image for %s...' "$name"
-  errf=$(mktemp)
-  run_quiet "building image for $name" dc "$name" build 2>"$errf" || rc=$?
-  if (( rc )); then echo; cat "$errf" >&2; else echo " done"; check_image_user "$name"; fi
-  rm -f "$errf"
-  return "$rc"
+# ensure_token_timer: tokens refresh every 30 minutes and at boot, from a
+# systemd user timer (boxen-tokens), or cron where there's no systemd user
+# session.
+ensure_token_timer() {
+  local unit_dir="$HOME/.config/systemd/user"
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    mkdir -p "$unit_dir"
+    write_unit "$unit_dir/boxen-tokens.service" <<EOF
+# Written by boxen; rewritten on boxen setup.
+[Unit]
+Description=boxen: refresh each project's GitHub tokens
+
+[Service]
+Type=oneshot
+Environment="BOXEN_HOME=$BOXEN_HOME" "BOXEN_SRC=$SRC_ROOT"
+ExecStart=/bin/sh -c 'exec "\$0" tokens --quiet >>"\$1" 2>&1' "$BOXEN_BIN" "$TOKENS_LOG"
+EOF
+    write_unit "$unit_dir/boxen-tokens.timer" <<'EOF'
+# Written by boxen; rewritten on boxen setup.
+[Unit]
+Description=boxen: refresh GitHub tokens every 30 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now boxen-tokens.timer >/dev/null 2>&1 \
+      || { warn "couldn't start the boxen-tokens timer (systemctl --user status boxen-tokens.timer)"; return 1; }
+    uninstall_cron
+    return 0
+  fi
+  install_cron
 }
 
-# Set by cmd_new so a failed or interrupted run can be retried cleanly.
-NEW_NAME="" NEW_PDIR="" NEW_SRC="" NEW_CREATED_SRC=0
+# write_unit FILE < content: replace FILE when the content changed.
+write_unit() {
+  local tmp
+  tmp=$(mktemp)
+  cat > "$tmp"
+  if cmp -s "$tmp" "$1"; then rm -f "$tmp"; return 0; fi
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+# ---------------------------------------------------------------- Claude
+
+# claude_settings: the settings in ~/.claude/settings.json that make boxen's
+# isolation hold, merged into yours (every other key is left alone; lists
+# get boxen's entries added). Kept on at every setup:
+#   - the sandbox, on, required (failIfUnavailable), with no unsandboxed
+#     retries; `boxen run` and `boxen env` are its only exceptions (they act
+#     on the folder they're run in), and are allowed without a prompt
+#   - its network: GitHub only
+#   - no reading the Docker sockets, SSH keys, gh's login or the GitHub
+#     App's key from a sandboxed command
+#   - Remote Control for every session, unless you set it yourself
+#   - transcripts kept a year (cleanupPeriodDays), unless you set it
+claude_settings() {
+  local s="$CLAUDE_DIR/settings.json" tmp socks=() p
+  mkdir -p "$CLAUDE_DIR"
+  [[ -s "$s" ]] || printf '{}\n' > "$s"
+  if ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
+    warn "$s isn't a JSON object, so boxen's sandbox settings are NOT applied; fix it and re-run install.sh"
+    return 1
+  fi
+  socks=("$DOCKER_SOCK")
+  for p in /var/run/docker.sock /run/docker.sock; do [[ -e "$p" ]] && socks+=("$p"); done
+  tmp=$(mktemp -p "$CLAUDE_DIR" .settings.XXXXXX)
+  jq --arg key "$GH_DIR" --args '
+    def union($a; $b): ($a // []) as $a | $a + [$b[] | select(. as $x | $a | index([$x]) | not)];
+    .cleanupPeriodDays //= 365
+    | if has("remoteControlAtStartup") then . else .remoteControlAtStartup = true end
+    | .sandbox = ((.sandbox // {}) + {enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false})
+    | .sandbox.excludedCommands = union(.sandbox.excludedCommands; ["boxen run *", "boxen env *"])
+    | .sandbox.network = (.sandbox.network // {})
+    | .sandbox.network.allowedDomains = union(.sandbox.network.allowedDomains;
+        ["github.com", "api.github.com", "*.githubusercontent.com"])
+    | .sandbox.filesystem = (.sandbox.filesystem // {})
+    | .sandbox.filesystem.denyRead = union(.sandbox.filesystem.denyRead; $ARGS.positional)
+    | .sandbox.credentials = (.sandbox.credentials // {})
+    | .sandbox.credentials.files = union(.sandbox.credentials.files;
+        [{path: "~/.ssh", mode: "deny"}, {path: "~/.config/gh", mode: "deny"}, {path: $key, mode: "deny"}])
+    | .permissions = (.permissions // {})
+    | .permissions.allow = union(.permissions.allow; ["Bash(boxen run *)", "Bash(boxen env *)"])
+  ' "${socks[@]}" < "$s" > "$tmp" || { rm -f "$tmp"; warn "couldn't update $s"; return 1; }
+  if cmp -s "$tmp" "$s"; then rm -f "$tmp"; return 0; fi
+  chmod --reference="$s" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+  mv -f "$tmp" "$s"
+  info "Claude settings: sandbox on for every session, boxen run/env its only exceptions ($s)"
+}
+
+# claude_config: boxen.md (how agents work here) next to the shared
+# CLAUDE.md, imported from it with an @boxen.md line (the rest of CLAUDE.md
+# is yours); the /carry skill; the settings above. Only boxen's own copies
+# are replaced (first line marked boxen-managed).
+claude_config() {
+  local d="$CLAUDE_DIR" c
+  mkdir -p "$d/skills/carry"
+  if [[ ! -f "$d/skills/carry/SKILL.md" ]] || head -5 "$d/skills/carry/SKILL.md" | grep -q boxen-managed; then
+    cp -f "$BOXEN_REPO/skills/carry/SKILL.md" "$d/skills/carry/SKILL.md"
+  fi
+  if [[ ! -f "$d/boxen.md" ]] || head -1 "$d/boxen.md" | grep -q boxen-managed; then
+    cp -f "$BOXEN_REPO/templates/boxen.md" "$d/boxen.md"
+  else
+    warn "$d/boxen.md isn't boxen's (no boxen-managed line); leaving it alone"
+  fi
+  c="$d/CLAUDE.md"
+  if [[ ! -f "$c" ]]; then
+    printf '@boxen.md\n' > "$c"
+  elif ! grep -qx '@boxen.md' "$c"; then
+    { [[ ! -s "$c" || -z "$(tail -c 1 "$c")" ]] || printf '\n'; printf '\n@boxen.md\n'; } >> "$c"
+  fi
+  claude_settings || true
+}
+
+# ---------------------------------------------------------------- setup
+
+# Hidden command: install.sh runs it (and self-update, through install.sh).
+cmd_setup() {
+  require_docker
+  docker compose version >/dev/null 2>&1 || die "the docker compose plugin isn't installed; re-run $BOXEN_REPO/install.sh"
+  mkdir -p "$PROJECTS_DIR" "$SRC_ROOT"
+  build_base || exit 1
+  claude_config
+  write_gitconfig
+  ensure_token_timer || true
+  serve_unit || true
+}
+
+# ---------------------------------------------------------------- new
+
+NEW_PDIR="" NEW_SRC="" NEW_CREATED_SRC=0 NEW_NAME=""
 new_cleanup() {
   local rc=$?
   [[ -n "$NEW_PDIR" ]] || return 0
   warn "'new $NEW_NAME' didn't finish (exit $rc); cleaning up so you can retry"
-  if [[ -f "$NEW_PDIR/compose.yaml" ]]; then
-    dc "$NEW_NAME" down --rmi all -v >/dev/null 2>&1 || true
-  fi
+  if [[ -f "$NEW_PDIR/compose.yaml" ]]; then dc "$NEW_NAME" down --rmi all -v >/dev/null 2>&1 || true; fi
   rm -rf "$NEW_PDIR"
-  # Only remove the code dir if this run created it (e.g. a half-finished clone).
   if [[ "$NEW_CREATED_SRC" == 1 ]]; then rm -rf "$NEW_SRC"; fi
 }
 
 cmd_new() {
-  local name="" url="" pos=()
-  while (( $# )); do
-    case $1 in
-      --*) start_opts "$@"; break ;;    # options come after name [git-url]
-      *)   pos+=("$1"); shift ;;
-    esac
-  done
-  name=${pos[0]:-} url=${pos[1]:-}
-  (( ${#pos[@]} <= 2 )) || die "usage: boxen new <name> [git-url] [--approve trust]"
-  [[ -n "$name" ]] || die "usage: boxen new <name> [git-url]  (git-url optional; GitHub URL to clone)"
-  if [[ -n "$url" ]] && ! github_repo "$url" >/dev/null && [[ "$url" == git@* || "$url" == ssh://* ]]; then
-    die "only github.com repos can be cloned over SSH-style URLs (containers have no SSH keys); use the https:// URL"
-  fi
+  local name=${1:-} url=${2:-} repo="" pdir src
+  (( $# >= 1 && $# <= 2 )) || die "usage: boxen new <name> [git-url]"
   valid_name "$name"
-  [[ "$name" != all ]] || die "'all' is reserved (it means every project); pick another name"
-  [[ "$name" != supervisor ]] || die "'supervisor' is reserved; 'boxen supervisor' creates that project"
   not_reserved "$name"
   require_setup
-
-  local pdir src
+  if [[ -n "$url" ]]; then
+    repo=$(github_repo "$url" || true)
+    if [[ -n "$repo" ]]; then
+      url="https://github.com/$repo.git"
+    elif [[ "$url" != https://* ]]; then
+      die "clone over https (git-url '$url'); nobody here has SSH keys"
+    fi
+  fi
   pdir=$(proj_dir "$name")
-  src="$SRC_ROOT/$name"
-
-  [[ -e "$pdir" ]] && die "project '$name' already exists ($pdir)"
+  src=$(src_dir "$name")
+  [[ ! -f "$pdir/compose.yaml" ]] || die "project '$name' already exists"
   if [[ -n "$url" && -d "$src" && -n "$(ls -A "$src")" ]]; then
-    die "$src already has files; can't clone into it (omit the url to use it as-is)"
+    die "$src already has files; can't clone into it (leave out the url to use it as it is)"
   fi
   lock_project "$name"
-  # Another `new` of the same name got here first and has its files in already.
-  [[ ! -e "$pdir/compose.yaml" ]] || die "project '$name' already exists ($pdir)"
-
   NEW_NAME=$name NEW_PDIR=$pdir NEW_SRC=$src NEW_CREATED_SRC=0
   [[ -d "$src" ]] || NEW_CREATED_SRC=1
   trap new_cleanup EXIT
-
-  # Create the code dir yourself so Docker doesn't create it root-owned.
+  mkdir_private "$(token_dir "$name")"
   mkdir -p "$src"
-  # Sign in before building anything, so a missing login fails fast.
-  ensure_login
-  create_project "$name"
 
   if [[ -n "$url" ]]; then
-    # The repo cloned starts the project's list of repos its tokens cover.
-    local repo
-    repo=$(github_repo "$url" || true)
     seed_repos "$name" "$repo"
-    if app_configured; then
-      [[ -n "$repo" ]] || die "'$url' isn't a github.com repo URL"
+    if [[ -n "$repo" ]] && app_configured; then
       refresh_project "$name" || true
       case $(repo_states "$name" "$repo") in
         ok) ;;
         not-installed)
-          info "$repo isn't yours, so there's no token for it; cloning works if it's public. To push changes, fork it, then 'boxen repos $name add <you>/<repo>'." ;;
+          info "$repo isn't yours, so there's no token for it; cloning works if it's public. To push, fork it, then 'boxen repos $name add <you>/<repo>'." ;;
         *) die "no GitHub token for $repo, so it can't be cloned (see above)" ;;
       esac
-    else
-      warn "GitHub isn't set up ('boxen github'); cloning a private repo will fail unless GH_TOKEN is in boxen.env"
+    elif [[ -n "$repo" ]]; then
+      warn "GitHub isn't set up ('boxen github'); cloning a private repo will fail"
     fi
     info "cloning $url"
-    run_quiet "cloning $url" dc "$name" run --rm --no-deps -T claude git clone "$url" .
+    run_quiet "cloning $url" git -c credential.https://github.com.helper= \
+      -c "credential.https://github.com.helper=!$(printf '%q' "$BOXEN_BIN") git-credential --project $name" \
+      -c credential.https://github.com.useHttpPath=true clone -- "$url" "$src"
   fi
-
-  # Code already in the folder (or none): the list starts from its origin.
   seed_repos "$name"
-  # From here on the project exists; keep it even if the start needs a retry.
+  env_files "$name"
+  write_compose "$name"
+  info "building $name's build container..."
+  start_env "$name" --build
   trap - EXIT
   NEW_PDIR=""
-  start_project "$name"
-  info "done: '$name' is in the Claude app under Code."
+  info "done. Start working: boxen claude $name   (or: cd $src && claude)"
+  echo "    Its build environment is $src/.boxen/ (the agent may edit it; boxen env apply applies it)."
 }
 
-# ------------------------------------------------------------- supervisor
-#
-# The supervisor is a project like any other, except that inside it, `boxen`
-# is a client (base/boxen-client) that reaches bin/boxen-agentd on the VM
-# through a socket mounted into the container, and may only run an
-# allowlisted set of boxen commands, with BOXEN_AGENT=1 (see agent_mode).
-# Its CLAUDE.md (templates/supervisor.CLAUDE.md) is what makes it a
-# supervisor; boxen owns that file: it lives in the project dir, is mounted
-# read-only over ~/src/supervisor/CLAUDE.md (so the supervisor can't edit
-# its own rules), and is rewritten here and on self-update.
+# ---------------------------------------------------------------- run, env
 
-AGENT_DIR="$BOXEN_HOME/agent"
-AGENT_SOCK="$AGENT_DIR/agent.sock"
-
-write_supervisor_claude_md() {
-  local pdir
-  pdir=$(proj_dir supervisor)
-  mkdir -p "$pdir" "$SRC_ROOT/supervisor"
-  cp "$BOXEN_REPO/templates/supervisor.CLAUDE.md" "$pdir/CLAUDE.md"
-  chmod 0644 "$pdir/CLAUDE.md"
+# run [-C DIR] [--] CMD...      the command in the build container, in the
+#                               folder you're in (or DIR, inside the project)
+# run -d NAME [-C DIR] CMD...   started in the background (boxen-bg)
+# run --logs NAME [-f] [--tail N] | --stop NAME | --ps
+# Excluded from Claude Code's sandbox (see claude_settings), so it acts only
+# on the project of the folder it's run in.
+cmd_run() {
+  local wd="" mode=exec name="" here target t
+  case ${1:-} in -h|--help) usage; return 0 ;; esac
+  project_here
+  here=$(pwd -P)
+  while (( $# )); do
+    case $1 in
+      -C)      wd=${2:-}; [[ -n "$wd" ]] || die "-C needs a folder"; shift 2 ;;
+      -C?*)    wd=${1#-C}; shift ;;
+      -d)      mode="bg"; name=${2:-}; [[ -n "$name" ]] || die "usage: boxen run -d NAME cmd..."; shift 2 ;;
+      --logs)  mode="logs"; name=${2:-}; [[ -n "$name" ]] || die "usage: boxen run --logs NAME [-f] [--tail N]"; shift 2; break ;;
+      --stop)  mode="stop"; name=${2:-}; [[ -n "$name" ]] || die "usage: boxen run --stop NAME"; shift 2; break ;;
+      --ps)    mode="ps"; shift; break ;;
+      --)      shift; break ;;
+      -*)      die "unknown option '$1' (put -- before a command that starts with -)" ;;
+      *)       break ;;
+    esac
+  done
+  target=$here
+  if [[ -n "$wd" ]]; then
+    [[ "$wd" == /* ]] && target=$(realpath -m "$wd") || target=$(realpath -m "$here/$wd")
+    case "$target/" in
+      "$(src_dir "$HERE")"/*) ;;
+      *) die "-C $wd is outside this project ($(src_dir "$HERE"))" ;;
+    esac
+    [[ -d "$target" ]] || die "no such folder: $target"
+  fi
+  ensure_running "$HERE"
+  t=(-i)
+  if [[ -t 0 && -t 1 ]]; then t=(-it); fi
+  case $mode in
+    exec)
+      (( $# )) || die "usage: boxen run [-C dir] cmd...  (see boxen run --help)"
+      exec docker exec "${t[@]}" -w "$target" -e "TERM=${TERM:-dumb}" "$(env_name "$HERE")" \
+        bash -lc 'exec "$@"' boxen-run "$@" ;;
+    bg)
+      (( $# )) || die "usage: boxen run -d NAME cmd..."
+      exec docker exec -i -w "$target" "$(env_name "$HERE")" \
+        bash -lc 'exec boxen-bg start "$@"' boxen-run "$name" "$@" ;;
+    logs) exec docker exec "${t[@]}" "$(env_name "$HERE")" boxen-bg logs "$name" "$@" ;;
+    stop) (( $# == 0 )) || die "usage: boxen run --stop NAME"; exec docker exec -i "$(env_name "$HERE")" boxen-bg stop "$name" ;;
+    ps)   (( $# == 0 )) || die "usage: boxen run --ps"; exec docker exec -i "$(env_name "$HERE")" boxen-bg ps ;;
+  esac
 }
 
-cmd_supervisor() {
-  (( $# == 0 )) || die "usage: boxen supervisor"
-  need_tty supervisor
+cmd_env() {
+  project_here
+  local n=$HERE
+  case ${1:-} in
+    apply)
+      (( $# == 1 )) || die "usage: boxen env apply"
+      require_setup
+      LOCK_WAIT=600 lock_project "$n"
+      start_env "$n" --build || die "nothing changed: fix the problem above and run boxen env apply again"
+      echo "$n: environment applied" ;;
+    show)
+      (( $# == 1 )) || die "usage: boxen env show"
+      show_project "$n" ;;
+    logs)
+      shift
+      env_logs "$n" "$@" ;;
+    *) die "usage: boxen env apply | show | logs <sidecar> [--tail N]" ;;
+  esac
+}
+
+# show_project NAME: what the project's agent (or you) needs to know.
+show_project() {
+  local n=$1 pdir line any=0
+  pdir=$(proj_dir "$n")
+  echo "$n: $(src_dir "$n")"
+  echo "Containers:"
+  while IFS=$'\t' read -r line; do
+    any=1
+    printf '    %s\n' "$line"
+  done < <(docker ps -a --filter "label=com.docker.compose.project=boxen-$n" \
+             --format '{{.Names}}   {{.Image}}   {{.Status}}' 2>/dev/null | sort || true)
+  (( any )) || echo "    none (boxen run starts the build container)"
+  if [[ -f "$pdir/compose.override.yaml" ]]; then
+    echo "Override: $pdir/compose.override.yaml (the user's: ports, mounts, limits)"
+  else
+    echo "Override: none (the user can add ports, mounts and limits in $pdir/compose.override.yaml)"
+  fi
+  repos_show "$n"
+  echo "Build environment: $(bdir "$n")/Dockerfile, $(bdir "$n")/services.yaml"
+}
+
+env_logs() {
+  local n=$1 svc=${2:-} tail=100 c
+  [[ -n "$svc" ]] || die "usage: boxen env logs <sidecar|env> [--tail N]"
+  shift 2
+  while (( $# )); do
+    case $1 in
+      --tail) tail=${2:-}; shift ;;
+      --tail=*) tail=${1#--tail=} ;;
+      *) die "usage: boxen env logs <sidecar|env> [--tail N]" ;;
+    esac
+    shift
+  done
+  [[ "$tail" =~ ^[0-9]+$ ]] && (( tail >= 1 && tail <= 5000 )) || die "--tail needs a number of lines, 1 to 5000"
+  if [[ "$svc" != env ]] && ! sidecar_names "$n" | grep -qxF "$svc"; then
+    die "no sidecar called '$svc' (sidecars: $(sidecar_names "$n" | paste -sd' ' -))"
+  fi
+  c="boxen.$n.$svc"
+  # Control characters stripped, so a log can't drive your terminal.
+  docker logs --tail "$tail" "$c" 2>&1 | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+}
+
+# ---------------------------------------------------------------- user commands
+
+cmd_up() {
+  require_project "${1:-}"
   require_setup
-  local name=supervisor pdir
-  pdir=$(proj_dir "$name")
-  lock_project "$name"
-  # The socket's folder, mounted into the container (a folder, not the
-  # socket itself: boxen-agentd recreates the socket when it restarts, and a
-  # mount of the file would keep pointing at the old one). Created here so
-  # Docker doesn't create it root-owned.
-  mkdir_private "$AGENT_DIR"
-  [[ -S "$AGENT_SOCK" ]] || warn "boxen-agent isn't running (no $AGENT_SOCK); re-run $BOXEN_REPO/install.sh, which sets it up"
-  write_supervisor_claude_md
-  ensure_login
-  if [[ -f "$pdir/compose.yaml" ]]; then
-    migrate_env "$name"
-    rerender_compose "$name"
-    write_override_example "$name"
-  else
-    create_project "$name"
-  fi
-  start_project "$name"
-  info "done: 'boxen supervisor' is in the Claude app under Code. Ask it what's running."
+  lock_project "$1"
+  start_env "$1" --build
 }
 
-# -------------------------------------------------------------- day to day
+cmd_down() {
+  require_project "${1:-}"
+  lock_project "$1"
+  run_quiet "stopping $1" dc "$1" down || return 1
+  echo "$1: stopped"
+}
 
-# ------------------------------------------------------------ ls
+cmd_shell() {
+  require_project "${1:-}"
+  (( $# == 1 )) || die "usage: boxen shell <name>"
+  [[ -t 0 && -t 1 ]] || die "shell needs a terminal"
+  ensure_running "$1"
+  exec docker exec -it -w "$(src_dir "$1")" -e "TERM=${TERM:-xterm}" "$(env_name "$1")" bash -l
+}
 
-# collect_projects: what `ls` shows, for every project, in L_* arrays (one
-# entry per project, in projects order): container status, restarts,
-# StartedAt and id ("" when there's no container), server state, GitHub
-# token state, the first listed repo, every listed repo and its state
-# (space-separated) and the origin's repo. One `docker inspect` for every
-# container, server states from server_state_cached, one boxen-gitscan for
-# every origin, one jq per project with repos. DOCKER_OK=0 when docker
-# couldn't be asked at all.
-L_NAME=() L_STATUS=() L_RESTARTS=() L_STARTED=() L_ID=() L_SERVER=() L_GITHUB=() L_REPO=()
-L_REPOS=() L_RSTATES=() L_ORIGIN=()
-DOCKER_OK=1
-collect_projects() {
-  local n i out line rc=0 names=() dirs=() repos=() states=()
-  local -A st=()
-  mapfile -t L_NAME < <(projects)
-  (( ${#L_NAME[@]} )) || return 0
-  for n in "${L_NAME[@]}"; do names+=("boxen-$n"); dirs+=("$SRC_ROOT/$n"); done
-  if command -v docker >/dev/null; then
-    out=$(docker inspect -f 'C {{.Name}} {{.State.Status}} {{.RestartCount}} {{.State.StartedAt}} {{.Id}}' \
-            "${names[@]}" 2>&1) || rc=$?
-  else
-    out="docker: command not found" rc=127
+cmd_rm() {
+  require_project "${1:-}"
+  local n=$1 yes=0 ans q
+  shift
+  while (( $# )); do
+    case $1 in
+      --yes|-y) yes=1 ;;
+      *) die "usage: boxen rm <name> [--yes]" ;;
+    esac
+    shift
+  done
+  q="Remove $n's build container, image, sidecars and their data (volumes)? Code in $(src_dir "$n") (with .boxen/) and its Claude history stay."
+  if (( ! yes )); then
+    [[ -t 0 ]] || die "rm asks first; run it in a terminal, or add --yes"
+    read -rp "$q [y/N] " ans
+    [[ "$ans" == [yY] ]] || { echo "aborted"; return 0; }
   fi
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^C\ /boxen-([a-z0-9_-]+)\ ([a-z]+)\ ([0-9]+)\ ([0-9T:.Z+-]+)\ ([0-9a-f]+)$ ]]; then
-      st[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]} ${BASH_REMATCH[3]} ${BASH_REMATCH[4]} ${BASH_REMATCH[5]}"
-    elif (( rc )) && [[ -n "$line" && "$line" != *"No such object"* && "$line" != *"No such container"* ]]; then
-      DOCKER_OK=0
-    fi
-  done <<<"$out"
-  mapfile -t L_ORIGIN < <("$GITSCAN" origin "${dirs[@]}" 2>/dev/null || true)
+  lock_project "$n"
+  serve_stop "$n" || true
+  run_quiet "removing $n" dc "$n" down --rmi all -v --remove-orphans || return 1
+  docker volume ls -q --filter "label=boxen.project=$n" 2>/dev/null | xargs -r docker volume rm >/dev/null 2>&1 || true
+  docker volume ls -q --filter "name=^boxen\\.$n\\." 2>/dev/null | xargs -r docker volume rm >/dev/null 2>&1 || true
+  rm -rf "$(proj_dir "$n")"
+  info "removed '$n'. Code in $(src_dir "$n") and its Claude history are kept."
+}
+
+# ---------------------------------------------------------------- sessions
+
+in_boxen_tmux() { [[ -n "${TMUX:-}" && "$(basename "${TMUX%%,*}")" == boxen ]]; }
+
+# claude NAME [ARGS]: a Claude session in the project folder, in a window of
+# boxen's tmux (so it keeps running when SSH drops, and shows in boxen ui).
+# With Remote Control on for every session (claude_settings), it's in the
+# Claude app too.
+cmd_claude() {
+  require_project "${1:-}"
+  local n=$1 argv
+  shift
+  command -v claude >/dev/null || die "Claude Code isn't installed on the VM; re-run $BOXEN_REPO/install.sh"
+  [[ -t 0 && -t 1 ]] || die "claude needs a terminal"
+  argv=(claude "$@")
+  if in_boxen_tmux; then
+    "${TMUX_CMD[@]}" new-window -t boxen: -n "$n" -c "$(src_dir "$n")" "${argv[@]}"
+    return
+  fi
+  if "${TMUX_CMD[@]}" has-session -t boxen 2>/dev/null; then
+    "${TMUX_CMD[@]}" new-window -t boxen: -n "$n" -c "$(src_dir "$n")" "${argv[@]}"
+    exec env -u TMUX "${TMUX_CMD[@]}" attach-session -t boxen
+  fi
+  exec env -u TMUX "${TMUX_CMD[@]}" -f "$TMUX_CONF" new-session -s boxen -n "$n" -c "$(src_dir "$n")" "${argv[@]}"
+}
+
+# serve: a Remote Control server per project, for starting sessions from the
+# app when none is running. Each runs in a tmux window, <name>~serve, so its
+# one-time questions (trust the folder, enable Remote Control) can be
+# answered in boxen ui. projects/<name>/serve marks it on; the boxen-serve
+# user service starts the marked ones at boot.
+serve_win() { printf '%s~serve' "$1"; }
+serve_on() { [[ -f "$(proj_dir "$1")/serve" ]]; }
+serving() { "${TMUX_CMD[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -qxF "$(serve_win "$1")"; }
+
+serve_start() {
+  local n=$1
+  serving "$n" && return 0
+  if "${TMUX_CMD[@]}" has-session -t boxen 2>/dev/null; then
+    "${TMUX_CMD[@]}" new-window -d -t boxen: -n "$(serve_win "$n")" -c "$(src_dir "$n")" "$BOXEN_BIN" serve-run "$n"
+  else
+    nolocks "${TMUX_CMD[@]}" -f "$TMUX_CONF" new-session -d -s boxen -n "$(serve_win "$n")" -c "$(src_dir "$n")" \
+      "$BOXEN_BIN" serve-run "$n"
+  fi
+}
+serve_stop() {
+  serving "$1" || return 0
+  "${TMUX_CMD[@]}" kill-window -t "boxen:=$(serve_win "$1")" 2>/dev/null || true
+}
+
+cmd_serve() {
+  local n
+  case ${1:-} in
+    "")
+      for n in $(projects); do
+        if serve_on "$n"; then
+          if serving "$n"; then printf '%-24s on\n' "$n"; else printf '%-24s on, not running (boxen serve %s)\n' "$n" "$n"; fi
+        fi
+      done
+      return 0 ;;
+    --restore)
+      for n in $(projects); do serve_on "$n" && serve_start "$n"; done
+      return 0 ;;
+  esac
+  require_project "$1"
+  n=$1
+  case ${2:-} in
+    "")
+      command -v claude >/dev/null || die "Claude Code isn't installed on the VM; re-run $BOXEN_REPO/install.sh"
+      : > "$(proj_dir "$n")/serve"
+      serve_start "$n"
+      info "$n: Remote Control server running (tmux window $(serve_win "$n")); start sessions from the Claude app"
+      echo "    The first time, it asks to trust the folder and to enable Remote Control: answer in boxen ui." ;;
+    --off)
+      rm -f "$(proj_dir "$n")/serve"
+      serve_stop "$n"
+      echo "$n: serve off" ;;
+    *) die "usage: boxen serve [<name> [--off]]" ;;
+  esac
+}
+
+# Hidden: the serve window's program. The server exits after a long network
+# outage; it comes back after 10 seconds.
+cmd_serve_run() {
+  require_project "${1:-}"
+  cd "$(src_dir "$1")"
+  while :; do
+    env -u DOCKER_HOST claude remote-control --name "$1" --spawn=same-dir || true
+    echo "boxen: the Remote Control server for $1 stopped; restarting in 10 s (boxen serve $1 --off to stop it)"
+    sleep 10
+  done
+}
+
+# serve_unit: the user service that starts serve windows at boot. KillMode
+# process: stopping it never takes the tmux server (and your sessions) down.
+serve_unit() {
+  local unit_dir="$HOME/.config/systemd/user"
+  systemctl --user show-environment >/dev/null 2>&1 || return 0
+  mkdir -p "$unit_dir"
+  write_unit "$unit_dir/boxen-serve.service" <<EOF
+# Written by boxen; rewritten on boxen setup.
+[Unit]
+Description=boxen: start the Remote Control servers marked with boxen serve
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+KillMode=process
+ExecStart=/bin/bash -lc 'exec "\$0" serve --restore' "$BOXEN_BIN"
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable boxen-serve.service >/dev/null 2>&1 || warn "couldn't enable boxen-serve (systemctl --user status boxen-serve)"
+}
+
+# ---------------------------------------------------------------- ls
+
+# claude_counts: "project count" lines: Claude Code processes of yours by the
+# project their folder is in (each interactive session, and each server).
+claude_counts() {
+  local p cwd n
+  local -A c=()
+  for p in /proc/[0-9]*; do
+    [[ -O "$p" ]] || continue
+    [[ "$(cat "$p/comm" 2>/dev/null)" == claude ]] || continue
+    cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
+    n=$(project_of_dir "$cwd") || continue
+    c[$n]=$(( ${c[$n]:-0} + 1 ))
+  done
+  for n in "${!c[@]}"; do printf '%s %s\n' "$n" "${c[$n]}"; done
+}
+
+# collect: what ls shows, per project, in L_* arrays.
+L_NAME=() L_ENV=() L_SESS=() L_SERVE=() L_GITHUB=() L_REPO=() L_REPOS=() L_RSTATES=() L_ORIGIN=() L_SIDE=()
+DOCKER_OK=1
+collect() {
+  local i n line out proj cname state status svc dirs=() repos=() states=() wins
+  local -A envst=() side=() sess=()
+  mapfile -t L_NAME < <(projects)
+  if out=$(docker ps -a --filter label=com.docker.compose.project \
+             --format '{{.Label "com.docker.compose.project"}}|{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null); then
+    while IFS='|' read -r proj cname state status; do
+      [[ "$proj" == boxen-* ]] || continue
+      n=${proj#boxen-}
+      svc=${cname#"boxen.$n."}
+      if [[ "$svc" == env ]]; then envst[$n]="$state|$status"
+      else side[$n]+="$svc|$state|$status;"; fi
+    done <<<"$out"
+  else
+    DOCKER_OK=0
+  fi
+  while read -r n line; do sess[$n]=$line; done < <(claude_counts)
+  wins=$("${TMUX_CMD[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null || true)
+  for n in "${L_NAME[@]}"; do dirs+=("$(src_dir "$n")"); done
+  if (( ${#dirs[@]} )); then mapfile -t L_ORIGIN < <("$GITSCAN" origin "${dirs[@]}" 2>/dev/null || true); fi
   for i in "${!L_NAME[@]}"; do
-    n=${L_NAME[$i]}
-    L_STATUS[i]="" L_RESTARTS[i]=0 L_STARTED[i]="" L_ID[i]="" L_SERVER[i]="-"
-    if [[ -n "${st[$n]:-}" ]]; then
-      read -r "L_STATUS[i]" "L_RESTARTS[i]" "L_STARTED[i]" "L_ID[i]" <<<"${st[$n]}"
-      if [[ "${L_STATUS[i]}" == running ]]; then
-        L_SERVER[i]=$(server_state_cached "$n" "${L_ID[i]}" "${L_STARTED[i]}")
-      fi
+    n=${L_NAME[i]}
+    L_ENV[i]=${envst[$n]:-}
+    L_SIDE[i]=${side[$n]:-}
+    L_SESS[i]=${sess[$n]:-0}
+    if serve_on "$n"; then
+      if grep -qxF "$(serve_win "$n")" <<<"$wins"; then L_SERVE[i]=on; else L_SERVE[i]=stopped; fi
+    else
+      L_SERVE[i]=off
     fi
     mapfile -t repos < <(listed_repos "$n")
     mapfile -t states < <(repo_states "$n" "${repos[@]}")
@@ -2098,84 +1103,60 @@ collect_projects() {
   done
 }
 
-# Each project's container, whether its server is actually connected (a
-# running container can hold a server stuck at a question), and its GitHub
-# token.
 cmd_ls() {
-  local i c
-  collect_projects
-  printf '%-24s %-20s %-42s %s\n' PROJECT CONTAINER SERVER GITHUB
+  local i e v1=()
+  collect
+  printf '%-24s %-14s %-9s %-8s %s\n' PROJECT CONTAINER SESSIONS SERVE GITHUB
   for i in "${!L_NAME[@]}"; do
-    c="not created"
-    if [[ -n "${L_STATUS[i]}" ]]; then
-      c=${L_STATUS[i]}
-      (( L_RESTARTS[i] == 0 )) || c="$c (${L_RESTARTS[i]} restarts)"
-    fi
-    printf '%-24s %-20s %-42s %s\n' "${L_NAME[i]}" "$c" "${L_SERVER[i]}" "${L_GITHUB[i]}"
+    e=${L_ENV[i]%%|*}
+    (( DOCKER_OK )) || e="?"
+    printf '%-24s %-14s %-9s %-8s %s\n' "${L_NAME[i]}" "${e:-not created}" "${L_SESS[i]}" "${L_SERVE[i]}" "${L_GITHUB[i]}"
   done
+  (( DOCKER_OK )) || warn "couldn't reach rootless Docker ($DOCKER_HOST)"
+  mapfile -t v1 < <(v1_projects)
+  (( ${#v1[@]} == 0 )) || echo "boxen v1 projects, not moved yet (boxen migrate): ${v1[*]}"
 }
 
-# ls --json: one JSON document for boxen ui (and anything else that wants
-# it), built by a single jq from collect_projects and each project's
-# compose.services.yaml:
-#   {"version": 2, "docker": true|false,
-#    "projects": [{"name", "container": {"status", "restarts", "started_at",
-#                  "id"} | null, "server", "github", "repo": "owner/repo" | null,
-#                  "repos": [{"repo", "state", "origin": true|false}],
-#                  "sidecars": [{"service", "container", "image"}]}, ...],
-#    "supervisor": {... the same ...} | null}
-# "server" is "-" when the container isn't running, as in `ls`; "repo" is
-# the first listed repo (what the project's tokens default to), "repos"
-# all of them with their state from the last token refresh (ok,
-# not-installed, no-access, error, "-" not known yet) and whether it's the
-# origin; sidecars are the configured ones (their live state is Docker's to
-# tell). No network.
-LS_FIELDS=11
+# ls --json: for boxen ui and scripts. No network.
+#   {"version": 3, "docker": bool, "src": "~/src path",
+#    "projects": [{"name", "path", "container": {"state", "status"} | null,
+#                  "sidecars": [{"service", "container", "state", "status"}],
+#                  "sessions": N, "serve": "off"|"on"|"stopped",
+#                  "github", "repo": "owner/repo" | null,
+#                  "repos": [{"repo", "state", "origin"}]}],
+#    "v1": ["name", ...]}
+LS_FIELDS=10
 cmd_ls_json() {
-  local i f args=() files=()
-  collect_projects
+  local i args=() v1=()
+  collect
   for i in "${!L_NAME[@]}"; do
-    args+=("${L_NAME[i]}" "${L_STATUS[i]}" "${L_RESTARTS[i]}" "${L_STARTED[i]}" "${L_ID[i]}"
-           "${L_SERVER[i]}" "${L_GITHUB[i]}" "${L_REPO[i]}" "${L_REPOS[i]}" "${L_RSTATES[i]}" "${L_ORIGIN[i]}")
-    f="$(proj_dir "${L_NAME[i]}")/compose.services.yaml"
-    if [[ -f "$f" ]]; then files+=(--rawfile "sc$i" "$f"); fi
+    args+=("${L_NAME[i]}" "${L_ENV[i]}" "${L_SIDE[i]}" "${L_SESS[i]}" "${L_SERVE[i]}"
+           "${L_GITHUB[i]}" "${L_REPO[i]}" "${L_REPOS[i]}" "${L_RSTATES[i]}" "${L_ORIGIN[i]}")
   done
-  jq -n --argjson docker "$( (( DOCKER_OK )) && echo true || echo false)" --argjson nf "$LS_FIELDS" "${files[@]}" '
+  mapfile -t v1 < <(v1_projects)
+  jq -n --argjson docker "$( (( DOCKER_OK )) && echo true || echo false)" --argjson nf "$LS_FIELDS" \
+     --arg src "$SRC_ROOT" --arg v1 "${v1[*]}" '
     def words: split(" ") | map(select(. != ""));
     [$ARGS.positional | range(0; length; $nf) as $o | .[$o:$o + $nf]]
-    | to_entries
-    | map(.key as $i | .value as $v | {
+    | map(. as $v | {
         name: $v[0],
-        container: (if $v[1] == "" then null
-                    else {status: $v[1], restarts: ($v[2] | tonumber? // 0), started_at: $v[3], id: $v[4]} end),
-        server: $v[5], github: $v[6],
-        repo: (if $v[7] == "" then null else $v[7] end),
-        repos: ([$v[8] | words, ($v[9] | words)] | transpose
+        path: "\($src)/\($v[0])",
+        container: (if $v[1] == "" then null else ($v[1] | split("|") | {state: .[0], status: (.[1] // "")}) end),
+        sidecars: ($v[2] | split(";") | map(select(. != "") | split("|")
+                   | {service: .[0], container: "boxen.\($v[0]).\(.[0])", state: (.[1] // ""), status: (.[2] // "")})),
+        sessions: ($v[3] | tonumber? // 0),
+        serve: $v[4], github: $v[5],
+        repo: (if $v[6] == "" then null else $v[6] end),
+        repos: ([$v[7] | words, ($v[8] | words)] | transpose
                 | map({repo: .[0], state: (.[1] // "-"),
-                       origin: ($v[10] != "" and (.[0] | ascii_downcase) == ($v[10] | ascii_downcase))})),
-        sidecars: (try ($ARGS.named["sc\($i)"] // "{}" | fromjson | .services // {} | to_entries
-                        | map({service: .key,
-                               container: (.value.container_name // "boxen.\($v[0]).\(.key)"),
-                               image: (.value.image // "")}))
-                   catch [])})
-    | {version: 2, docker: $docker,
-       projects: map(select(.name != "supervisor")),
-       supervisor: (map(select(.name == "supervisor")) | first // null)}' --args "${args[@]}"
+                       origin: ($v[9] != "" and (.[0] | ascii_downcase) == ($v[9] | ascii_downcase))}))})
+    | {version: 3, docker: $docker, src: $src, projects: ., v1: ($v1 | words)}' --args "${args[@]}"
 }
 
-# ui: the dashboard (ui/boxen_ui, Textual) in a tmux server of its own
-# (-L boxen, ui/tmux.conf; your ~/.tmux.conf isn't read), so it and every
-# terminal it opens keep running when SSH drops: `boxen ui` again
-# reattaches. Inside that session already, it just shows the dashboard.
-# `boxen ui --restart` starts the dashboard again (after an update).
+# ---------------------------------------------------------------- ui
+
 UI_VENV="${BOXEN_UI_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/boxen/ui-venv}"
 UI_DASH=()
-# ui_prepare: check tmux and the venv, and put the dashboard's command in
-# UI_DASH. It runs from the venv's real folder (ui-venv is a link to the
-# current version, see ui/install-venv.sh), so a dashboard keeps the
-# version it started with when an update installs another; with -P, so
-# nothing is imported from the working directory; and if it exits with an
-# error, its last words stay on screen.
 ui_prepare() {
   local v vdir
   command -v tmux >/dev/null || die "tmux isn't installed; re-run $BOXEN_REPO/install.sh"
@@ -2187,30 +1168,22 @@ ui_prepare() {
   vdir=$(readlink -f "$UI_VENV" 2>/dev/null || true)
   [[ -n "$vdir" && -x "$vdir/bin/python" ]] \
     || die "the ui's Python environment is missing ($UI_VENV); re-run $BOXEN_REPO/install.sh"
-  "$vdir/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
-    || die "boxen ui needs Python 3.11 or newer ($vdir/bin/python is older)"
   # shellcheck disable=SC2016  # expanded by that sh, on purpose
-  UI_DASH=(env "PYTHONPATH=$BOXEN_REPO/ui" sh -c \
+  UI_DASH=(env -u DOCKER_HOST "PYTHONPATH=$BOXEN_REPO/ui" sh -c \
            '"$0" -P -m boxen_ui || { printf "\nboxen ui exited (%s); press Enter " "$?"; read -r _; }' \
            "$vdir/bin/python")
 }
 
 cmd_ui() {
-  local conf="$BOXEN_REPO/ui/tmux.conf" t=(tmux -L boxen) restart=0
+  local t=("${TMUX_CMD[@]}") restart=0
   case ${1:-} in
     "") ;;
     --restart) restart=1 ;;
+    --dashboard) ui_prepare; exec "${UI_DASH[@]}" ;;
     *) die "usage: boxen ui [--restart]" ;;
   esac
-  (( $# <= 1 )) || die "usage: boxen ui [--restart]"
-  if agent_mode; then
-    printf 'boxen: ui needs a terminal\n' >&2
-    exit 2
-  fi
   (( restart )) || [[ -t 0 && -t 1 ]] || die "ui needs a terminal (run it in an SSH session on the VM)"
   ui_prepare
-  # Every window starts in your home folder: never in a project's, whose
-  # files the container can write.
   if (( restart )); then
     "${t[@]}" has-session -t boxen 2>/dev/null || die "boxen ui isn't running; start it with 'boxen ui'"
     "${t[@]}" respawn-window -k -c "$HOME" -t boxen:=dashboard "${UI_DASH[@]}" 2>/dev/null \
@@ -2218,346 +1191,91 @@ cmd_ui() {
     info "dashboard restarted"
     return
   fi
-  # Already in it: switch to the dashboard window (recreated if it's gone).
-  if [[ -n "${TMUX:-}" && "$(basename "${TMUX%%,*}")" == boxen ]]; then
+  if in_boxen_tmux; then
     "${t[@]}" select-window -t boxen:=dashboard 2>/dev/null \
       || "${t[@]}" new-window -c "$HOME" -t boxen: -n dashboard "${UI_DASH[@]}"
     return
   fi
   if "${t[@]}" has-session -t boxen 2>/dev/null; then
-    # A running server keeps the config it started with; this picks up an update.
-    "${t[@]}" source-file "$conf" 2>/dev/null || true
-    "${t[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -x dashboard >/dev/null \
+    "${t[@]}" source-file "$TMUX_CONF" 2>/dev/null || true
+    "${t[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -qx dashboard \
       || "${t[@]}" new-window -d -c "$HOME" -t boxen: -n dashboard "${UI_DASH[@]}"
+    exec env -u TMUX "${t[@]}" attach-session -t boxen \; select-window -t boxen:=dashboard
   fi
-  # From inside another tmux, nest (tmux refuses unless TMUX is unset).
-  exec env -u TMUX "${t[@]}" -f "$conf" new-session -A -c "$HOME" -s boxen -n dashboard "${UI_DASH[@]}"
+  exec env -u TMUX "${t[@]}" -f "$TMUX_CONF" new-session -c "$HOME" -s boxen -n dashboard "${UI_DASH[@]}"
 }
 
-# start_opts [--approve trust] [--prepare]: the options up, restart and new
-# take after the name. In agent mode, --approve trust answers the folder's
-# trust question (see drive_prompts); from a terminal you answer it
-# yourself. --prepare (restart, update) stops after the checks.
-start_opts() {
-  while (( $# )); do
-    case $1 in
-      --approve) [[ "${2:-}" == trust ]] || die "--approve takes 'trust' (e.g. boxen up <name> --approve trust)"; APPROVE_TRUST=1; shift ;;
-      --approve=trust) APPROVE_TRUST=1 ;;
-      --prepare) PREPARE=1 ;;
-      *) die "unknown option '$1' (options: --approve trust, --prepare)" ;;
-    esac
-    shift
-  done
-}
+# ---------------------------------------------------------------- upkeep
 
-# prepare_project NAME [--build]: everything a restart (or, with --build,
-# an update) checks and makes before recreating the container, and nothing
-# more: the env files are plain files, services.yaml passes (and
-# compose.services.yaml is written), the image builds. rc 2 on a rejected
-# environment, 1 on a failed build; the container is left as it is.
-prepare_project() {
-  local n=$1 f
-  fresh_compose "$n" || return 1
-  for f in Dockerfile services.yaml STATUS.md; do
-    [[ "$n" == supervisor && "$f" == services.yaml ]] && continue
-    env_path "$n" "$f" >/dev/null || return 2
-  done
-  render_services "$n" || return $?
-  if [[ "${2:-}" == --build ]]; then
-    run_quiet "building image for $n" dc "$n" build || return 1
-    check_image_user "$n"
-  fi
-  echo "$n: environment OK"
-}
-
-# An approval is for one project's question: never `up all --approve trust`.
-no_approve_all() {
-  local a
-  [[ "${1:-}" == all ]] || return 0
-  for a in "${@:2}"; do
-    [[ "$a" != --approve* ]] || die "approve one project at a time (boxen up <name> --approve trust), not all"
-  done
-}
-
-cmd_up()      { require_project "${1:-}"; lock_project "$1"; start_opts "${@:2}"; start_project "$1"; }
-cmd_restart() {
-  require_project "${1:-}"
-  lock_project "$1"
-  start_opts "${@:2}"
-  if (( PREPARE )); then prepare_project "$1"; return; fi
-  start_project "$1" --force-recreate
-}
-cmd_down() {
-  require_project "${1:-}"
-  # From the supervisor (agent mode), `down all` would stop the supervisor
-  # itself, and nothing in the app could start it again.
-  if agent_mode && (( EACH_ALL )) && [[ "$1" == supervisor ]]; then
-    echo "supervisor: left running (stop it from the VM)"
-    return 0
-  fi
-  lock_project "$1"
-  run_quiet "stopping $1" dc "$1" down || return 1
-  echo "$1: stopped"
-}
-
-cmd_logs() {
-  require_project "${1:-}"
-  local n=$1 tail=100 args=()
-  shift
-  while (( $# )); do
-    case $1 in
-      --tail)   tail=${2:-}; shift ;;
-      --tail=*) tail=${1#--tail=} ;;
-      -f|--follow)
-        if agent_mode; then
-          printf 'boxen: logs -f isn'"'"'t available here; use --tail\n' >&2
-          exit 2
-        fi
-        args+=("$1") ;;
-      *) args+=("$1") ;;
-    esac
-    shift
-  done
-  [[ "$tail" =~ ^[0-9]+$ ]] && (( tail >= 1 && tail <= 5000 )) || die "--tail needs a number of lines, 1 to 5000"
-  # The server writes to a terminal, so its log is full of screen-control
-  # codes (cursor moves, clears) that would scramble yours; print the text.
-  dc "$n" logs --no-log-prefix --tail="$tail" "${args[@]}" claude 2>&1 | plain_text
-}
-
-cmd_shell() {
-  need_tty shell
-  require_project "${1:-}"
-  docker exec -it "boxen-$1" bash
-}
-
-cmd_claude() {
-  need_tty claude
-  require_project "${1:-}"
-  local n=$1; shift
-  docker exec -it "boxen-$n" claude "$@"
-}
-
-# resume NAME [N|ID] [--stop|--attach|--force]: earlier sessions, in a
-# numbered list; picking one puts it in the Claude app with its history. The
-# work happens inside the container (boxen-sessions).
-cmd_resume() {
-  require_project "${1:-}"
-  local n=$1 a
-  shift
-  [[ "$(docker inspect -f '{{.State.Running}}' "boxen-$n" 2>/dev/null || true)" == true ]] \
-    || die "$n isn't running; start it with 'boxen up $n'"
-  if agent_mode; then
-    for a in "$@"; do [[ "$a" != --attach ]] || need_tty "resume --attach"; done
-    docker exec -i -e BOXEN_AGENT=1 "boxen-$n" boxen-sessions resume "$@"
-  else
-    docker exec -it "boxen-$n" boxen-sessions resume "$@"
-  fi
-}
-
-cmd_rm() {
-  require_project "${1:-}"
-  local name=$1 ans yes=0 q
-  shift
-  lock_project "$name"
-  while (( $# )); do
-    case $1 in
-      --yes|-y) yes=1 ;;
-      *) die "usage: boxen rm <name> [--yes]" ;;
-    esac
-    shift
-  done
-  q="Remove container, image and config for '$name'? Its tool installs (home volume) and sidecar data are removed too; code in $SRC_ROOT/$name is kept."
-  if (( ! yes )); then
-    if agent_mode; then
-      approval_needed rm "$name" "boxen rm $name --yes" <<<"$q" || return $?
-    fi
-    read -rp "$q [y/N] " ans
-    [[ "$ans" == [yY] ]] || { echo "aborted"; return; }
-  fi
-  run_quiet "removing $name" dc "$name" down --rmi all -v || return 1
-  # Sidecar volumes from earlier renders (boxen.<name>.<vol>) that the
-  # current compose.services.yaml no longer declares.
-  docker volume ls -q --filter "name=^boxen\\.$name\\." 2>/dev/null | xargs -r docker volume rm >/dev/null 2>&1 || true
-  rm -rf "$(proj_dir "$name")"
-  info "removed '$name'. Code in $SRC_ROOT/$name and its Claude history in the shared config are kept."
-}
-
-# show NAME: the project's environment as it stands: the sidecars from the
-# last render (what's running, or will be after the next start), the
-# Dockerfile and services.yaml, and whether there's a compose.override.yaml.
-cmd_show() {
-  require_project "${1:-}"
-  (( $# == 1 )) || die "usage: boxen show <name>"
-  local n=$1 pdir f
-  pdir=$(proj_dir "$n")
-  # Refuse up front, before printing anything, if an env file is a link
-  # (env_read checks again, on the open file, when it comes to reading).
-  for f in Dockerfile services.yaml; do
-    [[ "$n" == supervisor && "$f" == services.yaml ]] && continue
-    env_path "$n" "$f" >/dev/null || return 2
-  done
-  f="$pdir/compose.services.yaml"
-  echo "$n: sidecars (from the last start):"
-  if [[ -f "$f" ]]; then
-    jq -r '.services | to_entries[] | "    \(.key)  \(.value.image)"' "$f" 2>/dev/null || echo "    (unreadable: $f)"
-  else
-    echo "    none"
-  fi
-  if [[ -f "$pdir/compose.override.yaml" ]]; then
-    echo "$n: compose.override.yaml: present ($pdir/compose.override.yaml)"
-  else
-    echo "$n: compose.override.yaml: none"
-  fi
-  if [[ -f "$pdir/agent.log" ]]; then
-    echo "$n: last apply (restart/update run from inside the project; $pdir/agent.log):"
-    tail -n 20 "$pdir/agent.log" | sed 's/^/    /'
-  fi
-  local rc
-  for f in Dockerfile services.yaml; do
-    [[ "$n" == supervisor && "$f" == services.yaml ]] && continue
-    echo
-    echo "--- env/$f (/boxen/$f inside the container)"
-    rc=0
-    env_read "$n" "$f" || rc=$?
-    (( rc != 2 )) || return 2
-    (( rc != 1 )) || echo "(missing)"
-  done
-}
-
-# ------------------------------------------------------------- maintenance
-
-# update_one NAME: rebuild the project's image (cached), recreate its
-# container and wait for the server. One line of output.
 update_one() {
-  local n=$1 sc
-  fresh_compose "$n" || return 1
-  render_services "$n" || return $?
-  run_quiet "building image for $n" dc "$n" build || return 1
-  check_image_user "$n"
-  refresh_project "$n" || true
-  write_status "$n" || return $?
-  run_quiet "starting $n" dc "$n" up -d --force-recreate --remove-orphans || return 1
-  sc=$(sidecar_names "$n")
-  [[ -z "$sc" ]] || echo "$n: sidecars: $sc"
-  wait_server "$n" "rebuilt, "
+  local n=$1
+  start_env "$n" --build
 }
 
 cmd_update() {
   local n r failed=() busy=() list=()
-  if [[ -n "${1:-}" && "$1" != all ]]; then
-    require_project "$1"
-    lock_project "$1"
-    start_opts "${@:2}"
-    if (( PREPARE )); then prepare_project "$1" --build; return; fi
-    update_one "$1"
-    return
-  fi
-  (( $# <= 1 )) || die "usage: boxen update [name|all] (--prepare with a name)"
+  (( $# == 0 )) || die "usage: boxen update   (one project: boxen up <name>)"
+  require_setup
   lock_global
   build_base --fresh || exit 1
   mapfile -t list < <(projects)
   for n in "${list[@]}"; do
     r=0
-    locked "$n" update_one "$n" || r=$?
+    if docker inspect "$(env_name "$n")" >/dev/null 2>&1; then
+      locked "$n" update_one "$n" || r=$?
+    else
+      # Never started: just drop the old image; the next start builds it.
+      docker image rm "boxen-env-$n:latest" >/dev/null 2>&1 || true
+    fi
     if (( r == BUSY_RC )); then busy+=("$n"); elif (( r )); then failed+=("$n"); fi
   done
-  docker image prune -f >/dev/null
-  docker builder prune -f --filter until=720h >/dev/null
-  loop_summary update "${busy[@]}" -- "${failed[@]}"
+  docker image prune -f >/dev/null 2>&1 || true
+  docker builder prune -f --filter until=720h >/dev/null 2>&1 || true
+  (( ${#busy[@]} == 0 )) || warn "update: skipped, busy: ${busy[*]}"
+  (( ${#failed[@]} == 0 )) || die "update finished, but these projects failed: ${failed[*]}"
   info "update done"
 }
 
-# self_update_files NAME OLD_TEMPLATE: a project's files after a
-# self-update (env/ layout, compose.yaml from the new template).
-self_update_files() {
-  local n=$1
-  migrate_env "$n"
-  rerender_compose "$n" "$2"
-  write_override_example "$n"
-  mkdir_private "$(token_dir "$n")"
-  seed_repos "$n"
-  [[ "$n" != supervisor ]] || write_supervisor_claude_md
-}
-
-# Hidden for one release: the previous self-update told upgraders to run
-# these. `regen` re-renders compose.yaml (hand edits kept as .old) and starts
-# the project; `rebuild` is `update`. Remove next release.
-cmd_regen() {
-  require_project "${1:-}"
-  lock_project "$1"
-  migrate_env "$1"
-  rerender_compose "$1"
-  write_override_example "$1"
-  mkdir_private "$(token_dir "$1")"
-  seed_repos "$1"
-  start_project "$1"
-}
-
 cmd_self_update() {
-  local old new changed n r list=() failed=() busy=() mode=none oldt
+  local old new changed n r list=() failed=() oldt rebuild=0
   lock_global
   old=$(git -C "$BOXEN_REPO" rev-parse HEAD)
-  # git may leave a gc running in the background: without the locks, and
-  # not detached.
   run_quiet "git pull" nolocks git -c gc.autoDetach=false -C "$BOXEN_REPO" pull --ff-only \
-    || die "couldn't fast-forward $BOXEN_REPO. If you edited files there, move those changes to ~/.config/boxen (see README, Customizing) and retry."
+    || die "couldn't fast-forward $BOXEN_REPO. If you edited files there, move those changes to ~/.config/boxen and retry."
   new=$(git -C "$BOXEN_REPO" rev-parse HEAD)
-  if [[ "$old" == "$new" ]]; then
-    info "boxen is already up to date"
-    return 0
-  fi
+  if [[ "$old" == "$new" ]]; then info "boxen is already up to date"; return 0; fi
   info "updated boxen:"
   git -C "$BOXEN_REPO" log --oneline --no-decorate "$old..$new" | sed 's/^/    /'
   changed=$(git -C "$BOXEN_REPO" diff --name-only "$old" "$new")
-
-  # The new installer: VM prerequisites, PATH link, base image. (This script
-  # keeps running from the old copy it already opened, which is fine.)
   info "running the updated installer"
-  # Without the locks: it (re)starts the boxen agent, which runs for good.
   BOXEN_SELF_UPDATE=1 nolocks "$BOXEN_REPO/install.sh"
-
   mapfile -t list < <(projects)
-  if (( ${#list[@]} == 0 )); then
-    info "self-update done"
-    return 0
-  fi
-
-  # Every project's compose.yaml comes from the template (settings of your
-  # own belong in compose.override.yaml). Hand edits are kept as .old. A
-  # project from before env/ gets its Dockerfile moved there first.
   oldt=$(mktemp)
+  git -C "$BOXEN_REPO" show "$old:templates/compose.yaml" > "$oldt" 2>/dev/null || true
+  grep -qE '^(image/|templates/compose\.yaml$)' <<<"$changed" && rebuild=1
   for n in "${list[@]}"; do
-    git -C "$BOXEN_REPO" show "$old:templates/$(basename "$(compose_template "$n")")" > "$oldt" 2>/dev/null || true
     r=0
-    locked "$n" self_update_files "$n" "$oldt" || r=$?
-    if (( r == BUSY_RC )); then busy+=("$n"); elif (( r )); then failed+=("$n"); fi
+    locked "$n" write_compose "$n" "$oldt" || r=$?
+    if (( ! r && rebuild )) && docker inspect "$(env_name "$n")" >/dev/null 2>&1; then
+      locked "$n" update_one "$n" || r=$?
+    fi
+    (( r == 0 )) || failed+=("$n")
   done
   rm -f "$oldt"
-
-  # A changed base image means new project images; a changed compose template
-  # means `up` (compose recreates only what differs).
-  if grep -qE '^base/' <<<"$changed"; then
-    mode=rebuild
-  elif grep -qE '^templates/compose(\.supervisor)?\.yaml$' <<<"$changed"; then
-    mode=up
-  fi
-  if [[ "$mode" != none ]]; then
-    info "applying to projects (servers restart; app sessions reconnect on their own)"
-    for n in "${list[@]}"; do
-      r=0
-      case $mode in
-        rebuild) locked "$n" update_one "$n" || r=$? ;;
-        up)      locked "$n" start_project "$n" || r=$? ;;
-      esac
-      if (( r == BUSY_RC )); then
-        [[ " ${busy[*]} " == *" $n "* ]] || busy+=("$n")
-      elif (( r )); then
-        failed+=("$n")
-      fi
-    done
-  fi
-  loop_summary self-update "${busy[@]}" -- "${failed[@]}"
+  (( ${#failed[@]} == 0 )) || die "self-update finished, but these projects failed (or were busy): ${failed[*]}"
   info "self-update done"
+}
+
+cmd_doctor() {
+  # shellcheck source=lib/doctor.sh
+  source "$BOXEN_REPO/lib/doctor.sh"
+  doctor_main "$@"
+}
+
+cmd_migrate() {
+  # shellcheck source=lib/migrate.sh
+  source "$BOXEN_REPO/lib/migrate.sh"
+  migrate_main "$@"
 }
 
 # ------------------------------------------------------------------- main
@@ -2566,37 +1284,31 @@ cmd=${1:-help}
 shift || true
 case "$cmd" in
   new)      cmd_new "$@" ;;
-  supervisor) cmd_supervisor "$@" ;;
   ls|list)
     case ${1:-} in
       "")     cmd_ls ;;
       --json) (( $# == 1 )) || die "usage: boxen ls [--json]"; cmd_ls_json ;;
       *)      die "usage: boxen ls [--json]" ;;
     esac ;;
-  ui)       cmd_ui "$@" ;;
-  up)       no_approve_all "$@"; each cmd_up "$@" ;;
-  down)     each cmd_down "$@" ;;
-  restart)  no_approve_all "$@"; each cmd_restart "$@" ;;
-  logs)     cmd_logs "$@" ;;
-  show)     cmd_show "$@" ;;
-  shell)    cmd_shell "$@" ;;
   claude)   cmd_claude "$@" ;;
-  resume)   cmd_resume "$@" ;;
+  serve)    cmd_serve "$@" ;;
+  serve-run) cmd_serve_run "$@" ;;
+  ui)       cmd_ui "$@" ;;
+  shell)    cmd_shell "$@" ;;
+  up)       each cmd_up "$@" ;;
+  down)     each cmd_down "$@" ;;
   rm)       cmd_rm "$@" ;;
-  github)   cmd_github "$@" ;;
   repos)    cmd_repos "$@" ;;
-  login)    cmd_login ;;
+  run)      cmd_run "$@" ;;
+  env)      cmd_env "$@" ;;
+  github)   cmd_github "$@" ;;
+  doctor)   cmd_doctor "$@" ;;
+  migrate)  cmd_migrate "$@" ;;
   update)   cmd_update "$@" ;;
   self-update) cmd_self_update ;;
-  import-mac)
-    need_tty import-mac
-    # shellcheck source=lib/import-mac.sh
-    source "$BOXEN_REPO/lib/import-mac.sh"
-    cmd_import_mac "$@" ;;
   setup)    cmd_setup "$@" ;;
   tokens)   cmd_tokens "$@" ;;
-  regen)    each cmd_regen "$@" ;;
-  rebuild)  cmd_update "$@" ;;
+  git-credential) cmd_git_credential "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac

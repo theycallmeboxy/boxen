@@ -1,152 +1,91 @@
 #!/usr/bin/env bash
-# boxen installer. On a fresh Ubuntu VM, as your normal user:
+# boxen installer. On an Ubuntu 24.04 VM, as your normal user (it uses sudo
+# where it has to):
 #
-#   gh repo clone theycallmeboxy/boxen ~/boxen    (or git clone)
+#   git clone https://github.com/theycallmeboxy/boxen ~/boxen
 #   ~/boxen/install.sh
 #
-# Safe to re-run: every step checks whether it's already done.
+# What it sets up: Claude Code and its sandbox (bubblewrap, socat, an
+# AppArmor profile for bwrap), rootless Docker for your user (the build
+# containers), the GitHub CLI, tmux and vim, then `boxen setup`: the base
+# image, boxen's Claude settings and instructions, git settings for ~/src and
+# the token timer. Safe to re-run: every step checks whether it's done.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 ME="$(id -un)"
+BOXEN_HOME="${BOXEN_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/boxen}"
 
 die()  { printf 'install: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'install: %s\n' "$*" >&2; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
-# The boxen agent (bin/boxen-agentd): the listener the supervisor project
-# talks to. A systemd user service with lingering, so it runs without a login
-# session and comes back after reboots; where `systemctl --user` doesn't
-# work, a cron @reboot line (tagged "# boxen-agent") plus a start now.
-# Idempotent: the unit is rewritten only when it changed, and a running
-# service is restarted when the unit changed or on self-update, so it picks
-# up an updated agentd. Run from the agent itself (self-update; BOXEN_AGENT
-# set) it doesn't restart the service out from under the running command:
-# agentd notices its file changed and re-executes itself once the command
-# is done.
-install_agent() {
-  local boxen_home="${BOXEN_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/boxen}"
-  local boxen_src="${BOXEN_SRC:-$HOME/src}"
-  local unit_dir="$HOME/.config/systemd/user" unit="boxen-agent.service" tmp was_active=0 changed=0
-  local tag="# boxen-agent" job current
-  job="BOXEN_HOME=\"$boxen_home\" BOXEN_SRC=\"$boxen_src\" \"$REPO_DIR/bin/boxen-agentd\" >>\"$boxen_home/agent.log\" 2>&1"
-  chmod +x "$REPO_DIR/bin/boxen-agentd"
-  mkdir -p "$boxen_home"
-
-  if systemctl --user show-environment >/dev/null 2>&1; then
-    mkdir -p "$unit_dir"
-    tmp=$(mktemp)
-    cat > "$tmp" <<EOF
-# Written by boxen's install.sh; rewritten on self-update.
-[Unit]
-Description=boxen agent: runs allowlisted boxen commands for the supervisor project
-
-[Service]
-ExecStart="$REPO_DIR/bin/boxen-agentd"
-Environment="BOXEN_HOME=$boxen_home"
-Environment="BOXEN_SRC=$boxen_src"
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-EOF
-    if ! cmp -s "$tmp" "$unit_dir/$unit"; then
-      mv -f "$tmp" "$unit_dir/$unit"
-      chmod 0644 "$unit_dir/$unit"
-      changed=1
-    else
-      rm -f "$tmp"
-    fi
-    systemctl --user daemon-reload
-    systemctl --user is-active --quiet "$unit" && was_active=1
-    # Switching from the cron fallback: stop the agentd it started by hand
-    # (never from under the agent itself: that would be this very command).
-    if (( ! was_active )) && [[ -z "${BOXEN_AGENT:-}" ]]; then
-      pkill -u "$ME" -xf "python3 $REPO_DIR/bin/boxen-agentd" 2>/dev/null || true
-    fi
-    systemctl --user enable --now "$unit" >/dev/null 2>&1 || die "couldn't start the boxen agent (systemctl --user status $unit)"
-    if (( was_active )) && [[ -z "${BOXEN_AGENT:-}" ]] && { (( changed )) || [[ -n "${BOXEN_SELF_UPDATE:-}" ]]; }; then
-      systemctl --user restart "$unit"
-    fi
-    # Without lingering, user services stop when the last session ends.
-    if [[ "$(loginctl show-user "$ME" -p Linger --value 2>/dev/null)" != yes ]]; then
-      loginctl enable-linger "$ME" 2>/dev/null \
-        || warn "couldn't enable lingering (loginctl enable-linger $ME); the agent stops when you log out"
-    fi
-    # A cron fallback from an earlier install isn't needed any more.
-    current=$(crontab -l 2>/dev/null || true)
-    if grep -qF "$tag" <<<"$current"; then
-      grep -vF "$tag" <<<"$current" | crontab -
-    fi
-    info "boxen agent: systemd user service $unit (socket in $boxen_home/agent)"
-    return 0
-  fi
-
-  command -v crontab >/dev/null || die "neither systemctl --user nor cron is available to run the boxen agent"
-  current=$(crontab -l 2>/dev/null || true)
-  {
-    if [[ -n "$current" ]]; then grep -vF "$tag" <<<"$current" || true; fi
-    printf '@reboot sleep 30 && %s %s\n' "$job" "$tag"
-  } | crontab -
-  if [[ -z "${BOXEN_AGENT:-}" ]]; then
-    pkill -u "$ME" -xf "python3 $REPO_DIR/bin/boxen-agentd" 2>/dev/null || true
-    sleep 0.5
-    BOXEN_HOME="$boxen_home" BOXEN_SRC="$boxen_src" nohup "$REPO_DIR/bin/boxen-agentd" >>"$boxen_home/agent.log" 2>&1 &
-    disown
-  fi
-  info "boxen agent: started with nohup and a cron @reboot line (no systemd user session here)"
-}
-
 [[ $EUID -ne 0 ]] || die "run as your normal user, not root (it uses sudo where needed)"
-# Run by the boxen agent (boxen self-update from the supervisor project):
-# there's no terminal, so sudo can't ask for a password. Steps that need it
-# are skipped with a note instead of dying half way.
-AGENT=${BOXEN_AGENT:-}
 # shellcheck source=/dev/null
 . /etc/os-release
-[[ "${ID:-}" == "ubuntu" ]] || die "expected Ubuntu, found '${ID:-unknown}'"
+[[ "${ID:-}" == ubuntu ]] || die "expected Ubuntu, found '${ID:-unknown}'"
+CODENAME=${UBUNTU_CODENAME:-$VERSION_CODENAME}
+ARCH=$(dpkg --print-architecture)
 
-# The snap build of Docker can't see hidden dirs in your home (~/.config/boxen).
-if snap list docker >/dev/null 2>&1 \
-   || [[ "$(readlink -f "$(command -v docker 2>/dev/null || echo /nonexistent)")" == /snap/* ]]; then
+if snap list docker >/dev/null 2>&1; then
   die "Docker is installed as a snap, which boxen can't use. Remove it with 'sudo snap remove docker', then re-run."
 fi
 
-# 0. Tools boxen itself uses on the VM (GitHub token minting and its cron job;
-#    tmux, a Python venv and vim for boxen ui).
-missing=()
-for pkg in ca-certificates curl git jq openssl cron tmux python3-venv vim; do
-  dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
-done
+# v1 projects (agents in containers, on the system Docker daemon) are still
+# here until `boxen migrate`: the system daemon stays on for them.
+v1_present() {
+  local f
+  for f in "$BOXEN_HOME"/projects/*/compose.yaml; do
+    [[ -f "$f" ]] || continue
+    grep -qxF '# boxen-format: 2' "$f" || return 0
+  done
+  return 1
+}
+
+apt_missing() {
+  local p out=()
+  for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || out+=("$p"); done
+  printf '%s\n' "${out[@]}"
+}
+
+# 0. Packages from Ubuntu: what boxen uses on the VM (tokens: curl, jq,
+#    openssl; boxen ui: tmux, a Python venv, vim), the sandbox's (bubblewrap,
+#    socat) and rootless Docker's (uidmap, dbus-user-session).
+mapfile -t missing < <(apt_missing ca-certificates curl git jq openssl gnupg tmux python3-venv vim \
+                                   bubblewrap socat uidmap dbus-user-session)
 if (( ${#missing[@]} )); then
-  if [[ -n "$AGENT" ]]; then
-    warn "new packages needed (${missing[*]}); run install.sh from a terminal on the VM to install them"
-  else
-    info "installing ${missing[*]}"
-    sudo apt-get update
-    sudo apt-get install -y "${missing[@]}"
-  fi
+  info "installing ${missing[*]}"
+  sudo apt-get update
+  sudo apt-get install -y "${missing[@]}"
 fi
 
-# boxen ui needs tmux 3.3 or newer (Ubuntu 24.04 has 3.4).
-if command -v tmux >/dev/null; then
-  tv=$(tmux -V 2>/dev/null || true)
-  if ! [[ "$tv" =~ ([0-9]+)\.([0-9]+) ]] \
-     || (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 3) )); then
-    warn "boxen ui needs tmux 3.3 or newer (this is ${tv:-an unknown version}); the boxen commands work without it"
-  fi
+# 1. The sandbox on Ubuntu 24.04: AppArmor stops bwrap from creating the
+#    user namespaces it needs unless it has a profile of its own (this one
+#    is from Claude Code's sandboxing docs; it covers bwrap itself, not what
+#    runs inside).
+if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == 1 ]] \
+   && [[ ! -f /etc/apparmor.d/bwrap ]]; then
+  info "adding an AppArmor profile so bwrap (Claude Code's sandbox) can create user namespaces"
+  sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+  sudo systemctl reload apparmor
 fi
 
-# 1. Docker CE + compose plugin, from Docker's own apt repo.
-if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
-  info "Docker already installed"
-elif [[ -n "$AGENT" ]]; then
-  warn "Docker CE with the compose plugin is needed; run install.sh from a terminal on the VM to install it"
-else
-  info "installing Docker CE from download.docker.com"
-  # Ubuntu's own Docker packages conflict with Docker CE.
+# 2. Docker CE with the rootless extras, from Docker's own apt repo.
+mapfile -t missing < <(apt_missing docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+                                   docker-compose-plugin docker-ce-rootless-extras)
+fresh_docker=0
+if (( ${#missing[@]} )); then
+  dpkg -s docker-ce >/dev/null 2>&1 || fresh_docker=1
+  info "installing Docker (${missing[*]}) from download.docker.com"
   for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
     if dpkg -s "$pkg" >/dev/null 2>&1; then
       info "removing conflicting package $pkg"
@@ -159,62 +98,131 @@ else
   sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
-Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Suites: $CODENAME
 Components: stable
-Architectures: $(dpkg --print-architecture)
+Architectures: $ARCH
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
   sudo apt-get update
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin
-  sudo systemctl enable --now docker
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+    docker-compose-plugin docker-ce-rootless-extras
+fi
+# boxen never uses the system daemon (root in its containers would be root on
+# the VM). A fresh install turns it off; with v1 projects still here it stays
+# on until `boxen migrate --cleanup`.
+if (( fresh_docker )) && ! v1_present; then
+  sudo systemctl disable --now docker.service docker.socket >/dev/null 2>&1 || true
 fi
 
-# 2. Let your user run docker without sudo.
-if id -nG "$ME" | tr ' ' '\n' | grep -qx docker; then
-  info "$ME is already in the docker group"
-elif [[ -n "$AGENT" ]]; then
-  warn "$ME isn't in the docker group; run install.sh from a terminal on the VM"
-else
-  info "adding $ME to the docker group"
-  sudo usermod -aG docker "$ME"
+# 3. Rootless Docker for you: subordinate IDs, the user daemon, lingering (so
+#    it runs without a login and after reboots), and cgroup delegation (so
+#    memory and CPU limits work, not just pids).
+if ! grep -q "^$ME:" /etc/subuid || ! grep -q "^$ME:" /etc/subgid; then
+  info "adding subordinate user and group IDs for $ME"
+  sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$ME"
+fi
+if [[ "$(loginctl show-user "$ME" -p Linger --value 2>/dev/null)" != yes ]]; then
+  sudo loginctl enable-linger "$ME"
+fi
+systemctl --user show-environment >/dev/null 2>&1 \
+  || die "systemd user services don't work in this session (log in over SSH as $ME, not with su or sudo, and re-run)"
+delegate=/etc/systemd/system/user@.service.d/delegate.conf
+if [[ ! -f "$delegate" ]]; then
+  info "delegating cgroup controllers to user services (memory and CPU limits; applies after a reboot)"
+  sudo mkdir -p "$(dirname "$delegate")"
+  printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee "$delegate" >/dev/null
+  sudo systemctl daemon-reload
+fi
+if ! systemctl --user is-active --quiet docker.service; then
+  info "setting up rootless Docker for $ME"
+  force=()
+  # Its setup tool won't run beside a reachable system daemon without
+  # --force (v1's, until `boxen migrate --cleanup`).
+  [[ ! -S /var/run/docker.sock ]] || force=(--force)
+  dockerd-rootless-setuptool.sh install "${force[@]}"
+  systemctl --user enable --now docker.service
+fi
+# Plain `docker` in your shell goes to the rootless daemon too (boxen sets
+# DOCKER_HOST itself either way).
+if docker context inspect rootless >/dev/null 2>&1 \
+   && [[ "$(docker context show 2>/dev/null)" != rootless ]]; then
+  docker context use rootless >/dev/null
 fi
 
-# 3. Put the boxen command on your PATH.
+# 4. The GitHub CLI and Claude Code, from their signed apt repos. Claude
+#    Code's key fingerprint is checked against the one Anthropic publishes.
+if ! dpkg -s gh >/dev/null 2>&1; then
+  info "installing the GitHub CLI"
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+  sudo apt-get update
+  sudo apt-get install -y gh
+fi
+if ! dpkg -s claude-code >/dev/null 2>&1; then
+  info "installing Claude Code"
+  tmpkey=$(mktemp)
+  curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o "$tmpkey"
+  gpg --show-keys --with-colons "$tmpkey" | grep -q '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE' \
+    || { rm -f "$tmpkey"; die "Claude Code's signing key doesn't have the published fingerprint; not installing"; }
+  sudo install -m 0644 "$tmpkey" /etc/apt/keyrings/claude-code.asc
+  rm -f "$tmpkey"
+  echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
+    | sudo tee /etc/apt/sources.list.d/claude-code.list >/dev/null
+  sudo apt-get update
+  sudo apt-get install -y claude-code
+fi
+
+# 5. boxen on your PATH, with its gh wrapper (each project's own token in
+#    ~/src) and boxen-carry (for /carry).
 mkdir -p "$BIN_DIR"
-chmod +x "$REPO_DIR/bin/boxen" "$REPO_DIR/bin/boxen-services"
+chmod +x "$REPO_DIR"/bin/* "$REPO_DIR/image/boxen-bg"
 ln -sfn "$REPO_DIR/bin/boxen" "$BIN_DIR/boxen"
-info "linked $BIN_DIR/boxen -> $REPO_DIR/bin/boxen"
+ln -sfn "$REPO_DIR/bin/boxen-gh" "$BIN_DIR/gh"
+ln -sfn "$REPO_DIR/bin/boxen-carry" "$BIN_DIR/boxen-carry"
+info "linked boxen, gh (boxen's wrapper) and boxen-carry into $BIN_DIR"
 
-# 4. Run boxen setup. This shell may predate the docker group change, so use
-#    sg if needed (the path goes through the environment to avoid quoting issues).
-export BOXEN_BIN="$REPO_DIR/bin/boxen"
-if docker info >/dev/null 2>&1; then
-  "$BOXEN_BIN" setup
-else
-  # shellcheck disable=SC2016  # expanded by sg's shell, on purpose
-  sg docker -c '"$BOXEN_BIN" setup'
+# 6. What boxen v1 ran on the VM: its agent service (the supervisor's
+#    listener) and cron lines.
+if systemctl --user cat boxen-agent.service >/dev/null 2>&1; then
+  systemctl --user disable --now boxen-agent.service >/dev/null 2>&1 || true
+  rm -f "$HOME/.config/systemd/user/boxen-agent.service"
+  systemctl --user daemon-reload
+  info "removed v1's boxen-agent service"
+fi
+if command -v crontab >/dev/null && crontab -l 2>/dev/null | grep -qF '# boxen-agent'; then
+  crontab -l | grep -vF '# boxen-agent' | crontab -
 fi
 
-# 5. The boxen agent, for the supervisor project (boxen supervisor).
-install_agent
+# 7. boxen setup: the base image, Claude settings and instructions, git
+#    settings for ~/src, the token timer, the serve service.
+"$REPO_DIR/bin/boxen" setup
 
-# 6. boxen ui's Python environment (Textual), rebuilt only when
-#    ui/requirements.txt changes. The CLI doesn't need it, so a failure here
-#    is a warning, retried on the next run.
-chmod +x "$REPO_DIR/ui/install-venv.sh"
+# 8. boxen ui's Python environment (Textual), rebuilt only when
+#    ui/requirements.lock changes. Everything else works without it.
 "$REPO_DIR/ui/install-venv.sh" \
   || warn "boxen ui isn't installed (see above); everything else works. Re-run install.sh to retry."
 
-# `boxen self-update` runs this too and prints its own summary.
 [[ -z "${BOXEN_SELF_UPDATE:-}" ]] || exit 0
 
-cat <<EOF
+if v1_present; then
+  cat <<EOF
+
+==> Installed. You have boxen v1 projects; move them with:
+    boxen migrate          (stops v1's containers; brings your Claude login, sessions and projects across)
+    boxen doctor           then check everything
+EOF
+else
+  cat <<EOF
 
 ==> Installed. Next:
     1. Log out and back in if 'boxen' isn't on your PATH yet.
-    2. boxen github                      connect GitHub
-    3. boxen new <name> [git-url]        add a project
-    4. boxen ui                          the dashboard (or keep using the commands)
-    5. boxen supervisor                  (optional) run boxen from the Claude app
+    2. claude                        sign in to Claude once (/login), then exit
+    3. boxen github                  connect GitHub
+    4. boxen new <name> [git-url]    add a project; boxen claude <name> to work in it
+    5. boxen doctor                  check the sandbox and rootless Docker
 EOF
+fi

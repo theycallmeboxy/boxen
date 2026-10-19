@@ -1,15 +1,14 @@
-# Project image for __NAME__, layered on the shared boxen base.
-# Add this project's toolchain here, then run `boxen update __NAME__` (or
-# `boxen update` inside the container, where this file is /boxen/Dockerfile).
-# Install outside the home folder (/opt, /usr/local): the home folder is a
-# volume that masks whatever the image puts there. Tools installed under the
-# home folder from inside the container persist without a rebuild.
-# End with USER __USER__: the container runs as that user either way.
-FROM boxen-base:latest
+# The build container for __NAME__: the toolchain this project builds and
+# runs with. Add what it needs, then apply with `boxen env apply` (from the
+# project folder). You're root here, so apt-get works directly; there's no
+# sudo and no need for USER lines.
+#
+# Install system packages and SDKs here, not at run time: anything outside
+# /root and the project folder is lost when the container is recreated.
+# (/root is a volume: what's installed there survives rebuilds.)
+FROM boxen-env:latest
 
 # Example:
-# USER root
 # RUN apt-get update \
 #  && apt-get install -y --no-install-recommends golang-go \
 #  && rm -rf /var/lib/apt/lists/*
-# USER __USER__

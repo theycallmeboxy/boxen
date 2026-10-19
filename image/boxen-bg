@@ -1,0 +1,86 @@
+#!/bin/sh
+# boxen-bg: background processes in a project's build container, for
+#   boxen run -d NAME cmd...     start   (boxen-bg start NAME cmd...)
+#   boxen run --logs NAME [-f]   logs    (boxen-bg logs NAME [N] [-f])
+#   boxen run --stop NAME        stop    (boxen-bg stop NAME)
+#   boxen run --ps               ps      (boxen-bg ps)
+# Each process runs in its own session (setsid), so stop ends it and
+# everything it started. Its output goes to /var/log/boxen-bg/NAME.log, its
+# exit code to NAME.rc. All of it lives in the container, so it's gone when
+# the container is recreated (boxen env apply, boxen update).
+set -u
+dir=${BOXEN_BG_DIR:-/var/log/boxen-bg}
+
+die() { printf 'boxen run: %s\n' "$*" >&2; exit 1; }
+valid() {
+  printf '%s\n' "$1" | grep -Eqx '[a-z0-9][a-z0-9_-]{0,31}' \
+    || die "name '$1': lowercase letters, digits, - and _, up to 32"
+}
+pid_of() { cat "$dir/$1.pid" 2>/dev/null || true; }
+alive() {
+  p=$(pid_of "$1")
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+  start)
+    [ $# -ge 2 ] || die "usage: boxen run -d NAME cmd..."
+    name=$1; shift
+    valid "$name"
+    if alive "$name"; then die "$name is already running (boxen run --stop $name first)"; fi
+    mkdir -p "$dir"
+    rm -f "$dir/$name.pid" "$dir/$name.rc"
+    printf '%s\n' "$*" > "$dir/$name.cmd"
+    # The shell writes its own pid (the session leader's), runs the command
+    # and records its exit code.
+    setsid sh -c 'echo $$ > "$0.pid"; "$@"; echo $? > "$0.rc"' "$dir/$name" "$@" \
+      > "$dir/$name.log" 2>&1 < /dev/null &
+    i=0
+    while [ ! -s "$dir/$name.pid" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    echo "$name: started (pid $(pid_of "$name")); output: boxen run --logs $name"
+    ;;
+  stop)
+    [ $# -eq 1 ] || die "usage: boxen run --stop NAME"
+    valid "$1"
+    alive "$1" || { echo "$1: not running"; exit 0; }
+    p=$(pid_of "$1")
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+    i=0
+    while kill -0 "$p" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$p" 2>/dev/null; then kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null; fi
+    echo "$1: stopped"
+    ;;
+  logs)
+    [ $# -ge 1 ] || die "usage: boxen run --logs NAME [-f] [--tail N]"
+    name=$1; shift
+    valid "$name"
+    [ -f "$dir/$name.log" ] || die "no process called $name (boxen run --ps lists them)"
+    n=200 follow=""
+    while [ $# -gt 0 ]; do
+      case $1 in
+        -f|--follow) follow=-f ;;
+        --tail) n=${2:-}; shift ;;
+        *) die "unknown option $1" ;;
+      esac
+      shift
+    done
+    printf '%s\n' "$n" | grep -Eqx '[0-9]{1,5}' || die "--tail needs a number"
+    exec tail -n "$n" $follow "$dir/$name.log"
+    ;;
+  ps)
+    found=0
+    for f in "$dir"/*.cmd; do
+      [ -e "$f" ] || continue
+      found=1
+      name=$(basename "$f" .cmd)
+      if alive "$name"; then st="running (pid $(pid_of "$name"))"
+      elif [ -f "$dir/$name.rc" ]; then st="exited ($(cat "$dir/$name.rc"))"
+      else st="stopped"; fi
+      printf '%-20s %-22s %s\n' "$name" "$st" "$(cat "$f")"
+    done
+    [ $found = 1 ] || echo "no background processes (start one: boxen run -d NAME cmd...)"
+    ;;
+  *) die "usage: boxen-bg start|stop|logs|ps" ;;
+esac

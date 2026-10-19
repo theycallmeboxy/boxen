@@ -1,7 +1,7 @@
 # Sidecar services for __NAME__: databases, caches, queues the project needs
-# next to its container. Each one runs on this project's own network, with
-# the service name as its hostname. Apply with `boxen restart __NAME__` (from
-# the VM, the supervisor, or inside this container: `boxen restart`).
+# next to its build container. Each one runs on this project's own network,
+# with the service name as its hostname, reachable from `boxen run` (not from
+# the VM itself). Apply with `boxen env apply` from the project folder.
 #
 # boxen checks this file before anything starts. Allowed per service:
 #   image (required)                 command, entrypoint, environment
@@ -9,14 +9,16 @@
 #   tmpfs (absolute paths)           healthcheck
 #   depends_on (other sidecars)      restart (default: unless-stopped)
 #   mem_limit, cpus                  stop_grace_period, labels, init
+#   read_only, cap_drop
 # Everything else is rejected: no ports, no host paths (volumes are named,
 # "pgdata" below, and stored as boxen.__NAME__.pgdata), no privileges, caps,
 # devices, network modes, build, env_file, the Docker socket. Values are
 # taken literally ($ isn't expanded). At most 8 services; names are
-# lowercase, not "claude", not starting with "boxen". To reach a sidecar
-# from the VM or the LAN, the user adds ports in compose.override.yaml.
+# lowercase, not "env", not starting with "boxen"; no volume called "home".
+# To reach a sidecar from the VM or the LAN, the user adds ports in
+# ~/.config/boxen/projects/__NAME__/compose.override.yaml.
 #
-# Example: a PostgreSQL server, at postgres:5432 from this container.
+# Example: a PostgreSQL server, at postgres:5432 from `boxen run`.
 #
 # services:
 #   postgres:

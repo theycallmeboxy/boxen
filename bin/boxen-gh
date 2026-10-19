@@ -1,0 +1,65 @@
+#!/bin/sh
+# boxen-gh: the GitHub CLI on the boxen VM (install.sh links it in as
+# ~/.local/bin/gh, ahead of /usr/bin/gh). Outside a project it's plain gh.
+# In a folder under ~/src/<project>, gh gets that project's own token,
+# read fresh on every call: the one for the owner of the repo it's about
+# (-R/--repo, else $GH_REPO, else this folder's origin), else the
+# project's default. It never falls back to your own gh login there: gh
+# runs with an empty config folder, so a repo outside the project's list
+# fails with GitHub's own error. The arguments go to gh unchanged.
+real=/usr/bin/gh
+[ -x "$real" ] || { echo "gh: $real not found (install.sh installs it)" >&2; exit 127; }
+
+home=${BOXEN_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/boxen}
+src=$(realpath -m "${BOXEN_SRC:-$HOME/src}")
+here=$(pwd -P)
+case "$here/" in
+  "$src"/?*/*) ;;
+  *) exec "$real" "$@" ;;
+esac
+rel=${here#"$src"/}
+proj=${rel%%/*}
+printf '%s\n' "$proj" | grep -Eqx '[a-z0-9]+([_-][a-z0-9]+)*' || exec "$real" "$@"
+grep -qxF '# boxen-format: 2' "$home/projects/$proj/compose.yaml" 2>/dev/null || exec "$real" "$@"
+dir=$home/projects/$proj/token
+
+repo="" next=""
+for a in "$@"; do
+  if [ -n "$next" ]; then repo=$a; next=""; continue; fi
+  case $a in
+    --) break ;;
+    -R|--repo) next=1 ;;
+    --repo=*) repo=${a#--repo=} ;;
+    -R?*) repo=${a#-R} ;;
+  esac
+done
+[ -n "$repo" ] || repo=${GH_REPO:-}
+[ -n "$repo" ] || repo=$(git remote get-url origin 2>/dev/null) || repo=""
+case $repo in
+  https://github.com/*)   r=${repo#https://github.com/} ;;
+  https://*@github.com/*) r=${repo#https://*@github.com/} ;;
+  git@github.com:*)       r=${repo#git@github.com:} ;;
+  ssh://git@github.com/*) r=${repo#ssh://git@github.com/} ;;
+  github.com/*)           r=${repo#github.com/} ;;
+  *://*|*/*/*)            r="" ;;
+  */*)                    r=$repo ;;
+  *)                      r="" ;;
+esac
+owner=$(printf '%s' "${r%%/*}" | tr 'A-Z' 'a-z')
+f=""
+if [ -n "$owner" ] && printf '%s\n' "$owner" | grep -Eqx '[a-z0-9]([a-z0-9_.-]{0,37}[a-z0-9_])?' \
+   && [ -s "$dir/gh-token.$owner" ]; then
+  f=$dir/gh-token.$owner
+elif [ -s "$dir/gh-token" ]; then
+  f=$dir/gh-token
+fi
+GH_TOKEN=""
+[ -z "$f" ] || GH_TOKEN=$(head -n 1 "$f")
+export GH_TOKEN
+# An empty config folder of its own (in the temp folder, which the sandbox
+# lets it write): no stored login to fall back on.
+GH_CONFIG_DIR=${TMPDIR:-/tmp}/boxen-gh-$(id -u)
+mkdir -p "$GH_CONFIG_DIR" 2>/dev/null && chmod 700 "$GH_CONFIG_DIR" 2>/dev/null
+export GH_CONFIG_DIR
+unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+exec "$real" "$@"

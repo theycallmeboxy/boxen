@@ -1,5 +1,5 @@
 #!/bin/bash
-# boxen-carry: runs inside a boxen container, for the /carry skill.
+# boxen-carry: for the /carry skill, on the boxen VM.
 #
 #   boxen-carry list                          earlier sessions in this folder (state: live, partial, carried, -)
 #   boxen-carry info <id-or-prefix>           one session's id, title, date, turns, chars, parts
@@ -12,7 +12,7 @@
 
 set -u
 
-CFG=${CLAUDE_CONFIG_DIR:?CLAUDE_CONFIG_DIR not set}
+CFG=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 # Claude Code files a folder's sessions under
 # projects/<path with every non-alphanumeric character as ->, as in boxen-sessions.
 keyof() { printf '%s/projects/%s' "$CFG" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
@@ -93,12 +93,10 @@ sdate() {
   printf '%s' "$d"
 }
 
-# IDs of conversations a Claude process in this container has open right
-# now. Each running Claude writes sessions/<pid>.json with its conversation
-# ID, PID, process start time and PID namespace; the folder is shared by
-# every project, so only entries from this container's namespace whose
+# IDs of conversations a Claude process has open right now. Each running
+# Claude writes sessions/<pid>.json with its conversation ID, PID, process
+# start time and PID namespace; only entries from this PID namespace whose
 # process is still the same one (start time matches) count.
-# Same as boxen-sessions running_ids(): keep the two in sync.
 running_ids() {
   local ns f id pid start dom
   ns=$(readlink /proc/self/ns/pid 2>/dev/null) || return 0
@@ -115,7 +113,12 @@ running_ids() {
 state() {
   local f
   grep -qxF "$1" <<<"$LIVE" && { echo live; return; }
-  [[ -e "$MEMDIR/carried/.${1:0:8}.notes.md" ]] && { echo partial; return; }
+  # A notes file whose first line is "done" is a finished carry's (the
+  # sandbox can't delete files there, so the skill marks it instead).
+  if [[ -f "$MEMDIR/carried/.${1:0:8}.notes.md" ]] \
+     && [[ "$(head -n 1 "$MEMDIR/carried/.${1:0:8}.notes.md" 2>/dev/null)" != done ]]; then
+    echo partial; return
+  fi
   for f in "$MEMDIR/carried/${1:0:8}"-*.md; do [[ -e $f ]] && { echo carried; return; }; done
   echo "-"
 }
