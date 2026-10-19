@@ -10,6 +10,9 @@
   home folder (a volume per project: conda/micromamba, cargo, go, npm and
   downloaded SDKs installed under `$HOME` survive rebuilds); `~/.claude`
   (shared by every project: memory, skills, settings).
+- Code goes in the project folder, the directory you started in: clones,
+  checkouts, build trees. `$HOME` is for tool installs only; it isn't
+  visible on the VM or to other projects, and `boxen rm` deletes it.
 - Doesn't persist: the rest of the container filesystem, rebuilt from
   `/boxen/Dockerfile` on `boxen update`. `boxen rm` (by the user) resets
   the home folder too.
