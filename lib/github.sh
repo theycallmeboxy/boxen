@@ -175,7 +175,7 @@ unlisted_repos() {
 
 # seed_repos NAME [REPO]: a project without a list gets one: REPO (what
 # `new` clones; none if empty), else the project's origin now if that's on
-# GitHub, else an empty list. Happens once (`new`, `setup`, or else the
+# GitHub, else an empty list. Happens once (`new`, `migrate`, or else the
 # first token refresh); after that, origin is never asked again.
 seed_repos() {
   local n=$1 repo=${2-} f

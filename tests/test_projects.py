@@ -255,7 +255,7 @@ def test_new_clone(vm):
                          "-c", "credential.https://github.com.helper=" + helper,
                          "-c", "credential.https://github.com.useHttpPath=true",
                          "clone", "--", "https://github.com/TheyCallMeBoxy/gamma.git", src]
-    assert g["cred"] == ""                 # no token: git gets nothing and fails on its own
+    assert g["cred"] == "quit=1\n"         # no token: git asks nobody else and fails on its own
     assert [x for x in (vm.pdir("gamma") / "repos").read_text().splitlines() if not x.startswith("#")] == \
         ["TheyCallMeBoxy/gamma"]
     assert (vm.src / "gamma" / ".boxen" / "Dockerfile").exists()

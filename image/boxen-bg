@@ -47,9 +47,14 @@ case $cmd in
     alive "$1" || { echo "$1: not running"; exit 0; }
     p=$(pid_of "$1")
     kill -s TERM -- "-$p" 2>/dev/null || kill -s TERM "$p" 2>/dev/null
+    # Wait for the whole group (a child can outlive its session leader),
+    # then KILL whatever of it is left.
     i=0
-    while kill -0 "$p" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
-    if kill -0 "$p" 2>/dev/null; then kill -s KILL -- "-$p" 2>/dev/null || kill -s KILL "$p" 2>/dev/null; fi
+    while { kill -s 0 -- "-$p" 2>/dev/null || kill -0 "$p" 2>/dev/null; } && [ $i -lt 100 ]; do
+      sleep 0.1; i=$((i + 1))
+    done
+    kill -s KILL -- "-$p" 2>/dev/null || true
+    kill -s KILL "$p" 2>/dev/null || true
     echo "$1: stopped"
     ;;
   logs)

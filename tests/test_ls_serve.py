@@ -33,11 +33,11 @@ def test_ls_json(vm):
         "container": {"state": "running", "status": "Up 2 hours"},
         "sidecars": [{"service": "db", "container": "boxen.alpha.db", "state": "exited",
                       "status": "Exited (1) 5 minutes ago"}],
-        "sessions": 0, "serve": "off", "github": "run boxen github", "repo": "theycallmeboxy/alpha",
+        "sessions": 0, "served": 0, "serve": "off", "github": "run boxen github", "repo": "theycallmeboxy/alpha",
         "repos": [{"repo": "theycallmeboxy/alpha", "state": "-", "origin": True},
                   {"repo": "myorg/x", "state": "-", "origin": False}]}
     assert beta == {"name": "beta", "path": str(vm.src / "beta"), "container": None, "sidecars": [],
-                    "sessions": 0, "serve": "off", "github": "-", "repo": None, "repos": []}
+                    "sessions": 0, "served": 0, "serve": "off", "github": "-", "repo": None, "repos": []}
     # one docker call for every container
     assert [c[0] for c in vm.docker_calls()] == ["ps"]
     assert vm.docker_calls()[0][:4] == ["ps", "-a", "--filter", "label=com.docker.compose.project"]
@@ -129,7 +129,25 @@ def test_ls_counts_sessions(vm, claude_procs):
     assert r.stdout.splitlines()[1].split()[:3] == ["alpha", "running", "2"]
     # another program isn't counted
     r = vm.fn("claude_counts | sort")
-    assert r.stdout == "alpha 2\nbeta 2\n"
+    assert r.stdout == "alpha 2 0\nbeta 2 0\n"
+
+
+def test_ls_counts_served_apart(vm, claude_procs):
+    """A Claude under a serve window (a `boxen serve-run NAME` among its
+    ancestors) counts as served, not as an interactive session."""
+    exe = vm.tmp / "procs" / "claude"
+    claude_procs(vm.src / "alpha")
+    # sh stays the parent (the `; true`), with serve-run alpha in its argv
+    p = subprocess.Popen(["sh", "-c", 'cd "$1" && "$2" 60; true', "sh", str(vm.src / "alpha"), str(exe),
+                          "serve-run", "alpha"])
+    try:
+        assert wait_for(lambda: vm.fn("claude_counts").stdout.strip() == "alpha 1 1")
+        doc = ls_json(vm)
+        assert [(x["name"], x["sessions"], x["served"]) for x in doc["projects"]][0] == ("alpha", 1, 1)
+    finally:
+        subprocess.run(["pkill", "-P", str(p.pid)])
+        p.kill()
+        p.wait()
 
 
 def test_ls_github_and_origin(vm):
@@ -247,9 +265,10 @@ def test_git_credential(vm):
     os.symlink(vm.tmp, vm.src / "beta" / "out")
     r = cred(vm, REQ % "myorg/x", cwd=vm.src / "beta" / "out")
     assert r.stdout == ""
-    # no tokens: nothing, quietly
+    # a project with no token: quit=1, so git asks no later helper (your own
+    # login in ~/.gitconfig) and fails
     r = cred(vm, REQ % "myorg/x", cwd=vm.src / "beta")
-    assert r.returncode == 0 and r.stdout == "" and r.stderr == ""
+    assert r.returncode == 0 and r.stdout == "quit=1\n" and r.stderr == ""
 
 
 def test_git_credential_project_option(vm):
@@ -259,8 +278,10 @@ def test_git_credential_project_option(vm):
     assert cred(vm, REQ % "a/b", cwd=vm.tmp, args=("--project", "beta", "get")).stdout == ANS % "BETA"
     # --project wins over the folder
     assert cred(vm, REQ % "a/b", args=("--project", "beta", "get")).stdout == ANS % "BETA"
-    for bad in ("../beta", "Beta", "beta/token", ""):
+    for bad in ("../beta", "Beta", "beta/token"):
         r = cred(vm, REQ % "a/b", cwd=vm.tmp, args=("--project", bad, "get"))
-        assert r.returncode == 0 and r.stdout == "", bad
+        assert r.returncode == 0 and r.stdout == "quit=1\n", bad
+    r = cred(vm, REQ % "a/b", cwd=vm.tmp, args=("--project", "", "get"))     # empty: the folder decides
+    assert r.returncode == 0 and r.stdout == ""
     r = cred(vm, REQ % "a/b", cwd=vm.tmp, args=("--project",))
     assert r.returncode == 0 and r.stdout == ""

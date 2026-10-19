@@ -52,10 +52,6 @@ SUGGEST_EVERY = 30          # `boxen repos NAME --suggest` for the selected proj
 # without DOCKER_HOST (bin/boxen), and this makes sure of it: nothing an
 # agent runs gets a way to the Docker daemon.
 CLAUDE_ARGV = ["env", "-u", "DOCKER_HOST", "claude"]
-# Control characters out of a followed log, as bin/boxen env_logs does, so a
-# sidecar's output can't drive your terminal.
-FOLLOW_SH = ("docker -H \"$1\" logs -f --tail 100 \"$2\" 2>&1 "
-             "| LC_ALL=C tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
 
 PROJECT_ACTIONS = [
     # (action, palette title, description)
@@ -1138,11 +1134,10 @@ class Dashboard(Screen):
         sc = self._sidecar(p, self._log_source)
         if sc is None:
             return
-        if self.cfg.docker_sock is None:
-            self.notify("Can't follow: %s" % self.cfg.docker_problem, severity="warning", markup=False)
-            return
+        # boxen env acts on the folder it runs in, and strips control
+        # characters, so a sidecar's output can't drive your terminal.
         self.open_window(window_name(p.name, "logs-" + sc.service),
-                         ["sh", "-c", FOLLOW_SH, "boxen-logs", "unix://" + self.cfg.docker_sock, sc.container])
+                         [self.cfg.boxen, "env", "logs", sc.service, "-f", "--tail", "100"], cwd=p.path)
 
     # files
 

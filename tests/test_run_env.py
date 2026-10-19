@@ -348,10 +348,12 @@ def test_env_logs(vm):
     calls = [c for c in vm.docker_calls() if c[0] == "logs"]
     assert calls[1:] == [["logs", "--tail", "5", "boxen.alpha.db"], ["logs", "--tail", "7", "boxen.alpha.db"],
                          ["logs", "--tail", "100", "boxen.alpha.env"]]
+    vm.ok("env", "logs", "db", "-f", "--tail", "3", cwd=a)        # follow
+    assert ["logs", "-f", "--tail", "3", "boxen.alpha.db"] in vm.docker_calls()
     vm.clear_logs()
     r = vm.boxen("env", "logs", "web", cwd=a)
     assert r.returncode == 1 and "no sidecar called 'web' (sidecars: db)" in r.stderr
-    for bad in (["--tail", "0"], ["--tail", "x"], ["--tail", "5001"], ["--tail"], ["--tail="], ["-f"]):
+    for bad in (["--tail", "0"], ["--tail", "x"], ["--tail", "5001"], ["--tail"], ["--tail="], ["-x"]):
         r = vm.boxen("env", "logs", "db", *bad, cwd=a)
         assert r.returncode == 1 and r.stderr.startswith("boxen: "), bad
     r = vm.boxen("env", "logs", cwd=a)

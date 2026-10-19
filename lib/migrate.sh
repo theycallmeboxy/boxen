@@ -107,7 +107,7 @@ migrate_claude() {
 v1_dockerfile() {
   printf '%s\n' "# Moved from boxen v1 by 'boxen migrate': FROM now names boxen-env, and the" \
                 "# USER lines are gone (you're root in v2's build container)."
-  sed -E -e 's/^([[:space:]]*FROM[[:space:]]+)boxen-base(:[A-Za-z0-9._-]+)?/\1boxen-env:latest/I' \
+  sed -E -e 's/^([[:space:]]*FROM[[:space:]]+(--[^[:space:]]+[[:space:]]+)*)boxen-base(:[A-Za-z0-9._-]+)?([[:space:]]|$)/\1boxen-env:latest\4/I' \
          -e '/^[[:space:]]*USER[[:space:]]/Id'
 }
 
@@ -129,7 +129,7 @@ migrate_project() {
     if [[ -f "$pdir/env/services.yaml" && ! -L "$pdir/env/services.yaml" ]]; then
       cp "$pdir/env/services.yaml" "$(bdir "$n")/services.yaml"
     fi
-    env_files "$n"
+    env_files "$n" || return 1
     echo "    $src/.boxen/: from v1's env/"
   else
     echo "    $src/.boxen/ exists already; left as it is"
@@ -141,7 +141,7 @@ migrate_project() {
   if [[ -f "$v1dir/compose.override.yaml" ]]; then
     echo "    your v1 compose.override.yaml is in $v1dir/ (it was for the 'claude' service; v2's is 'env')"
   fi
-  write_compose "$n"
+  write_compose "$n" || return 1
   mkdir_private "$(token_dir "$n")"
   seed_repos "$n"
   # Sidecar data (named boxen.<p>.<vol> on both daemons).

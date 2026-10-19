@@ -58,8 +58,13 @@ GH_TOKEN=""
 export GH_TOKEN
 # An empty config folder of its own (in the temp folder, which the sandbox
 # lets it write): no stored login to fall back on.
-GH_CONFIG_DIR=${TMPDIR:-/tmp}/boxen-gh-$(id -u)
-mkdir -p "$GH_CONFIG_DIR" 2>/dev/null && chmod 700 "$GH_CONFIG_DIR" 2>/dev/null
+# A folder someone else made first (in a shared /tmp) isn't used.
+GH_CONFIG_DIR=${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/boxen-gh-$(id -u)
+mkdir -p "$GH_CONFIG_DIR" 2>/dev/null
+if [ -L "$GH_CONFIG_DIR" ] || [ "$(stat -c %u "$GH_CONFIG_DIR" 2>/dev/null)" != "$(id -u)" ] \
+   || ! chmod 700 "$GH_CONFIG_DIR" 2>/dev/null; then
+  GH_CONFIG_DIR=$(mktemp -d) || exit 1
+fi
 export GH_CONFIG_DIR
 unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 exec "$real" "$@"

@@ -133,7 +133,7 @@ def test_new_from_clone_url_mints_and_clones_with_the_token(gh):
     assert listed(gh, "delta") == ["upstream/delta"]
     assert "isn't yours" in r.stdout and "boxen repos delta add" in r.stdout
     assert state(gh, "delta") == {"upstream/delta": "not-installed"}
-    assert gh.git_log()[-1]["cred"] == ""
+    assert gh.git_log()[-1]["cred"] == "quit=1\n"
     # yours but the app can't reach it: refused, cleaned up
     r = gh.boxen("new", "eps", "https://github.com/theycallmeboxy/private")
     assert r.returncode == 1 and "no GitHub token for theycallmeboxy/private, so it can't be cloned" in r.stderr

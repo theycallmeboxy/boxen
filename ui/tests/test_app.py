@@ -368,9 +368,8 @@ async def test_logs_tab_shows_sidecars_through_boxen_env(world):
         await pilot.press("f")
         await wait_for(pilot, lambda: w.tmux_calls("new-window"), what="follow window")
         name, cwd, script = new_window(w)
-        assert name == "caulker/logs-redis" and cwd == app.cfg.home
-        assert "logs -f" in script and "boxen.caulker.redis" in script and "unix://" + w.sock in script
-        assert "tr -d" in script                             # control characters out
+        assert name == "caulker/logs-redis" and cwd == os.path.join(w.src, "caulker")
+        assert "env logs redis -f --tail 100" in script
         await pilot.press("down")                            # beta: no sidecars
         await wait_for(pilot, lambda: "No sidecars" in screen_text(app), what="no sidecars")
         assert w.docker_calls() == []

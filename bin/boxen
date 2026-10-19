@@ -75,13 +75,14 @@ Projects (~/src/<name>)
   shell <name>                    A root shell in the project's build container
   up <name|all>                   Start a build container and its sidecars, applying any changes
   down <name|all>                 Stop them
-  rm <name> [--yes]               Remove the build container, image, sidecars and their data (keeps the code)
+  rm <name> [--yes]               Remove the build container, image, sidecars and their data, and boxen's
+                                  config for it (override, repo list, tokens); the code stays
   repos <name> [add|rm <owner/repo>...]   The GitHub repos a project's tokens cover
 
 In a project folder (what agents use; they act on the folder they're in)
   run [-C dir] cmd...             Run a command in the project's build container
   run -d NAME cmd... | --logs NAME [-f] | --stop NAME | --ps   Background processes there
-  env apply | show | logs <sidecar> [--tail N]   Apply .boxen/ changes; status; a sidecar's logs
+  env apply | show | logs <sidecar> [-f] [--tail N]   Apply .boxen/ changes; status; a sidecar's logs
 
 Setup and upkeep
   github [--reset] [--key f.pem]  Connect GitHub: your app, per-project tokens, commit identity
@@ -506,7 +507,7 @@ git_ident() { git config -f "$GITCONFIG" --get "user.$1" 2>/dev/null || true; }
 # SSH keys), and commits carry the boxen identity. Without NAME/EMAIL the
 # identity already there is kept.
 write_gitconfig() {
-  local name=${1:-$(git_ident name)} email=${2:-$(git_ident email)} tmp helper inc
+  local name=${1:-$(git_ident name)} email=${2:-$(git_ident email)} tmp helper inc last
   mkdir -p "$BOXEN_HOME"
   tmp=$(mktemp -p "$BOXEN_HOME" .gitconfig.XXXXXX)
   printf '%s\n' "# Written by boxen (boxen setup, boxen github); rewritten each time." \
@@ -521,8 +522,13 @@ write_gitconfig() {
   [[ -z "$email" ]] || git config -f "$tmp" user.email "$email"
   chmod 0644 "$tmp"
   mv -f "$tmp" "$GITCONFIG"
+  # The include goes last in ~/.gitconfig (moved there again at every
+  # setup), so its credential settings come after any of yours.
   inc="includeIf.gitdir:$SRC_ROOT/.path"
-  if ! git config --global --get-all "$inc" 2>/dev/null | grep -qxF "$GITCONFIG"; then
+  last=$(git config --global --get-regexp '.*' 2>/dev/null | tail -n 1 || true)
+  # (git prints section names in lower case)
+  if [[ "${last,,}" != "${inc,,} ${GITCONFIG,,}" ]]; then
+    git config --global --unset-all "$inc" 2>/dev/null || true
     git config --global --add "$inc" "$GITCONFIG"
     info "$HOME/.gitconfig: repos under $SRC_ROOT use boxen's git settings ($GITCONFIG)"
   fi
@@ -531,9 +537,11 @@ write_gitconfig() {
 # git-credential [--project NAME] get: the credential helper for github.com
 # in repos under ~/src (see write_gitconfig). The project is the one git
 # runs in (or NAME, for `new`'s clone); the token is the one for the
-# repo's owner, else the project's default. Prints nothing when there's no
-# token, so git fails with GitHub's own error. Runs inside the agent's
-# sandbox: it only reads.
+# repo's owner, else the project's default. With no token it answers
+# quit=1, so git asks no helper after it (a `credential.helper` you or
+# `gh auth setup-git` added to ~/.gitconfig later would otherwise hand the
+# agent your own login) and fails with an auth error. Outside a project it
+# says nothing. Runs inside the agent's sandbox: it only reads.
 cmd_git_credential() {
   local proj="" op line host="" path="" protocol="" owner dir token=""
   if [[ "${1:-}" == --project ]]; then proj=${2:-}; shift 2 || true; fi
@@ -547,7 +555,7 @@ cmd_git_credential() {
   done
   [[ "$op" == get && "$host" == github.com && ( -z "$protocol" || "$protocol" == https ) ]] || return 0
   if [[ -z "$proj" ]]; then proj=$(project_of_dir "$(pwd -P)") || return 0; fi
-  [[ "$proj" =~ ^[a-z0-9]+([_-][a-z0-9]+)*$ ]] || return 0
+  [[ "$proj" =~ ^[a-z0-9]+([_-][a-z0-9]+)*$ ]] || { echo quit=1; return 0; }
   dir=$(token_dir "$proj")
   owner=${path%%/*}
   owner=${owner,,}
@@ -555,7 +563,7 @@ cmd_git_credential() {
     token=$(head -n 1 "$dir/gh-token.$owner" 2>/dev/null || true)
   fi
   if [[ -z "$token" && -s "$dir/gh-token" ]]; then token=$(head -n 1 "$dir/gh-token" 2>/dev/null || true); fi
-  [[ -n "$token" ]] || return 0
+  [[ -n "$token" ]] || { echo quit=1; return 0; }
   printf 'username=x-access-token\npassword=%s\n' "$token"
 }
 
@@ -795,21 +803,25 @@ cmd_run() {
     esac
     [[ -d "$target" ]] || die "no such folder: $target"
   fi
+  case $mode in
+    exec) (( $# )) || die "usage: boxen run [-C dir] cmd...  (see boxen run --help)" ;;
+    bg)   (( $# )) || die "usage: boxen run -d NAME cmd..." ;;
+    stop) (( $# == 0 )) || die "usage: boxen run --stop NAME" ;;
+    ps)   (( $# == 0 )) || die "usage: boxen run --ps" ;;
+  esac
   ensure_running "$HERE"
   t=(-i)
   if [[ -t 0 && -t 1 ]]; then t=(-it); fi
   case $mode in
     exec)
-      (( $# )) || die "usage: boxen run [-C dir] cmd...  (see boxen run --help)"
       exec docker exec "${t[@]}" -w "$target" -e "TERM=${TERM:-dumb}" "$(env_name "$HERE")" \
         bash -lc 'exec "$@"' boxen-run "$@" ;;
     bg)
-      (( $# )) || die "usage: boxen run -d NAME cmd..."
       exec docker exec -i -w "$target" "$(env_name "$HERE")" \
         bash -lc 'exec boxen-bg start "$@"' boxen-run "$name" "$@" ;;
     logs) exec docker exec "${t[@]}" "$(env_name "$HERE")" boxen-bg logs "$name" "$@" ;;
-    stop) (( $# == 0 )) || die "usage: boxen run --stop NAME"; exec docker exec -i "$(env_name "$HERE")" boxen-bg stop "$name" ;;
-    ps)   (( $# == 0 )) || die "usage: boxen run --ps"; exec docker exec -i "$(env_name "$HERE")" boxen-bg ps ;;
+    stop) exec docker exec -i "$(env_name "$HERE")" boxen-bg stop "$name" ;;
+    ps)   exec docker exec -i "$(env_name "$HERE")" boxen-bg ps ;;
   esac
 }
 
@@ -829,7 +841,7 @@ cmd_env() {
     logs)
       shift
       env_logs "$n" "$@" ;;
-    *) die "usage: boxen env apply | show | logs <sidecar> [--tail N]" ;;
+    *) die "usage: boxen env apply | show | logs <sidecar> [-f] [--tail N]" ;;
   esac
 }
 
@@ -855,24 +867,25 @@ show_project() {
 }
 
 env_logs() {
-  local n=$1 svc=${2:-} tail=100 c
-  [[ -n "$svc" ]] || die "usage: boxen env logs <sidecar|env> [--tail N]"
+  local n=$1 svc=${2:-} tail=100 c follow=()
+  [[ -n "$svc" ]] || die "usage: boxen env logs <sidecar|env> [-f] [--tail N]"
   shift 2
   while (( $# )); do
     case $1 in
       --tail) tail=${2:-}; [[ -n "$tail" ]] || die "--tail needs a number of lines, 1 to 5000"; shift ;;
       --tail=*) tail=${1#--tail=} ;;
-      *) die "usage: boxen env logs <sidecar|env> [--tail N]" ;;
+      -f|--follow) follow=(-f) ;;
+      *) die "usage: boxen env logs <sidecar|env> [-f] [--tail N]" ;;
     esac
     shift
   done
   [[ "$tail" =~ ^[0-9]+$ ]] && (( tail >= 1 && tail <= 5000 )) || die "--tail needs a number of lines, 1 to 5000"
-  if [[ "$svc" != env ]] && ! sidecar_names "$n" | grep -qxF "$svc"; then
+  if [[ "$svc" != env ]] && ! sidecar_names "$n" | grep -xF "$svc" >/dev/null; then
     die "no sidecar called '$svc' (sidecars: $(sidecar_names "$n" | paste -sd' ' -))"
   fi
   c="boxen.$n.$svc"
   # Control characters stripped, so a log can't drive your terminal.
-  docker logs --tail "$tail" "$c" 2>&1 | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+  docker logs "${follow[@]}" --tail "$tail" "$c" 2>&1 | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
 }
 
 # ---------------------------------------------------------------- user commands
@@ -910,7 +923,7 @@ cmd_rm() {
     esac
     shift
   done
-  q="Remove $n's build container, image, sidecars and their data (volumes)? Code in $(src_dir "$n") (with .boxen/) and its Claude history stay."
+  q="Remove $n's build container, image, sidecars and their data (volumes), and boxen's config for it ($(proj_dir "$n"): your override, its repo list and tokens)? Code in $(src_dir "$n") (with .boxen/) and its Claude history stay."
   if (( ! yes )); then
     [[ -t 0 ]] || die "rm asks first; run it in a terminal, or add --yes"
     read -rp "$q [y/N] " ans
@@ -1047,27 +1060,40 @@ EOF
 
 # ---------------------------------------------------------------- ls
 
-# claude_counts: "project count" lines: Claude Code processes of yours by the
-# project their folder is in (each interactive session, and each server).
+# claude_counts: "project sessions served" lines: Claude Code processes of
+# yours by the project their folder is in, split into interactive sessions
+# and those under a serve window (a `boxen serve-run` among their
+# ancestors: the server and the sessions it starts).
 claude_counts() {
-  local p cwd n
-  local -A c=()
+  local p cwd n a i served
+  local -A c=() s=()
   for p in /proc/[0-9]*; do
     [[ -O "$p" ]] || continue
     [[ "$(cat "$p/comm" 2>/dev/null)" == claude ]] || continue
     cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
     n=$(project_of_dir "$cwd") || continue
-    c[$n]=$(( ${c[$n]:-0} + 1 ))
+    served=0
+    a=${p#/proc/}
+    for i in 1 2 3 4 5 6 7 8; do
+      a=$(awk '/^PPid:/ { print $2 }' "/proc/$a/status" 2>/dev/null) || break
+      [[ "$a" =~ ^[0-9]+$ ]] && (( a > 1 )) || break
+      if tr '\0' ' ' < "/proc/$a/cmdline" 2>/dev/null | grep -E ' serve-run [a-z0-9_-]+ ?$' >/dev/null; then
+        served=1; break
+      fi
+    done
+    if (( served )); then s[$n]=$(( ${s[$n]:-0} + 1 )); else c[$n]=$(( ${c[$n]:-0} + 1 )); fi
   done
-  for n in "${!c[@]}"; do printf '%s %s\n' "$n" "${c[$n]}"; done
+  for n in $(printf '%s\n' "${!c[@]}" "${!s[@]}" | sort -u); do
+    printf '%s %s %s\n' "$n" "${c[$n]:-0}" "${s[$n]:-0}"
+  done
 }
 
 # collect: what ls shows, per project, in L_* arrays.
-L_NAME=() L_ENV=() L_SESS=() L_SERVE=() L_GITHUB=() L_REPO=() L_REPOS=() L_RSTATES=() L_ORIGIN=() L_SIDE=()
+L_NAME=() L_ENV=() L_SESS=() L_SERVED=() L_SERVE=() L_GITHUB=() L_REPO=() L_REPOS=() L_RSTATES=() L_ORIGIN=() L_SIDE=()
 DOCKER_OK=1
 collect() {
   local i n line out proj cname state status svc dirs=() repos=() states=() wins
-  local -A envst=() side=() sess=()
+  local -A envst=() side=() sess=() served=()
   mapfile -t L_NAME < <(projects)
   if out=$(docker ps -a --filter label=com.docker.compose.project \
              --format '{{.Label "com.docker.compose.project"}}|{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null); then
@@ -1081,7 +1107,7 @@ collect() {
   else
     DOCKER_OK=0
   fi
-  while read -r n line; do sess[$n]=$line; done < <(claude_counts)
+  while read -r n line svc; do sess[$n]=$line; served[$n]=$svc; done < <(claude_counts)
   wins=$("${TMUX_CMD[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null || true)
   for n in "${L_NAME[@]}"; do dirs+=("$(src_dir "$n")"); done
   if (( ${#dirs[@]} )); then mapfile -t L_ORIGIN < <("$GITSCAN" origin "${dirs[@]}" 2>/dev/null || true); fi
@@ -1090,6 +1116,7 @@ collect() {
     L_ENV[i]=${envst[$n]:-}
     L_SIDE[i]=${side[$n]:-}
     L_SESS[i]=${sess[$n]:-0}
+    L_SERVED[i]=${served[$n]:-0}
     if serve_on "$n"; then
       if grep -qxF "$(serve_win "$n")" <<<"$wins"; then L_SERVE[i]=on; else L_SERVE[i]=stopped; fi
     else
@@ -1123,17 +1150,18 @@ cmd_ls() {
 #   {"version": 3, "docker": bool, "src": "~/src path",
 #    "projects": [{"name", "path", "container": {"state", "status"} | null,
 #                  "sidecars": [{"service", "container", "state", "status"}],
-#                  "sessions": N, "serve": "off"|"on"|"stopped",
+#                  "sessions": N (interactive Claude sessions), "served": N (Claude
+#                  processes under its serve window), "serve": "off"|"on"|"stopped",
 #                  "github", "repo": "owner/repo" | null,
 #                  "repos": [{"repo", "state", "origin"}]}],
 #    "v1": ["name", ...]}
-LS_FIELDS=10
+LS_FIELDS=11
 cmd_ls_json() {
   local i args=() v1=()
   collect
   for i in "${!L_NAME[@]}"; do
     args+=("${L_NAME[i]}" "${L_ENV[i]}" "${L_SIDE[i]}" "${L_SESS[i]}" "${L_SERVE[i]}"
-           "${L_GITHUB[i]}" "${L_REPO[i]}" "${L_REPOS[i]}" "${L_RSTATES[i]}" "${L_ORIGIN[i]}")
+           "${L_GITHUB[i]}" "${L_REPO[i]}" "${L_REPOS[i]}" "${L_RSTATES[i]}" "${L_ORIGIN[i]}" "${L_SERVED[i]}")
   done
   mapfile -t v1 < <(v1_projects)
   jq -n --argjson docker "$( (( DOCKER_OK )) && echo true || echo false)" --argjson nf "$LS_FIELDS" \
@@ -1147,6 +1175,7 @@ cmd_ls_json() {
         sidecars: ($v[2] | split(";") | map(select(. != "") | split("|")
                    | {service: .[0], container: "boxen.\($v[0]).\(.[0])", state: (.[1] // ""), status: (.[2] // "")})),
         sessions: ($v[3] | tonumber? // 0),
+        served: ($v[10] | tonumber? // 0),
         serve: $v[4], github: $v[5],
         repo: (if $v[6] == "" then null else $v[6] end),
         repos: ([$v[7] | words, ($v[8] | words)] | transpose
