@@ -58,6 +58,10 @@ approval_needed() {
 # Set from `--approve trust` (up, restart, new): answer the trust question
 # in agent mode instead of reporting it.
 APPROVE_TRUST=0
+# Set from `--prepare` (restart, update): validate and build only, don't
+# recreate anything; the project's own agent socket runs this first so the
+# session asking sees the errors before its container goes away.
+PREPARE=0
 
 # run_quiet LABEL cmd...: run a command with its output hidden. On failure,
 # print "LABEL failed:" and the last 40 lines of its output, and fail too.
@@ -83,7 +87,7 @@ Usage: boxen <command> [args]
   ls                                              List projects, their servers and GitHub tokens
   up <name|all>                                   Start, or apply env/compose changes; answers pending prompts
   down <name|all>                                 Stop
-  restart <name|all>                              Recreate the container (picks up env changes)
+  restart <name|all> [--prepare]                  Recreate the container (picks up env changes; --prepare: only check)
   logs <name> [-f] [--tail N]                     The Remote Control server's output
   show <name>                                     The project's environment: sidecars, Dockerfile, services.yaml
   shell <name>                                    Bash inside the container
@@ -92,7 +96,7 @@ Usage: boxen <command> [args]
   rm <name> [--yes]                               Remove container, image, config, tool installs and sidecar data (keeps the code)
   github [--reset] [--key f.pem]                  Connect GitHub: your app, per-project tokens, commit identity
   login                                           Sign in to Claude again (shared by every project)
-  update [name|all]                               Rebuild images: fresh base and every project, or one project
+  update [name|all] [--prepare]                   Rebuild images: fresh base and every project, or one project (--prepare: only build)
   self-update                                     Update boxen itself and apply it to every project
   import-mac                                      How to move your Claude Code work from a Mac
 EOF
@@ -1050,7 +1054,8 @@ start_project() {
   render_services "$n" || return $?
   refresh_project "$n" || true
   write_status "$n" || return $?
-  run_quiet "starting $n" dc "$n" up -d "$@" || return 1
+  # --remove-orphans: a sidecar dropped from services.yaml is stopped.
+  run_quiet "starting $n" dc "$n" up -d --remove-orphans "$@" || return 1
   sc=$(sidecar_names "$n")
   [[ -z "$sc" ]] || echo "$n: sidecars: $sc"
   wait_server "$n"
@@ -1509,18 +1514,40 @@ cmd_ls() {
   done < <(projects)
 }
 
-# start_opts [--approve trust]: the options up, restart and new take after
-# the name. In agent mode, --approve trust answers the folder's trust
-# question (see drive_prompts); from a terminal you answer it yourself.
+# start_opts [--approve trust] [--prepare]: the options up, restart and new
+# take after the name. In agent mode, --approve trust answers the folder's
+# trust question (see drive_prompts); from a terminal you answer it
+# yourself. --prepare (restart, update) stops after the checks.
 start_opts() {
   while (( $# )); do
     case $1 in
       --approve) [[ "${2:-}" == trust ]] || die "--approve takes 'trust' (e.g. boxen up <name> --approve trust)"; APPROVE_TRUST=1; shift ;;
       --approve=trust) APPROVE_TRUST=1 ;;
-      *) die "unknown option '$1' (options: --approve trust)" ;;
+      --prepare) PREPARE=1 ;;
+      *) die "unknown option '$1' (options: --approve trust, --prepare)" ;;
     esac
     shift
   done
+}
+
+# prepare_project NAME [--build]: everything a restart (or, with --build,
+# an update) checks and makes before recreating the container, and nothing
+# more: the env files are plain files, services.yaml passes (and
+# compose.services.yaml is written), the image builds. rc 2 on a rejected
+# environment, 1 on a failed build; the container is left as it is.
+prepare_project() {
+  local n=$1 f
+  fresh_compose "$n" || return 1
+  for f in Dockerfile services.yaml STATUS.md; do
+    [[ "$n" == supervisor && "$f" == services.yaml ]] && continue
+    env_path "$n" "$f" >/dev/null || return 2
+  done
+  render_services "$n" || return $?
+  if [[ "${2:-}" == --build ]]; then
+    run_quiet "building image for $n" dc "$n" build || return 1
+    check_image_user "$n"
+  fi
+  echo "$n: environment OK"
 }
 
 # An approval is for one project's question: never `up all --approve trust`.
@@ -1533,7 +1560,12 @@ no_approve_all() {
 }
 
 cmd_up()      { require_project "${1:-}"; start_opts "${@:2}"; start_project "$1"; }
-cmd_restart() { require_project "${1:-}"; start_opts "${@:2}"; start_project "$1" --force-recreate; }
+cmd_restart() {
+  require_project "${1:-}"
+  start_opts "${@:2}"
+  if (( PREPARE )); then prepare_project "$1"; return; fi
+  start_project "$1" --force-recreate
+}
 cmd_down() {
   require_project "${1:-}"
   run_quiet "stopping $1" dc "$1" down || return 1
@@ -1675,7 +1707,7 @@ update_one() {
   check_image_user "$n"
   refresh_project "$n" || true
   write_status "$n" || return $?
-  run_quiet "starting $n" dc "$n" up -d --force-recreate || return 1
+  run_quiet "starting $n" dc "$n" up -d --force-recreate --remove-orphans || return 1
   sc=$(sidecar_names "$n")
   [[ -z "$sc" ]] || echo "$n: sidecars: $sc"
   wait_server "$n" "rebuilt, "
@@ -1685,9 +1717,12 @@ cmd_update() {
   local n failed=() list=()
   if [[ -n "${1:-}" && "$1" != all ]]; then
     require_project "$1"
+    start_opts "${@:2}"
+    if (( PREPARE )); then prepare_project "$1" --build; return; fi
     update_one "$1"
     return
   fi
+  (( $# <= 1 )) || die "usage: boxen update [name|all] (--prepare with a name)"
   build_base --fresh || exit 1
   mapfile -t list < <(projects)
   for n in "${list[@]}"; do

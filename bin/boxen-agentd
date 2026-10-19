@@ -27,12 +27,14 @@ A project's socket is scoped to that project, and the project is the one
 whose socket took the connection, never anything in the request: `ls`,
 `show`, `logs`, `restart` and `update` for itself (a missing name is filled
 in; another project's name is refused), nothing else. `restart` and
-`update` recreate the container the client lives in, so they run detached:
-the reply comes at once, the command's output goes to
-$BOXEN_HOME/projects/<name>/agent.log, and the client going away doesn't
-end it; a project may ask for one of them once a minute. The projects
-folder is rescanned every 5 seconds: a new project gets a socket, a
-removed one loses it.
+`update` recreate the container the client lives in, so they go in two
+steps: `boxen <verb> <name> --prepare` (checks, renders, builds; nothing
+recreated) runs with its output streamed to the client, and only if it
+passes does `boxen restart <name>` run detached: the reply comes at once,
+the command's output goes to $BOXEN_HOME/projects/<name>/agent.log, and
+the client going away doesn't end it. A project may do that once a
+minute. The projects folder is rescanned every 5 seconds: a new project
+gets a socket, a removed one loses it.
 
 Installed as a systemd user service (boxen-agent.service) by install.sh.
 After an update of this file (boxen self-update, run through the agent
@@ -127,7 +129,7 @@ def check_start(args):
         return "needs a project name (or all)"
     if args[0] == "all" and "--approve" in args[1:]:
         return "approve one project at a time, not all"
-    return flags(args[1:], {"--approve": 1})
+    return flags(args[1:], {"--approve": 1, "--prepare": 0})
 
 
 def check_down(args):
@@ -155,9 +157,11 @@ def check_show(args):
 def check_update(args):
     if not args:
         return None
-    if len(args) != 1 or not name(args[0], allow_all=True):
+    if not name(args[0], allow_all=True):
         return "takes a project name or all, nothing else"
-    return None
+    if args[0] == "all" and args[1:]:
+        return "takes a project name or all, nothing else"
+    return flags(args[1:], {"--prepare": 0})
 
 
 def check_self_update(args):
@@ -503,15 +507,22 @@ def handle(conn, project=None):
             return
         try:
             if detached:
-                with state:
-                    last_apply[project] = time.monotonic()
-                # The container asking is the one about to be recreated:
-                # answer now, close, and run without a client.
-                reply(conn, [{"out": "%s: applying environment and restarting; this session "
-                                     "reconnects when the server is back" % project}, {"exit": 0}])
-                conn.close()
-                log(argv, "detached (output in projects/%s/agent.log)" % project, project)
-                rc, note = run_detached(argv, project)
+                # First the checks and the build, streamed like any other
+                # command, so the session asking sees what's wrong while
+                # it's still there. Only when they pass is the container,
+                # the one asking, recreated: answer, close, run detached.
+                rc, note = run(conn, argv + ["--prepare"])
+                if note or rc != 0:
+                    detached = False
+                else:
+                    with state:
+                        last_apply[project] = time.monotonic()
+                    reply(conn, [{"out": "%s: environment OK; restarting now — this session "
+                                         "reconnects when the server is back" % project}, {"exit": 0}])
+                    conn.close()
+                    argv = ["restart", project]
+                    log(argv, "detached (output in projects/%s/agent.log)" % project, project)
+                    rc, note = run_detached(argv, project)
             else:
                 rc, note = run(conn, argv)
         finally:

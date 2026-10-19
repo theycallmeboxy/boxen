@@ -10,7 +10,7 @@
 #   depends_on (other sidecars)      restart (default: unless-stopped)
 #   mem_limit, cpus                  stop_grace_period, labels, init
 # Everything else is rejected: no ports, no host paths (volumes are named,
-# "pgdata" below, and stored as boxen-__NAME__-pgdata), no privileges, caps,
+# "pgdata" below, and stored as boxen.__NAME__.pgdata), no privileges, caps,
 # devices, network modes, build, env_file, the Docker socket. Values are
 # taken literally ($ isn't expanded). At most 8 services; names are
 # lowercase, not "claude", not starting with "boxen". To reach a sidecar

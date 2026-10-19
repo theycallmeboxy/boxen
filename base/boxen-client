@@ -40,12 +40,16 @@ From a project's own container (%s), for this project only:
   restart                                   Apply /boxen/services.yaml: recreate this container
   update                                    Apply /boxen/Dockerfile: rebuild the image, recreate this container
 
-restart and update from a project recreate the container you're in: the
-reply comes at once, the work continues on the VM, and the session
-reconnects in about 30 seconds. When boxen prints "approval needed", ask
-the user before running the command it names. Anything not listed here
-needs a terminal on the VM.
-""" % (("this container", "not this one") if SUPERVISOR else ("not this one", "this container"))
+%s
+""" % ((("this container", "not this one",
+         'When boxen prints "approval needed", ask the user before running the\n'
+         'command it names. Anything not listed here needs a terminal on the VM.')
+        if SUPERVISOR else
+        ("not this one", "this container",
+         "restart and update from a project validate first (update builds the\n"
+         "image too) and print any errors here, with nothing restarted. Only when\n"
+         "that passes is this container recreated, detached: the session reconnects\n"
+         "in about 30 seconds. Anything not listed here doesn't work from here.")))
 
 
 def fail(msg, code=1):
