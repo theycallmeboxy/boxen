@@ -1,4 +1,3 @@
-!templates/*.env
 # Never commit secrets.
 *.env
 *.pem
