@@ -161,6 +161,7 @@ projects() {
 # project, or for every project when the name is "all". Each project runs in
 # a subshell, so one failing doesn't stop the rest; failures are listed at
 # the end (exit 3 if any of them was only waiting for an approval).
+EACH_ALL=0
 each() {
   local fn=$1
   shift
@@ -169,6 +170,7 @@ each() {
     return
   fi
   shift
+  EACH_ALL=1
   local n rc=0 failed=() list=()
   mapfile -t list < <(projects)
   (( ${#list[@]} )) || { info "no projects yet"; return 0; }
@@ -1014,7 +1016,12 @@ wait_server() {
   st=$(poll_server "$n")
   case $st in
     "not trusted"*|"waiting for an answer"*)
-      if agent_mode; then
+      if agent_mode && [[ "$n" == supervisor ]]; then
+        # drive_prompts stops the container to report the question, and
+        # nothing in the app could start the supervisor again.
+        echo "supervisor: needs an answer at a question; run 'boxen up supervisor' from a terminal on the VM"
+        return 3
+      elif agent_mode; then
         drive_prompts "$n" || return $?
         st=$(poll_server "$n")
       elif [[ -t 0 ]]; then
@@ -1568,6 +1575,12 @@ cmd_restart() {
 }
 cmd_down() {
   require_project "${1:-}"
+  # From the supervisor (agent mode), `down all` would stop the supervisor
+  # itself, and nothing in the app could start it again.
+  if agent_mode && (( EACH_ALL )) && [[ "$1" == supervisor ]]; then
+    echo "supervisor: left running (stop it from the VM)"
+    return 0
+  fi
   run_quiet "stopping $1" dc "$1" down || return 1
   echo "$1: stopped"
 }

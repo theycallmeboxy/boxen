@@ -7,94 +7,104 @@ disable-model-invocation: true
 
 # /carry: carry earlier conversations into this project's memory
 
-Earlier sessions in this folder are on disk as transcripts. Read the ones
-the user picks and write a handoff for each into the project's auto memory,
-so every later session here knows what happened. Transcripts are never
-changed; `boxen resume` still replays them exactly.
+Earlier sessions in this folder are on disk as transcripts. Read the ones the
+user picks and write a handoff for each into the project's auto memory, so
+later sessions here know what happened. Transcripts are never changed.
 
 Selection passed with the command, if any: $ARGUMENTS
+This conversation's own id: ${CLAUDE_SESSION_ID}
 
-## Steps
+## Setup
 
-1. Run `boxen-carry list`. Each line is
-   `N  id8  date  turns  parts  carried|-  title`.
-   - If it prints nothing: say there are no earlier conversations in this
-     project and stop.
-   - If `boxen-carry` isn't found: say this project's container predates
-     /carry and that running `boxen self-update` on the VM adds it. Stop.
-   - If a selection was passed with the command (above), use it: numbers,
-     ranges (`2-4`), `all`, or `new` (= every session not yet marked
-     carried). Otherwise show the list as a numbered table (date, turns,
-     parts, carried mark, title) and ask which to carry, in those same terms.
-     A session with several parts is read in full, part by part, so it costs
-     more to carry; say so in one line if any selected session has more than
-     one part.
-   - A session marked `carried` is skipped unless the user explicitly selects
-     it by number.
+1. `MEMDIR=$(boxen-carry memdir); mkdir -p "$MEMDIR/carried"`. If
+   `boxen-carry` isn't found, this container predates /carry: ask the user to
+   run `boxen self-update` (from the supervisor project or a VM terminal; it
+   rebuilds this container). Stop.
+2. `boxen-carry list`: tab-separated `N id8 date turns parts state title`,
+   newest first (turns = messages the user typed; a part is up to 60k chars).
+   The state is `live` (open in a running Claude right now, never carried;
+   this includes the conversation you're in), `partial` (a carry of it was
+   interrupted; resumable), `carried` (a `carried/<id8>-*.md` file exists)
+   or `-`. Nothing printed: say there are no earlier conversations here and
+   stop.
+3. Skip `live` sessions: never carry one that is open, and leave them out of
+   `all` and `new`. As a second guard, also drop the line whose id8 starts
+   this conversation's id (above).
+4. `partial` = an interrupted carry. Say so; `all` and `new` include them.
+5. Selection: from $ARGUMENTS (numbers, ranges `2-4`, `all`, `new` = every
+   session not marked `carried`), else show the list as a table (N, date,
+   turns, parts, state, title) and ask which, in those terms. A `carried`
+   session is skipped unless picked by number; if that leaves nothing, say so
+   and offer re-carrying by number. If a pick has parts > 1, say in one line
+   that it is read in full, part by part, and costs more.
 
-2. Run `boxen-carry memdir` once; call its output `<memdir>`, then
-   `mkdir -p "<memdir>/carried"`.
+## Per session, oldest first
 
-3. For each chosen session, oldest first, run `boxen-carry info <id8>` to
-   learn its `parts` count M (and id, title, date, turns). Let
-   `<notes>` = `<memdir>/carried/.<id8>.notes.md`.
-   - If `<notes>` exists, this session's carry was interrupted earlier: tell
-     the user you're resuming, read the notes, and continue from the part
-     after the `last part read: K` recorded at its top.
-   - If M == 1: run `boxen-carry read <id8>` and write the handoff file
-     (below) from it directly.
-   - If M > 1: for K = 1..M (or from the resume point), run
-     `boxen-carry read <id8> --part K`, then update `<notes>`: first line
-     `last part read: K`, then bullets under the six headings Goal, What was
-     done, Decisions and why, Open items, Gotchas and things learned, Key
-     files. Carry earlier bullets forward and revise them (an open item that
-     a later part closed moves to "What was done") rather than repeating;
-     keep the notes under ~150 lines by condensing. After the last part,
-     write the handoff file from the notes, then delete `<notes>`.
-   - In what you read, a `## Earlier context (compaction summary)` section is
-     Claude's own recap of a part that was trimmed earlier; `[tools: …]`
-     lines name the tools a turn used.
-   - Write `<memdir>/carried/<id8>-<slug>.md`, slug = the title in lowercase
-     with runs of anything but letters and digits as `-`, at most 40 chars.
-     Use exactly this structure:
+1. `boxen-carry info <id8>`: `id`, `title`, `date`, `turns`, `chars`, `parts`
+   (M). NOTES = `$MEMDIR/carried/.<id8>.notes.md`.
+2. If NOTES exists: say you're resuming, read it, and continue from the part
+   after its first line `last part read: K`. Otherwise start at part 1.
+3. M == 1: `boxen-carry read <id8>`. M > 1: `boxen-carry read <id8> --part K`
+   for each K in order (the footer names the next command). After every part
+   rewrite NOTES: `last part read: K`, then bullets under the headings below,
+   carried forward and revised (an open item a later part closed moves to
+   Outcome), under 150 lines. Every part is read; never summarize one you
+   haven't read in this run or in NOTES.
+4. What you read: `## You` / `## Claude` turns, Claude's text, `[tools: …]`
+   lines (one entry per tool use: `Bash: <command>` (first 120 chars),
+   `Edit`/`Write`/`Read`/`NotebookEdit: <file path>`, other tools by name;
+   outputs are not in the transcript, so results come from the prose), and
+   `## Earlier context (compaction summary)` = Claude's own recap of a
+   trimmed stretch. Commands and paths can be exact: take them from there.
+5. Title: if `title` is a slash command (`/model`), empty or under three
+   words, use one you derive from the content instead (what the session was
+   about, 60 chars max), everywhere below.
+6. Write `$MEMDIR/carried/<id8>-<slug>.md` (slug: title lowercased, runs of
+   anything but letters and digits as `-`, trimmed of `-`, 40 chars max). If
+   another `<id8>-*.md` exists, `mv` it onto the new name first: one file per
+   session. Exactly this structure:
 
-     ```
-     ---
-     type: project
-     description: <one-line gist>
-     ---
-     # <title>  (session <id8>, <date>)
-     ## Goal
-     ## What was done
-     ## Decisions and why
-     ## Open items
-     ## Gotchas and things learned
-     ## Key files
-     ```
+   ```
+   ---
+   type: project
+   description: <one line: the topics (words a later search would use) and the outcome>
+   ---
+   # <title>  (session <id8>, <date>, <turns> turns)
+   ## Goal
+   ## Outcome
+   ## Decisions
+   ## Tried and dropped
+   ## Commands and paths that worked
+   ## Open items and questions
+   ## Where it stopped
+   ```
 
-     Each section 1-8 bullets, concrete: file paths, commands, numbers, error
-     messages. Omit a section only if it's truly empty.
+   - Decisions: `- <what> — because <why>; instead of <alternative>`.
+   - Tried and dropped: what failed or was rejected, with the error or reason.
+   - Commands and paths: exact commands, flags, file paths, URLs, numbers and
+     error strings as the transcript has them; nothing reconstructed.
+   - Where it stopped: the last exchange in 1-3 bullets: what was asked or
+     promised last and whether it was done.
+   - 1-8 bullets per section; drop a section only if it is empty. A session
+     that was all exploration gets two bullets saying so. Quote, don't guess.
+   - Then delete NOTES.
+7. `$MEMDIR/MEMORY.md`: under `## Carried over from earlier sessions` (create
+   it at the end; create the file if missing) one line
+   `- [<title>](carried/<file>) — <date>: <description>`, replacing the line
+   for the same `<id8>` if there is one. Claude Code loads only the first 200
+   lines or 25KB of MEMORY.md, so keep it under that; when the section has 30
+   lines, replace its 10 oldest with one line:
+   `- <n> older sessions, <first date> to <last date>: ls carried/`.
 
-4. After each file, add one line to `<memdir>/MEMORY.md` under a
-   `## Carried over from earlier sessions` heading (create the heading at the
-   end of the file if it's missing; create the file if it's missing):
-   `- [<title>](carried/<file>) — <date>: <one-line gist>`.
-   Keep MEMORY.md under 200 lines or 25KB, whichever comes first. If that
-   section already has 30 entries, say so and stop adding lines to it (the
-   carried files still exist and are still worth writing).
+## Finish
 
-5. Finish with a short "Where things stand" in chat: 3-8 bullets merging the
-   open items across everything carried this time, then ask what to pick up.
-   Don't re-list every file.
+"Where things stand" in chat: 3-8 bullets merging the open items across what
+was carried this time, then ask what to pick up. Don't re-list every file.
 
 ## Rules
 
-- Never modify or delete transcript files (`*.jsonl`).
-- Never summarize a part you have not read in this run or in the notes, and
-  never skip parts: every part of a chosen session is read, in order.
-- Check for `<notes>` before reading part 1; a resumed carry continues from
-  the notes, it doesn't start over.
-- Never delete a carried file; re-carrying a session overwrites its own file
-  only.
-- Quote the transcript, don't guess: if a session was all exploration with no
-  outcome, say so in two bullets rather than inventing decisions.
+- Never modify or delete transcript files (`*.jsonl`). Never delete a carried
+  file except by renaming it for the same session.
+- Check NOTES before part 1; a resumed carry continues, it doesn't start over.
+- Sections hold what the transcript says, in its words: no invented
+  decisions, no reconstructed commands.

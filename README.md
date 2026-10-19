@@ -138,7 +138,9 @@ supervisor's instructions (its read-only `CLAUDE.md`), not by the listener,
 which accepts `--approve trust` and `--yes` from the container. It guards
 against mistakes and casual injection, not a fully compromised supervisor
 session. `down all`, `restart all` and `update` need no approval and are
-disruptive. Every request goes to `~/.config/boxen/agent.log`.
+disruptive; `down all` from the supervisor leaves the supervisor itself
+running, so the app can't lock itself out. Every request goes to
+`~/.config/boxen/agent.log`.
 
 ## Moving from a Mac
 

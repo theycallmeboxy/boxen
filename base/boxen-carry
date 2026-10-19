@@ -1,7 +1,7 @@
 #!/bin/bash
 # boxen-carry: runs inside a boxen container, for the /carry skill.
 #
-#   boxen-carry list                          earlier sessions in this folder
+#   boxen-carry list                          earlier sessions in this folder (state: live, partial, carried, -)
 #   boxen-carry info <id-or-prefix>           one session's id, title, date, turns, chars, parts
 #   boxen-carry read <id-or-prefix> [--part K]   one session as plain text (part K of M)
 #   boxen-carry memdir                        this project's auto-memory dir
@@ -93,21 +93,43 @@ sdate() {
   printf '%s' "$d"
 }
 
-carried() {
+# IDs of conversations a Claude process in this container has open right
+# now. Each running Claude writes sessions/<pid>.json with its conversation
+# ID, PID, process start time and PID namespace; the folder is shared by
+# every project, so only entries from this container's namespace whose
+# process is still the same one (start time matches) count.
+# Same as boxen-sessions running_ids(): keep the two in sync.
+running_ids() {
+  local ns f id pid start dom
+  ns=$(readlink /proc/self/ns/pid 2>/dev/null) || return 0
+  for f in "$CFG"/sessions/*.json; do
+    [[ -f $f ]] || continue
+    IFS=$'\t' read -r id pid start dom < <(jq -r '[.sessionId, .pid, .procStart, .pidDomain] | map(. // "" | tostring) | @tsv' "$f" 2>/dev/null) || continue
+    [[ -n $id && $pid =~ ^[0-9]+$ && $dom == *":$ns" ]] || continue
+    [[ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)" == "$start" ]] && printf '%s\n' "$id"
+  done
+}
+
+# state ID: live (a running Claude has it open: never carry it), partial
+# (a carry of it was interrupted; its notes file is there), carried, or -.
+state() {
   local f
+  grep -qxF "$1" <<<"$LIVE" && { echo live; return; }
+  [[ -e "$MEMDIR/carried/.${1:0:8}.notes.md" ]] && { echo partial; return; }
   for f in "$MEMDIR/carried/${1:0:8}"-*.md; do [[ -e $f ]] && { echo carried; return; }; done
   echo "-"
 }
 
-# N  id8  date  turns  parts  carried|-  title
+# N  id8  date  turns  parts  live|partial|carried|-  title
 cmd_list() {
   local id p i=0
+  LIVE=$(running_ids)
   for id in $(sessions); do
     p=$(title "$id")
     [[ -n $p ]] || continue            # empty, never-used session
     i=$((i + 1))
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "${id:0:8}" "$(sdate "$id")" "$(turns "$id")" \
-      "$(render_convo "$id" | MODE=count parts_perl)" "$(carried "$id")" "$p"
+      "$(render_convo "$id" | MODE=count parts_perl)" "$(state "$id")" "$p"
   done
 }
 
@@ -125,10 +147,20 @@ find_id() {
 }
 
 # The conversation as text: "## You" / "## Claude" turns, Claude's text
-# blocks, and a line naming the tools it used. Tool results are left out; a
-# compaction summary (Claude's own recap of an earlier, trimmed part) is kept
-# under its own heading.
+# blocks, and a line naming the tools it used, with the inputs a handoff
+# needs: the command for Bash (first 120 chars), the path for Edit, Write,
+# Read and NotebookEdit; one entry per use in order, exact repeats within a
+# turn dropped, the line capped at 400 chars. Tool results are left out; a
+# compaction summary (Claude's own recap of an earlier, trimmed part) is
+# kept under its own heading.
 CONVO="$JQ_DEFS"'
+  def tool_entry:
+    if .name == "Bash" then "Bash: " + ((.input.command // "" | tostring) | gsub("[\\r\\n]+"; " ") | .[0:120])
+    elif (.name == "Edit" or .name == "Write" or .name == "Read" or .name == "NotebookEdit")
+      then .name + ": " + (.input.file_path // "" | tostring)
+    else .name end;
+  def dedup: reduce .[] as $e ([]; if index([$e]) then . else . + [$e] end);
+  def tools_line: "[tools: " + join("; ") + "]" | if length > 400 then .[0:399] + "\u2026" else . end;
   if .type == "user" and .isMeta == true then empty
   elif .type == "user" and .isCompactSummary == true then
     (blocks | join("\n") | gsub("^\\s+|\\s+$"; "")) as $t
@@ -141,12 +173,12 @@ CONVO="$JQ_DEFS"'
      | if type == "string" then {text: ., tools: []}
        elif type == "array" then
          {text: (map(select(.type == "text") | .text) | join("\n")),
-          tools: (map(select(.type == "tool_use") | .name) | unique)}
+          tools: (map(select(.type == "tool_use") | tool_entry) | dedup)}
        else {text: "", tools: []} end) as $m
     | if $m.text == "" and ($m.tools | length) == 0 then empty
       else "## Claude\n"
            + (if $m.text != "" then $m.text + "\n" else "" end)
-           + (if ($m.tools | length) > 0 then "[tools: \($m.tools | join(", "))]\n" else "" end)
+           + (if ($m.tools | length) > 0 then ($m.tools | tools_line) + "\n" else "" end)
       end
   else empty end'
 
