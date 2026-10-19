@@ -1,5 +1,6 @@
+!templates/*.env
 # Never commit secrets.
 *.env
-!templates/*.env
 *.pem
+.pytest_cache/
 __pycache__/

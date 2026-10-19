@@ -114,9 +114,10 @@ if snap list docker >/dev/null 2>&1 \
   die "Docker is installed as a snap, which boxen can't use. Remove it with 'sudo snap remove docker', then re-run."
 fi
 
-# 0. Tools boxen itself uses on the VM (GitHub token minting and its cron job).
+# 0. Tools boxen itself uses on the VM (GitHub token minting and its cron job;
+#    tmux, a Python venv and vim for boxen ui).
 missing=()
-for pkg in ca-certificates curl git jq openssl cron; do
+for pkg in ca-certificates curl git jq openssl cron tmux python3-venv vim; do
   dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
 if (( ${#missing[@]} )); then
@@ -126,6 +127,15 @@ if (( ${#missing[@]} )); then
     info "installing ${missing[*]}"
     sudo apt-get update
     sudo apt-get install -y "${missing[@]}"
+  fi
+fi
+
+# boxen ui needs tmux 3.3 or newer (Ubuntu 24.04 has 3.4).
+if command -v tmux >/dev/null; then
+  tv=$(tmux -V 2>/dev/null || true)
+  if ! [[ "$tv" =~ ([0-9]+)\.([0-9]+) ]] \
+     || (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 3) )); then
+    warn "boxen ui needs tmux 3.3 or newer (this is ${tv:-an unknown version}); the boxen commands work without it"
   fi
 fi
 
@@ -189,6 +199,13 @@ fi
 # 5. The boxen agent, for the supervisor project (boxen supervisor).
 install_agent
 
+# 6. boxen ui's Python environment (Textual), rebuilt only when
+#    ui/requirements.txt changes. The CLI doesn't need it, so a failure here
+#    is a warning, retried on the next run.
+chmod +x "$REPO_DIR/ui/install-venv.sh"
+"$REPO_DIR/ui/install-venv.sh" \
+  || warn "boxen ui isn't installed (see above); everything else works. Re-run install.sh to retry."
+
 # `boxen self-update` runs this too and prints its own summary.
 [[ -z "${BOXEN_SELF_UPDATE:-}" ]] || exit 0
 
@@ -198,5 +215,6 @@ cat <<EOF
     1. Log out and back in if 'boxen' isn't on your PATH yet.
     2. boxen github                      connect GitHub
     3. boxen new <name> [git-url]        add a project
-    4. boxen supervisor                  (optional) run boxen from the Claude app
+    4. boxen ui                          the dashboard (or keep using the commands)
+    5. boxen supervisor                  (optional) run boxen from the Claude app
 EOF

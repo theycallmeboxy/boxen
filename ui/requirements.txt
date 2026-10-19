@@ -1,0 +1,3 @@
+# boxen ui's direct dependency. What's installed is requirements.lock (every
+# package pinned with hashes), generated from this file: see its header.
+textual==8.2.8

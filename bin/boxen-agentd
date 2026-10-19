@@ -19,7 +19,10 @@ before anything runs; what passes is run as [bin/boxen, *argv] with
 BOXEN_AGENT=1, no shell, stdin from /dev/null, in $HOME, 30 minutes each.
 One command per project at a time, and one at a time for the commands that
 touch everything (all, update, self-update, new, rm): a request that would
-overlap gets "busy". Every request is logged to $BOXEN_HOME/agent.log. No
+overlap gets "busy". bin/boxen also locks each project it changes (and
+update/self-update globally) against every other caller, a terminal or
+boxen ui included, so a request can get "boxen: <name> is busy" (exit 2)
+from boxen itself too. Every request is logged to $BOXEN_HOME/agent.log. No
 Claude runs on the VM: this is a dumb relay, and the policy is here, not
 in the container.
 
@@ -279,6 +282,8 @@ global_job = [None]       # argv of the global job running (or waiting)
 project_jobs = {}         # project -> argv
 readers = [0]
 last_apply = {}           # project -> monotonic time of its last self restart/update
+last_empty = {}           # project -> monotonic time an empty connection was last logged
+EMPTY_LOG_EVERY = 60.0
 log_lock = threading.Lock()
 started_mtime = os.stat(os.path.realpath(__file__)).st_mtime
 
@@ -469,6 +474,20 @@ def handle(conn, project=None):
             if not chunk:
                 break
             data += chunk
+        # A connection that sends nothing: on the supervisor's socket, a
+        # liveness probe (boxen ui checks the listener this way): no reply,
+        # nothing logged. On a project's socket nothing probes, so it's
+        # logged, at most once a minute per project.
+        if not data.strip():
+            if project is not None:
+                now = time.monotonic()
+                with state:
+                    quiet = now - last_empty.get(project, -EMPTY_LOG_EVERY) < EMPTY_LOG_EVERY
+                    if not quiet:
+                        last_empty[project] = now
+                if not quiet:
+                    log("", "empty connection (no request; logged once a minute)", project)
+            return
         if not peer_ok(conn):
             reply(conn, [{"error": "not you"}, {"exit": 2}])
             return
@@ -598,7 +617,19 @@ def project_sock(project):
     return os.path.join(PROJECTS_DIR, project, "agent", "agent.sock")
 
 
+def close_inherited():
+    """Close every descriptor but stdin/out/err that whoever started the
+    agent left open: started from boxen (self-update runs install.sh), it
+    could otherwise hold boxen's lock files for as long as it runs."""
+    try:
+        top = os.sysconf("SC_OPEN_MAX")
+    except (ValueError, OSError):
+        top = 65536
+    os.closerange(3, top if top > 3 else 65536)
+
+
 def main():
+    close_inherited()
     os.makedirs(BOXEN_HOME, exist_ok=True)
     sel = selectors.DefaultSelector()
     srv = bind(SOCK)

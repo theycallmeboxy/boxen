@@ -1,0 +1,187 @@
+"""Editing a project's file (Files tab, e) without trusting its path.
+
+The file can live where the project's container writes (env/, the code
+folder), so the editor never gets the real path: the dashboard reads the
+file without following links (files.py) into a private folder (0700) and
+opens the editor on that copy in a tmux window, which runs
+
+    python -P -m boxen_ui.edit <private folder>/spec.json
+
+That runs the editor (vim with modelines off: a file can't set options),
+and when it exits writes the copy back the way bin/boxen's write_env does:
+to a temp file next to it (in the project folder for env/ files, where the
+container can't reach), then a rename over the target, which replaces a
+link put there meanwhile rather than following it. Only when the content
+changed, and only if the target is still a plain file with the content the
+copy started from (else the copy is kept and the window says where). The
+outcome goes to result.json in the private folder for the dashboard.
+"""
+import hashlib
+import json
+import os
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+
+from . import files
+
+VIM_NAMES = ("vim", "vi", "nvim", "view", "vim.basic", "vim.tiny", "vim.nox", "vim.gtk3")
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest() if data is not None else None
+
+
+def private_dir(env=None):
+    env = os.environ if env is None else env
+    base = env.get("XDG_RUNTIME_DIR")
+    try:
+        st = os.stat(base) if base else None
+    except OSError:
+        st = None
+    if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        base = None
+    return tempfile.mkdtemp(prefix="boxen-ui-edit-", dir=base)      # mode 0700
+
+
+def prepare(project, label, target, proj_dir, env_file, editor, env=None):
+    """Copy target into a private folder; returns the spec (a dict, also
+    written to spec.json there). Raises files.Refused or OSError."""
+    name = os.path.basename(target)
+    if env_file:
+        text = files.read_env_file(proj_dir, name, limit=1024 * 1024)
+    else:
+        text = files.read_file(target, limit=1024 * 1024)
+    data = text.encode("utf-8") if text is not None else None
+    d = private_dir(env)
+    copy = os.path.join(d, name)
+    fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data or b"")
+    spec = {"project": project, "label": label, "target": target, "proj_dir": proj_dir,
+            "env_file": bool(env_file), "copy": copy, "orig_sha": _sha(data), "editor": list(editor),
+            "dir": d, "result": os.path.join(d, "result.json")}
+    with open(os.path.join(d, "spec.json"), "w") as f:
+        json.dump(spec, f)
+    return spec
+
+
+def editor_cmd(editor, copy):
+    argv = list(editor)
+    if os.path.basename(argv[0]) in VIM_NAMES:
+        argv += ["--cmd", "set nomodeline"]
+    return argv + [copy]
+
+
+def _open_dir(path):
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _unlink_if(name, dfd, st):
+    """Remove our temp file, if name still is it."""
+    try:
+        cur = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if st is None or (cur.st_dev, cur.st_ino) == (st.st_dev, st.st_ino):
+            os.unlink(name, dir_fd=dfd)
+    except OSError:
+        pass
+
+
+def write_back(spec, new):
+    """Put new (bytes) in place of spec's target. Returns {"status":
+    unchanged|written|conflict|refused, "message"}."""
+    if _sha(new) == spec["orig_sha"] or (spec["orig_sha"] is None and new == b""):
+        return {"status": "unchanged", "message": "no changes"}
+    target = spec["target"]
+    name = os.path.basename(target)
+    try:
+        dfd = _open_dir(os.path.join(spec["proj_dir"], "env") if spec["env_file"] else os.path.dirname(target))
+    except OSError as e:
+        return {"status": "refused", "message": "%s: its folder is a symlink or gone (%s)" % (target, e.strerror)}
+    tfd = None
+    try:
+        mode = 0o600 if name.endswith(".env") else 0o644
+        try:
+            st = os.lstat(name, dir_fd=dfd)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if not stat.S_ISREG(st.st_mode):
+                return {"status": "refused", "message": "%s is now a symlink or not a file; not written" % target}
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            with os.fdopen(fd, "rb") as f:
+                cur = f.read()
+            mode = stat.S_IMODE(st.st_mode)
+            if _sha(cur) != spec["orig_sha"]:
+                return {"status": "conflict", "message": "%s changed while you edited it; not written" % target}
+        elif spec["orig_sha"] is not None:
+            return {"status": "conflict", "message": "%s was removed while you edited it; not written" % target}
+        # The temp file: in the project folder for env/ files (out of the
+        # container's reach), else next to the target, where the container
+        # can write too. So it's never touched by path once created: created
+        # exclusively without following links, mode set on the open file,
+        # and before it's renamed into place, the name must still be that
+        # very file (device and inode); afterwards the target must be it.
+        tfd = _open_dir(spec["proj_dir"]) if spec["env_file"] else os.dup(dfd)
+        tmp = ".boxen-edit-%s" % secrets.token_hex(6)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                     0o600, dir_fd=tfd)
+        mine = None
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(new)
+                f.flush()
+                os.fsync(f.fileno())
+                os.fchmod(f.fileno(), mode)
+                mine = os.fstat(f.fileno())
+            try:
+                there = os.stat(tmp, dir_fd=tfd, follow_symlinks=False)
+            except FileNotFoundError:
+                there = None
+            if there is None or (there.st_dev, there.st_ino) != (mine.st_dev, mine.st_ino):
+                return {"status": "refused", "message": "%s: the file being written changed during the write; "
+                        "not written" % target}
+            os.replace(tmp, name, src_dir_fd=tfd, dst_dir_fd=dfd)
+        except BaseException:
+            _unlink_if(tmp, tfd, mine)
+            raise
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (mine.st_dev, mine.st_ino):
+            return {"status": "refused", "message": "%s changed as it was written (it isn't the file written); "
+                    "check it" % target}
+        return {"status": "written", "message": "saved %s" % target}
+    except OSError as e:
+        return {"status": "refused", "message": "%s: %s; not written" % (target, e.strerror or e)}
+    finally:
+        os.close(dfd)
+        if tfd is not None:
+            os.close(tfd)
+
+
+def main(argv):
+    with open(argv[0]) as f:
+        spec = json.load(f)
+    try:
+        rc = subprocess.call(editor_cmd(spec["editor"], spec["copy"]))
+    except OSError as e:
+        rc = 127
+        print("boxen ui: can't run the editor %s: %s" % (spec["editor"][0], e.strerror or e))
+    with open(spec["copy"], "rb") as f:
+        new = f.read()
+    res = write_back(spec, new) if rc == 0 else {
+        "status": "conflict", "message": "the editor exited with %d; nothing written" % rc}
+    if res["status"] in ("conflict", "refused") and _sha(new) != spec["orig_sha"]:
+        res["message"] += "; your edit is kept at %s" % spec["copy"]
+        res["kept"] = spec["copy"]
+    print(res["message"])
+    tmp = spec["result"] + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(res, f)
+    os.replace(tmp, spec["result"])
+    return 0 if res["status"] in ("written", "unchanged") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

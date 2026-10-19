@@ -19,7 +19,8 @@ gh repo clone theycallmeboxy/boxen ~/boxen
 ```
 
 `install.sh` is safe to re-run: Docker CE, a few tools, the `docker` group,
-`boxen` in `~/.local/bin`, the base image. Then log out and back in if
+`boxen` in `~/.local/bin`, the base image, `boxen ui`'s Python environment
+(`~/.local/share/boxen/ui-venv`). Then log out and back in if
 `boxen` isn't on your PATH yet, run `boxen github`, and create a project.
 
 ## Connect GitHub
@@ -57,7 +58,8 @@ boxen new <name> [git-url]
 
 `<name>` becomes the folder `~/src/<name>`, the container `boxen-<name>` and
 the name in the Claude app: lowercase letters and digits, single `-` or `_`
-between them, up to 40 characters.
+between them, up to 40 characters (not `all`, `supervisor`, or `global`,
+`dashboard`, `ui`, which `boxen ui` uses).
 
 | You have | Run | Result |
 |---|---|---|
@@ -73,7 +75,25 @@ appears in the app's Code tab.
 
 ## Day to day
 
-- `boxen ls` — every project: container, server state, GitHub token.
+### boxen ui
+
+`boxen ui` opens the dashboard: every project with its container, server,
+CPU, memory and GitHub token; per project its state, sidecars, last apply,
+earlier sessions, logs and open terminals; and a jobs panel with the live
+output of everything you run from it. Actions go through `boxen` itself, and
+a question (trusting a folder, `rm`) comes up as a dialog. Shells, Claude,
+log tails and resumed sessions open as tmux windows (tabs at the bottom):
+**F1** (or **Ctrl+B 0**, when a program like htop wants the F-keys, which
+tmux takes first) comes back to the dashboard, **F2**/**F3** go to the
+previous/next window. It all runs in a tmux session of its own, so an SSH
+drop loses nothing: `boxen ui` again picks up where you were. **q** detaches
+(everything keeps running), **Q** quits it all, **?** lists the keys. After
+`boxen self-update`, `boxen ui --restart` loads the new dashboard.
+
+### Commands
+
+- `boxen ls` — every project: container, server state, GitHub token
+  (`--json` for scripts).
 - `boxen up <name|all>` — start; also applies env/compose changes, and if the
   server is waiting on a question, lets you answer it.
 - `boxen down <name|all>` — stop.
@@ -248,7 +268,8 @@ GitHub: `github.com`, `api.github.com` (gh CLI).
 Install and image builds: `download.docker.com`, `archive.ubuntu.com`,
 `security.ubuntu.com` (or `ports.ubuntu.com` on arm64), `cli.github.com`,
 Docker Hub (`registry-1.docker.io`, `auth.docker.io`,
-`production.cloudflare.docker.com`).
+`production.cloudflare.docker.com`), and for `boxen ui`'s Python packages
+`pypi.org` and `files.pythonhosted.org`.
 
 Plus whatever package registries your projects use.
 

@@ -84,7 +84,8 @@ Usage: boxen <command> [args]
 
   new <name> [git-url]                            Create a project (cloning git-url if given) and start it
   supervisor                                      Create/start the supervisor: runs boxen for you from the app
-  ls                                              List projects, their servers and GitHub tokens
+  ui [--restart]                                  The dashboard: projects, jobs, logs and terminals (in tmux)
+  ls [--json]                                     List projects, their servers and GitHub tokens
   up <name|all>                                   Start, or apply env/compose changes; answers pending prompts
   down <name|all>                                 Stop
   restart <name|all> [--prepare]                  Recreate the container (picks up env changes; --prepare: only check)
@@ -105,6 +106,90 @@ EOF
 valid_name() {
   [[ "$1" =~ ^[a-z0-9]+([_-][a-z0-9]+)*$ && ${#1} -le 40 ]] \
     || die "invalid project name '$1' (lowercase letters and digits, single '-' or '_' between them, max 40 chars)"
+}
+
+# Names boxen ui uses for its own tmux windows ("dashboard") and window
+# prefixes: a new project can't take them. (One made before they were
+# reserved keeps working.)
+RESERVED_NAMES=(global dashboard ui)
+not_reserved() {
+  local r
+  for r in "${RESERVED_NAMES[@]}"; do
+    [[ "$1" != "$r" ]] || die "'$1' is reserved (boxen ui uses it); pick another name"
+  done
+}
+
+# lock_project NAME: hold the project's lock (projects/NAME/.lock) for the
+# rest of this process (or subshell), so two boxen commands never change a
+# project at once (a terminal, boxen ui and the supervisor's agent all run
+# this same script). Never waits: if it's held, say so and exit 2
+# (LOCK_BUSY_RC: `locked` uses its own code so a loop can tell busy from
+# failed).
+#
+# The lock lives as long as its file descriptor is open, in this process
+# and in anything it starts. Every descriptor is kept in LOCK_FDS, and
+# whatever might outlive boxen or run long (install.sh and what it starts,
+# git, script and the attached docker client) runs through nolocks, so no
+# daemon can end up holding a project, or every project, locked.
+LOCK_FDS=()
+LOCK_BUSY_RC=2
+lock_project() {
+  local d fd
+  d=$(proj_dir "$1")
+  mkdir -p "$d"
+  exec {fd}>>"$d/.lock"
+  flock -n "$fd" || {
+    printf 'boxen: %s is busy (another boxen command is running for it)\n' "$1" >&2
+    exit "$LOCK_BUSY_RC"
+  }
+  LOCK_FDS+=("$fd")
+}
+
+# lock_global: the same for commands that touch every project (update,
+# self-update), which then also take each project's lock as they get to it.
+lock_global() {
+  local fd
+  mkdir -p "$BOXEN_HOME"
+  exec {fd}>>"$BOXEN_HOME/.global.lock"
+  flock -n "$fd" || {
+    printf 'boxen: busy (another update or self-update is running)\n' >&2
+    exit 2
+  }
+  LOCK_FDS+=("$fd")
+}
+
+# nolocks cmd...: run cmd (a command or a function) in a subshell with
+# every lock descriptor closed.
+nolocks() {
+  (
+    local fd
+    for fd in "${LOCK_FDS[@]}"; do exec {fd}>&-; done
+    LOCK_FDS=()
+    "$@"
+  )
+}
+
+# locked NAME cmd...: run cmd in a subshell holding NAME's lock, for loops
+# over every project: a busy one is skipped with exit 75 (BUSY_RC), told
+# apart from a failure, and the loop goes on.
+BUSY_RC=75
+locked() {
+  local n=$1
+  shift
+  ( LOCK_BUSY_RC=$BUSY_RC; lock_project "$n"; "$@" )
+}
+
+# loop_summary WHAT BUSY... -- FAILED...: the end of an update over every
+# project: skipped (busy) ones are a warning, failures an error.
+loop_summary() {
+  local what=$1 busy=() failed=()
+  shift
+  while (( $# )) && [[ "$1" != -- ]]; do busy+=("$1"); shift; done
+  shift || true
+  failed=("$@")
+  (( ${#busy[@]} == 0 )) || warn "$what: skipped, busy (another boxen command was running for them): ${busy[*]}"
+  (( ${#failed[@]} == 0 )) || die "$what finished, but these projects failed: ${failed[*]}"
+  (( ${#busy[@]} == 0 )) || exit 2
 }
 
 proj_dir() { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
@@ -150,7 +235,8 @@ projects() {
   shopt -s nullglob
   local d n
   for d in "$PROJECTS_DIR"/*/; do
-    n=$(basename "$d")
+    d=${d%/}
+    n=${d##*/}
     [[ "$n" != supervisor ]] && printf '%s\n' "$n"
   done
   [[ -d "$PROJECTS_DIR/supervisor" ]] && echo supervisor
@@ -171,13 +257,23 @@ each() {
   fi
   shift
   EACH_ALL=1
-  local n rc=0 failed=() list=()
+  local n rc=0 r failed=() busy=() list=()
   mapfile -t list < <(projects)
   (( ${#list[@]} )) || { info "no projects yet"; return 0; }
   for n in "${list[@]}"; do
-    ( "$fn" "$n" "$@" ) || { if (( $? == 3 && rc != 1 )); then rc=3; else rc=1; fi; failed+=("$n"); }
+    r=0
+    ( LOCK_BUSY_RC=$BUSY_RC; "$fn" "$n" "$@" ) || r=$?
+    if (( r == BUSY_RC )); then
+      busy+=("$n")
+      (( rc )) || rc=2
+    elif (( r )); then
+      if (( r == 3 && rc != 1 )); then rc=3; else rc=1; fi
+      failed+=("$n")
+    fi
   done
-  (( ${#failed[@]} == 0 )) || { warn "failed for: ${failed[*]}"; exit "$rc"; }
+  (( ${#busy[@]} == 0 )) || warn "skipped, busy (another boxen command was running for them): ${busy[*]}"
+  (( ${#failed[@]} == 0 )) || warn "failed for: ${failed[*]}"
+  (( rc == 0 )) || exit "$rc"
 }
 
 # The compose template a project is rendered from: the supervisor has its own.
@@ -440,12 +536,17 @@ token_dir() { printf '%s/token' "$(proj_dir "$1")"; }
 # Tokens last an hour and cron renews them every 30 minutes, so one older
 # than 55 minutes means the refresh isn't happening.
 token_state() {
-  local f
+  local f now
   f="$(token_dir "$1")/gh-token"
-  project_repo "$1" >/dev/null 2>&1 || { echo "-"; return; }
+  if (( $# > 1 )); then
+    [[ -n "$2" ]] || { echo "-"; return; }          # the repo, already looked up: none
+  else
+    project_repo "$1" >/dev/null 2>&1 || { echo "-"; return; }
+  fi
   app_configured || { echo "run boxen github"; return; }
   [[ -f "$f" ]] || { echo "no token"; return; }
-  if (( $(date +%s) - $(stat -c %Y "$f") < 3300 )); then echo "token ok"; else echo "token stale"; fi
+  printf -v now '%(%s)T' -1
+  if (( now - $(stat -c %Y "$f") < 3300 )); then echo "token ok"; else echo "token stale"; fi
 }
 
 # app_account OWNER: true if the boxen app is installed on that account (you,
@@ -787,9 +888,16 @@ plain_text() {
 # got completed. (The Remote Control question has no preamble in the binary;
 # on its own it can't be told from "starting".)
 server_state() {
-  local n=$1 started
-  started=$(docker inspect -f '{{.State.StartedAt}}' "boxen-$n" 2>/dev/null) || { echo "not created"; return; }
-  docker logs --since "$started" --tail 300 "boxen-$n" 2>&1 | plain_text | perl -ne '
+  local started
+  started=$(docker inspect -f '{{.State.StartedAt}}' "boxen-$1" 2>/dev/null) || { echo "not created"; return; }
+  server_state_since "$1" "$started"
+}
+
+# server_state_since NAME STARTED: server_state from the output since
+# STARTED (the container's StartedAt, known already).
+server_state_since() {
+  local n=$1 started=$2 st
+  st=$(docker logs --since "$started" --tail 300 "boxen-$n" 2>&1 | plain_text | perl -ne '
     BEGIN { $s = "starting"; $q = 0 }
     if    (/Workspace not trusted/)                      { $s = "not trusted: run boxen up NAME"; $q = 0 }
     elsif (/not logged in|please (log|sign) in|claude (auth )?login/i)
@@ -803,7 +911,31 @@ server_state() {
     elsif (/Reconnecting/)                               { $s = "reconnecting"; $q = 0 }
     elsif (/\bConnected\b|\bReconnected\b/)              { $s = "connected"; $q = 0 }
     elsif (/^Error:/)                                    { $q = 0 }
-    END   { $s = "waiting for an answer: run boxen up NAME" if $q && $s eq "starting"; print "$s\n" }' | sed "s/NAME/$n/" || true
+    END   { $s = "waiting for an answer: run boxen up NAME" if $q && $s eq "starting"; print "$s\n" }' || true)
+  printf '%s\n' "${st//NAME/$n}"
+}
+
+# server_state_cached NAME ID STARTED: server_state for `ls`, which runs
+# every few seconds under boxen ui, so it mustn't read every server's log
+# each time. The last answer is kept in projects/NAME/.state-cache with the
+# container's id and StartedAt: while those are unchanged and the server
+# was connected (or reconnecting), that answer stands for up to 60 s; any
+# other state (starting, waiting at a question, not trusted…) is still
+# settling, so the log is read again every time.
+server_state_cached() {
+  local n=$1 id=$2 started=$3 f c_id c_started c_at c_state now st
+  f="$(proj_dir "$n")/.state-cache"
+  printf -v now '%(%s)T' -1
+  if [[ -f "$f" && ! -L "$f" ]] && IFS=' ' read -r c_id c_started c_at c_state < "$f" \
+     && [[ "$c_id" == "$id" && "$c_started" == "$started" && "$c_at" =~ ^[0-9]+$ ]] \
+     && [[ "$c_state" == connected || "$c_state" == reconnecting ]] && (( now - c_at < 60 )); then
+    printf '%s\n' "$c_state"
+    return
+  fi
+  st=$(server_state_since "$n" "$started")
+  # One small write; a reader that catches it half done just reads the log.
+  { printf '%s %s %s %s\n' "$id" "$started" "$now" "$st" > "$f"; } 2>/dev/null || true
+  printf '%s\n' "$st"
 }
 
 # Escape a value for use as a sed replacement (we use | as the delimiter).
@@ -861,6 +993,7 @@ EOF
   # Watch the attached output for the session URL, then end the attachment
   # (the docker client, not the container). Gives up after 10 minutes.
   (
+    for fd in "${LOCK_FDS[@]}"; do exec {fd}>&-; done
     for _ in $(seq 600); do
       # The session URL (claude.ai/code?environment=...), not just any mention
       # of claude.ai/code: the server's one-time questions mention it too.
@@ -875,7 +1008,7 @@ EOF
   watcher=$!
   # script(1) gives the attachment a terminal and copies its output to a file
   # we can watch. The shell records its PID, then becomes the docker client.
-  script -qfec "echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" || true
+  nolocks script -qfec "echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" || true
   kill "$watcher" 2>/dev/null || true
   wait "$watcher" 2>/dev/null || true
   stty sane 2>/dev/null || true
@@ -914,7 +1047,12 @@ drive_prompts() {
   # DRV[1] is the pty's input. script's own stdout is discarded: the file
   # has everything. A write to a pty whose reader is gone must not end boxen.
   trap '' PIPE
-  coproc DRV { script -qfec "stty rows 50 cols 200; stty size > '$tmp/size'; echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" >/dev/null 2>&1; }
+  # (The coprocess closes the lock descriptors itself: it's a subshell that
+  # lives as long as the attachment, and must not keep the project locked.)
+  coproc DRV {
+    for fd in "${LOCK_FDS[@]}"; do exec {fd}>&-; done
+    exec script -qfec "stty rows 50 cols 200; stty size > '$tmp/size'; echo \$\$ > '$tmp/pid'; exec docker start -ai '$c'" "$tmp/out" >/dev/null 2>&1
+  }
   for (( i = 0; i < 180; i++ )); do
     sleep 1
     if [[ ! -s "$tmp/size" ]]; then continue; fi
@@ -1409,6 +1547,7 @@ cmd_new() {
   valid_name "$name"
   [[ "$name" != all ]] || die "'all' is reserved (it means every project); pick another name"
   [[ "$name" != supervisor ]] || die "'supervisor' is reserved; 'boxen supervisor' creates that project"
+  not_reserved "$name"
   require_setup
 
   local pdir src
@@ -1419,6 +1558,9 @@ cmd_new() {
   if [[ -n "$url" && -d "$src" && -n "$(ls -A "$src")" ]]; then
     die "$src already has files; can't clone into it (omit the url to use it as-is)"
   fi
+  lock_project "$name"
+  # Another `new` of the same name got here first and has its files in already.
+  [[ ! -e "$pdir/compose.yaml" ]] || die "project '$name' already exists ($pdir)"
 
   NEW_NAME=$name NEW_PDIR=$pdir NEW_SRC=$src NEW_CREATED_SRC=0
   [[ -d "$src" ]] || NEW_CREATED_SRC=1
@@ -1483,6 +1625,7 @@ cmd_supervisor() {
   require_setup
   local name=supervisor pdir
   pdir=$(proj_dir "$name")
+  lock_project "$name"
   # The socket's folder, mounted into the container (a folder, not the
   # socket itself: boxen-agentd recreates the socket when it restarts, and a
   # mount of the file would keep pointing at the old one). Created here so
@@ -1504,21 +1647,174 @@ cmd_supervisor() {
 
 # -------------------------------------------------------------- day to day
 
+# ------------------------------------------------------------ ls
+
+# collect_projects: what `ls` shows, for every project, in L_* arrays (one
+# entry per project, in projects order): container status, restarts,
+# StartedAt and id ("" when there's no container), server state, GitHub
+# token state and repo. One `docker inspect` for every container, server
+# states from server_state_cached, one git call per project. DOCKER_OK=0
+# when docker couldn't be asked at all.
+L_NAME=() L_STATUS=() L_RESTARTS=() L_STARTED=() L_ID=() L_SERVER=() L_GITHUB=() L_REPO=()
+DOCKER_OK=1
+collect_projects() {
+  local n i out line rc=0 names=() repo
+  local -A st=()
+  mapfile -t L_NAME < <(projects)
+  (( ${#L_NAME[@]} )) || return 0
+  for n in "${L_NAME[@]}"; do names+=("boxen-$n"); done
+  if command -v docker >/dev/null; then
+    out=$(docker inspect -f 'C {{.Name}} {{.State.Status}} {{.RestartCount}} {{.State.StartedAt}} {{.Id}}' \
+            "${names[@]}" 2>&1) || rc=$?
+  else
+    out="docker: command not found" rc=127
+  fi
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^C\ /boxen-([a-z0-9_-]+)\ ([a-z]+)\ ([0-9]+)\ ([0-9T:.Z+-]+)\ ([0-9a-f]+)$ ]]; then
+      st[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]} ${BASH_REMATCH[3]} ${BASH_REMATCH[4]} ${BASH_REMATCH[5]}"
+    elif (( rc )) && [[ -n "$line" && "$line" != *"No such object"* && "$line" != *"No such container"* ]]; then
+      DOCKER_OK=0
+    fi
+  done <<<"$out"
+  for i in "${!L_NAME[@]}"; do
+    n=${L_NAME[$i]}
+    L_STATUS[i]="" L_RESTARTS[i]=0 L_STARTED[i]="" L_ID[i]="" L_SERVER[i]="-"
+    if [[ -n "${st[$n]:-}" ]]; then
+      read -r "L_STATUS[i]" "L_RESTARTS[i]" "L_STARTED[i]" "L_ID[i]" <<<"${st[$n]}"
+      if [[ "${L_STATUS[i]}" == running ]]; then
+        L_SERVER[i]=$(server_state_cached "$n" "${L_ID[i]}" "${L_STARTED[i]}")
+      fi
+    fi
+    repo=$(project_repo "$n" 2>/dev/null || true)
+    L_REPO[i]=$repo
+    L_GITHUB[i]=$(token_state "$n" "$repo")
+  done
+}
+
 # Each project's container, whether its server is actually connected (a
 # running container can hold a server stuck at a question), and its GitHub
 # token.
 cmd_ls() {
+  local i c
+  collect_projects
   printf '%-24s %-20s %-42s %s\n' PROJECT CONTAINER SERVER GITHUB
-  local n c st
-  while read -r n; do
-    c=$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "boxen-$n" 2>/dev/null) || c="-"
-    st="-"
-    [[ $c == running* ]] && st=$(server_state "$n")
-    [[ $c == *" 0" ]] && c=${c% 0}
-    [[ $c == *" "* ]] && c="${c% *} (${c##* } restarts)"
-    [[ $c == "-" ]] && c="not created"
-    printf '%-24s %-20s %-42s %s\n' "$n" "$c" "$st" "$(token_state "$n")"
-  done < <(projects)
+  for i in "${!L_NAME[@]}"; do
+    c="not created"
+    if [[ -n "${L_STATUS[i]}" ]]; then
+      c=${L_STATUS[i]}
+      (( L_RESTARTS[i] == 0 )) || c="$c (${L_RESTARTS[i]} restarts)"
+    fi
+    printf '%-24s %-20s %-42s %s\n' "${L_NAME[i]}" "$c" "${L_SERVER[i]}" "${L_GITHUB[i]}"
+  done
+}
+
+# ls --json: one JSON document for boxen ui (and anything else that wants
+# it), built by a single jq from collect_projects and each project's
+# compose.services.yaml:
+#   {"version": 1, "docker": true|false,
+#    "projects": [{"name", "container": {"status", "restarts", "started_at",
+#                  "id"} | null, "server", "github", "repo": "owner/repo" | null,
+#                  "sidecars": [{"service", "container", "image"}]}, ...],
+#    "supervisor": {... the same ...} | null}
+# "server" is "-" when the container isn't running, as in `ls`; sidecars
+# are the configured ones (their live state is Docker's to tell).
+cmd_ls_json() {
+  local i f args=() files=()
+  collect_projects
+  for i in "${!L_NAME[@]}"; do
+    args+=("${L_NAME[i]}" "${L_STATUS[i]}" "${L_RESTARTS[i]}" "${L_STARTED[i]}" "${L_ID[i]}"
+           "${L_SERVER[i]}" "${L_GITHUB[i]}" "${L_REPO[i]}")
+    f="$(proj_dir "${L_NAME[i]}")/compose.services.yaml"
+    if [[ -f "$f" ]]; then files+=(--rawfile "sc$i" "$f"); fi
+  done
+  jq -n --argjson docker "$( (( DOCKER_OK )) && echo true || echo false)" "${files[@]}" '
+    [$ARGS.positional | range(0; length; 8) as $o | .[$o:$o + 8]]
+    | to_entries
+    | map(.key as $i | .value as $v | {
+        name: $v[0],
+        container: (if $v[1] == "" then null
+                    else {status: $v[1], restarts: ($v[2] | tonumber? // 0), started_at: $v[3], id: $v[4]} end),
+        server: $v[5], github: $v[6],
+        repo: (if $v[7] == "" then null else $v[7] end),
+        sidecars: (try ($ARGS.named["sc\($i)"] // "{}" | fromjson | .services // {} | to_entries
+                        | map({service: .key,
+                               container: (.value.container_name // "boxen.\($v[0]).\(.key)"),
+                               image: (.value.image // "")}))
+                   catch [])})
+    | {version: 1, docker: $docker,
+       projects: map(select(.name != "supervisor")),
+       supervisor: (map(select(.name == "supervisor")) | first // null)}' --args "${args[@]}"
+}
+
+# ui: the dashboard (ui/boxen_ui, Textual) in a tmux server of its own
+# (-L boxen, ui/tmux.conf; your ~/.tmux.conf isn't read), so it and every
+# terminal it opens keep running when SSH drops: `boxen ui` again
+# reattaches. Inside that session already, it just shows the dashboard.
+# `boxen ui --restart` starts the dashboard again (after an update).
+UI_VENV="${BOXEN_UI_VENV:-${XDG_DATA_HOME:-$HOME/.local/share}/boxen/ui-venv}"
+UI_DASH=()
+# ui_prepare: check tmux and the venv, and put the dashboard's command in
+# UI_DASH. It runs from the venv's real folder (ui-venv is a link to the
+# current version, see ui/install-venv.sh), so a dashboard keeps the
+# version it started with when an update installs another; with -P, so
+# nothing is imported from the working directory; and if it exits with an
+# error, its last words stay on screen.
+ui_prepare() {
+  local v vdir
+  command -v tmux >/dev/null || die "tmux isn't installed; re-run $BOXEN_REPO/install.sh"
+  v=$(tmux -V 2>/dev/null || true)
+  if ! [[ "$v" =~ ([0-9]+)\.([0-9]+) ]] \
+     || (( BASH_REMATCH[1] < 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] < 3) )); then
+    die "boxen ui needs tmux 3.3 or newer (this is ${v:-an unknown version})"
+  fi
+  vdir=$(readlink -f "$UI_VENV" 2>/dev/null || true)
+  [[ -n "$vdir" && -x "$vdir/bin/python" ]] \
+    || die "the ui's Python environment is missing ($UI_VENV); re-run $BOXEN_REPO/install.sh"
+  "$vdir/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+    || die "boxen ui needs Python 3.11 or newer ($vdir/bin/python is older)"
+  # shellcheck disable=SC2016  # expanded by that sh, on purpose
+  UI_DASH=(env "PYTHONPATH=$BOXEN_REPO/ui" sh -c \
+           '"$0" -P -m boxen_ui || { printf "\nboxen ui exited (%s); press Enter " "$?"; read -r _; }' \
+           "$vdir/bin/python")
+}
+
+cmd_ui() {
+  local conf="$BOXEN_REPO/ui/tmux.conf" t=(tmux -L boxen) restart=0
+  case ${1:-} in
+    "") ;;
+    --restart) restart=1 ;;
+    *) die "usage: boxen ui [--restart]" ;;
+  esac
+  (( $# <= 1 )) || die "usage: boxen ui [--restart]"
+  if agent_mode; then
+    printf 'boxen: ui needs a terminal\n' >&2
+    exit 2
+  fi
+  (( restart )) || [[ -t 0 && -t 1 ]] || die "ui needs a terminal (run it in an SSH session on the VM)"
+  ui_prepare
+  # Every window starts in your home folder: never in a project's, whose
+  # files the container can write.
+  if (( restart )); then
+    "${t[@]}" has-session -t boxen 2>/dev/null || die "boxen ui isn't running; start it with 'boxen ui'"
+    "${t[@]}" respawn-window -k -c "$HOME" -t boxen:=dashboard "${UI_DASH[@]}" 2>/dev/null \
+      || "${t[@]}" new-window -d -c "$HOME" -t boxen: -n dashboard "${UI_DASH[@]}"
+    info "dashboard restarted"
+    return
+  fi
+  # Already in it: switch to the dashboard window (recreated if it's gone).
+  if [[ -n "${TMUX:-}" && "$(basename "${TMUX%%,*}")" == boxen ]]; then
+    "${t[@]}" select-window -t boxen:=dashboard 2>/dev/null \
+      || "${t[@]}" new-window -c "$HOME" -t boxen: -n dashboard "${UI_DASH[@]}"
+    return
+  fi
+  if "${t[@]}" has-session -t boxen 2>/dev/null; then
+    # A running server keeps the config it started with; this picks up an update.
+    "${t[@]}" source-file "$conf" 2>/dev/null || true
+    "${t[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -x dashboard >/dev/null \
+      || "${t[@]}" new-window -d -c "$HOME" -t boxen: -n dashboard "${UI_DASH[@]}"
+  fi
+  # From inside another tmux, nest (tmux refuses unless TMUX is unset).
+  exec env -u TMUX "${t[@]}" -f "$conf" new-session -A -c "$HOME" -s boxen -n dashboard "${UI_DASH[@]}"
 }
 
 # start_opts [--approve trust] [--prepare]: the options up, restart and new
@@ -1566,9 +1862,10 @@ no_approve_all() {
   done
 }
 
-cmd_up()      { require_project "${1:-}"; start_opts "${@:2}"; start_project "$1"; }
+cmd_up()      { require_project "${1:-}"; lock_project "$1"; start_opts "${@:2}"; start_project "$1"; }
 cmd_restart() {
   require_project "${1:-}"
+  lock_project "$1"
   start_opts "${@:2}"
   if (( PREPARE )); then prepare_project "$1"; return; fi
   start_project "$1" --force-recreate
@@ -1581,6 +1878,7 @@ cmd_down() {
     echo "supervisor: left running (stop it from the VM)"
     return 0
   fi
+  lock_project "$1"
   run_quiet "stopping $1" dc "$1" down || return 1
   echo "$1: stopped"
 }
@@ -1643,6 +1941,7 @@ cmd_rm() {
   require_project "${1:-}"
   local name=$1 ans yes=0 q
   shift
+  lock_project "$name"
   while (( $# )); do
     case $1 in
       --yes|-y) yes=1 ;;
@@ -1727,26 +2026,39 @@ update_one() {
 }
 
 cmd_update() {
-  local n failed=() list=()
+  local n r failed=() busy=() list=()
   if [[ -n "${1:-}" && "$1" != all ]]; then
     require_project "$1"
+    lock_project "$1"
     start_opts "${@:2}"
     if (( PREPARE )); then prepare_project "$1" --build; return; fi
     update_one "$1"
     return
   fi
   (( $# <= 1 )) || die "usage: boxen update [name|all] (--prepare with a name)"
+  lock_global
   build_base --fresh || exit 1
   mapfile -t list < <(projects)
   for n in "${list[@]}"; do
-    update_one "$n" || failed+=("$n")
+    r=0
+    locked "$n" update_one "$n" || r=$?
+    if (( r == BUSY_RC )); then busy+=("$n"); elif (( r )); then failed+=("$n"); fi
   done
   docker image prune -f >/dev/null
   docker builder prune -f --filter until=720h >/dev/null
-  if (( ${#failed[@]} )); then
-    die "update finished, but these projects failed: ${failed[*]}"
-  fi
+  loop_summary update "${busy[@]}" -- "${failed[@]}"
   info "update done"
+}
+
+# self_update_files NAME OLD_TEMPLATE: a project's files after a
+# self-update (env/ layout, compose.yaml from the new template).
+self_update_files() {
+  local n=$1
+  migrate_env "$n"
+  rerender_compose "$n" "$2"
+  write_override_example "$n"
+  mkdir_private "$(token_dir "$n")"
+  [[ "$n" != supervisor ]] || write_supervisor_claude_md
 }
 
 # Hidden for one release: the previous self-update told upgraders to run
@@ -1754,6 +2066,7 @@ cmd_update() {
 # the project; `rebuild` is `update`. Remove next release.
 cmd_regen() {
   require_project "${1:-}"
+  lock_project "$1"
   migrate_env "$1"
   rerender_compose "$1"
   write_override_example "$1"
@@ -1762,9 +2075,12 @@ cmd_regen() {
 }
 
 cmd_self_update() {
-  local old new changed n list=() failed=() mode=none oldt
+  local old new changed n r list=() failed=() busy=() mode=none oldt
+  lock_global
   old=$(git -C "$BOXEN_REPO" rev-parse HEAD)
-  run_quiet "git pull" git -C "$BOXEN_REPO" pull --ff-only \
+  # git may leave a gc running in the background: without the locks, and
+  # not detached.
+  run_quiet "git pull" nolocks git -c gc.autoDetach=false -C "$BOXEN_REPO" pull --ff-only \
     || die "couldn't fast-forward $BOXEN_REPO. If you edited files there, move those changes to ~/.config/boxen (see README, Customizing) and retry."
   new=$(git -C "$BOXEN_REPO" rev-parse HEAD)
   if [[ "$old" == "$new" ]]; then
@@ -1778,7 +2094,8 @@ cmd_self_update() {
   # The new installer: VM prerequisites, PATH link, base image. (This script
   # keeps running from the old copy it already opened, which is fine.)
   info "running the updated installer"
-  BOXEN_SELF_UPDATE=1 "$BOXEN_REPO/install.sh"
+  # Without the locks: it (re)starts the boxen agent, which runs for good.
+  BOXEN_SELF_UPDATE=1 nolocks "$BOXEN_REPO/install.sh"
 
   mapfile -t list < <(projects)
   if (( ${#list[@]} == 0 )); then
@@ -1791,12 +2108,10 @@ cmd_self_update() {
   # project from before env/ gets its Dockerfile moved there first.
   oldt=$(mktemp)
   for n in "${list[@]}"; do
-    migrate_env "$n"
     git -C "$BOXEN_REPO" show "$old:templates/$(basename "$(compose_template "$n")")" > "$oldt" 2>/dev/null || true
-    rerender_compose "$n" "$oldt"
-    write_override_example "$n"
-    mkdir_private "$(token_dir "$n")"
-    [[ "$n" != supervisor ]] || write_supervisor_claude_md
+    r=0
+    locked "$n" self_update_files "$n" "$oldt" || r=$?
+    if (( r == BUSY_RC )); then busy+=("$n"); elif (( r )); then failed+=("$n"); fi
   done
   rm -f "$oldt"
 
@@ -1810,15 +2125,19 @@ cmd_self_update() {
   if [[ "$mode" != none ]]; then
     info "applying to projects (servers restart; app sessions reconnect on their own)"
     for n in "${list[@]}"; do
+      r=0
       case $mode in
-        rebuild) update_one "$n" || failed+=("$n") ;;
-        up)      start_project "$n" || failed+=("$n") ;;
+        rebuild) locked "$n" update_one "$n" || r=$? ;;
+        up)      locked "$n" start_project "$n" || r=$? ;;
       esac
+      if (( r == BUSY_RC )); then
+        [[ " ${busy[*]} " == *" $n "* ]] || busy+=("$n")
+      elif (( r )); then
+        failed+=("$n")
+      fi
     done
   fi
-  if (( ${#failed[@]} )); then
-    die "self-update finished, but these projects failed: ${failed[*]}"
-  fi
+  loop_summary self-update "${busy[@]}" -- "${failed[@]}"
   info "self-update done"
 }
 
@@ -1829,7 +2148,13 @@ shift || true
 case "$cmd" in
   new)      cmd_new "$@" ;;
   supervisor) cmd_supervisor "$@" ;;
-  ls|list)  cmd_ls ;;
+  ls|list)
+    case ${1:-} in
+      "")     cmd_ls ;;
+      --json) (( $# == 1 )) || die "usage: boxen ls [--json]"; cmd_ls_json ;;
+      *)      die "usage: boxen ls [--json]" ;;
+    esac ;;
+  ui)       cmd_ui "$@" ;;
   up)       no_approve_all "$@"; each cmd_up "$@" ;;
   down)     each cmd_down "$@" ;;
   restart)  no_approve_all "$@"; each cmd_restart "$@" ;;
