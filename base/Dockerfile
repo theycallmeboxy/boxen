@@ -55,8 +55,9 @@ RUN test -n "$USERNAME" || (echo "USERNAME build arg is required" >&2; exit 1) \
  && install -d -o "$USER_UID" -g "$USER_GID" \
       "/home/$USERNAME/.claude" "/home/$USERNAME/src"
 
-# GitHub access: git and gh both read the project's short-lived token from
-# /run/boxen/gh-token (mounted read-only; boxen refreshes it on the VM).
+# GitHub access: git and gh both read the project's short-lived tokens from
+# /run/boxen (gh-token.<owner>, gh-token: mounted read-only; boxen
+# refreshes them on the VM).
 COPY git-credential-boxen gh /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/git-credential-boxen /usr/local/bin/gh
 

@@ -30,9 +30,10 @@ boxen github
 ```
 
 Containers never get a long-lived GitHub token. A private GitHub App that you
-own mints a 1-hour token per project, scoped to that project's repo only; the
-app's private key stays on the VM, cron refreshes the tokens, and git and `gh`
-inside the container pick them up. The walkthrough takes about 3 minutes:
+own mints 1-hour tokens per project, scoped to the repos on that project's list
+only (see below); the app's private key stays on the VM, cron refreshes the
+tokens, and git and `gh` inside the container pick them up. The walkthrough
+takes about 3 minutes:
 
 1. It prints a link that pre-fills a new GitHub App (private, no webhook,
    permissions: Contents, Pull requests, Issues write; Actions, Checks,
@@ -43,12 +44,38 @@ inside the container pick them up. The walkthrough takes about 3 minutes:
 3. It prints the app's install link. Choose **All repositories** so repos you
    create later work too.
 
-The app only installs on accounts you control, so a project cloned from
-someone else's repo gets no token: pulls work if it's public, pushes don't.
-To push, fork it and point `origin` at your fork. It also sets the commit
-identity for containers to your GitHub name and no-reply address
-(`ID+username@users.noreply.github.com`), unless `GIT_AUTHOR_EMAIL` is
-already in `boxen.env`; running projects are restarted to pick it up.
+It also sets the commit identity for containers to your GitHub name and
+no-reply address (`ID+username@users.noreply.github.com`), unless
+`GIT_AUTHOR_EMAIL` is already in `boxen.env`; running projects are restarted
+to pick it up.
+
+### Which repos a project can push to
+
+Each project has a list of repos its tokens cover, kept on the VM
+(`~/.config/boxen/projects/<name>/repos`, never mounted into a container) and
+changed only by you. It starts with the repo `boxen new` clones (or, for a
+project made before lists existed, its `origin` at the time); after that a
+project can't widen its own access by changing its remotes: a push to an
+unlisted repo fails with GitHub's usual auth error. A project can list
+several repos, from several owners (you, your orgs): boxen mints one token per
+owner, and git and `gh` inside pick the right one by the repo they talk to.
+
+```bash
+boxen repos myproj                          # the list, each repo's state, and repos found unlisted
+boxen repos myproj add you/fork other/lib   # owner/repo or https://github.com/owner/repo
+boxen repos myproj rm other/lib
+```
+
+States: `ok` (the token covers it), `not your repo` (the app isn't installed
+on that account, so no token is possible: pulls work if it's public; to push,
+fork it and add the fork), `no access` (the app is on that account but not on
+this repo: add it to the app's installation on GitHub). `boxen repos` also
+lists the GitHub repos the project's folder mentions (every remote of the
+repo and of nested repos and submodules, read from their git config as text,
+never by running git) that aren't on the list, so a project asking for a
+fork or a second repo is one `add` away. Adding takes effect at once (tokens
+are minted again); in `boxen ui` (**G**) it asks you to confirm first, like
+trusting a folder.
 
 ## Create a project
 
@@ -78,10 +105,11 @@ appears in the app's Code tab.
 ### boxen ui
 
 `boxen ui` opens the dashboard: every project with its container, server,
-CPU, memory and GitHub token; per project its state, sidecars, last apply,
-earlier sessions, logs and open terminals; and a jobs panel with the live
-output of everything you run from it. Actions go through `boxen` itself, and
-a question (trusting a folder, `rm`) comes up as a dialog. Shells, Claude,
+CPU, memory and GitHub token; per project its state, GitHub repos, sidecars,
+last apply, earlier sessions, logs and open terminals; and a jobs panel with
+the live output of everything you run from it. Actions go through `boxen`
+itself, and a question (trusting a folder, `rm`, adding a repo with **G**)
+comes up as a dialog. Shells, Claude,
 log tails and resumed sessions open as tmux windows (tabs at the bottom):
 **F1** (or **Ctrl+B 0**, when a program like htop wants the F-keys, which
 tmux takes first) comes back to the dashboard, **F2**/**F3** go to the
@@ -104,6 +132,8 @@ drop loses nothing: `boxen ui` again picks up where you were. **q** detaches
   whether it has a `compose.override.yaml`.
 - `boxen shell <name>` — bash inside the container.
 - `boxen claude <name> [args]` — a terminal Claude session inside it.
+- `boxen repos <name> [add|rm <owner/repo>...]` — the GitHub repos the
+  project's tokens cover (see "Which repos a project can push to").
 - `boxen rm <name> [--yes]` — remove container, image, config, the project's
   home volume (tool installs: the next `boxen new` starts from a fresh home)
   and sidecar data; keeps `~/src/<name>` and its Claude history.
@@ -147,8 +177,8 @@ boxen only for `ls`, `show`, `up`, `restart`, `down`, `logs --tail`,
 `update`, `self-update`, `new`, `resume`, `rm` and `tokens`, arguments
 checked first; no shell, no Docker socket, nothing that needs a terminal.
 Every other project gets a socket of its own, scoped to itself: inside it,
-`boxen` runs only `ls`, `show`, `logs`, `restart` and `update` for that
-project (see Customizing). When an action
+`boxen` runs only `ls`, `show`, `logs`, `repos` (read only), `restart` and
+`update` for that project (see Customizing). When an action
 needs a decision (trusting a new folder, `rm`), boxen prints the exact
 question instead of answering, the supervisor shows it to you in the app,
 and only your yes re-runs it with `--approve trust` or `--yes`.
@@ -226,15 +256,17 @@ repo or a project's `compose.yaml` (`self-update` rewrites it);
   or the Docker socket, and `no-new-privileges` plus a pids limit are added.
   Files under `env/` are never followed through symlinks.
 - A project's own `boxen` socket is scoped to that project by which socket
-  it is (never by what the request says): `ls`, `show`, `logs`, `restart`,
-  `update` for itself, nothing for any other project.
+  it is (never by what the request says): `ls`, `show`, `logs`, `repos`
+  (read only), `restart`, `update` for itself, nothing for any other project.
 - Tool installs under a container's home folder persist per project in its
   own volume, removed with `boxen rm`.
 - The shared `claude-config` volume isn't isolated between projects: any
   container can read the login and every transcript. Untrusted code belongs
   on another VM.
-- A project's GitHub token is visible to everything in its container, hence
-  one repo and one hour. The app's private key never enters a container.
+- A project's GitHub tokens are visible to everything in its container,
+  hence only the repos you listed for it, and one hour. Its git remotes don't
+  widen that: the list lives on the VM, out of the container's reach. The
+  app's private key never enters a container.
 - Containers reach anything the VM can, including your LAN: give the VM its
   own VLAN and block RFC1918 except what you need.
 - Cloned repos can carry hooks and settings (`.claude/settings.json`,
@@ -249,8 +281,9 @@ repo or a project's `compose.yaml` (`self-update` rewrites it);
 - **Sign-in expired or wrong account:** `boxen login`.
 - **Env change didn't take effect:** `boxen restart <name>` (a plain Docker
   restart doesn't re-read env files).
-- **Clone, push or `gh` fails with an auth error:** `boxen ls` shows the token
-  state. Usually the app isn't installed on that repo, or lacks a permission
+- **Clone, push or `gh` fails with an auth error:** `boxen repos <name>`
+  shows whether the repo is on the project's list and its state. Usually
+  it isn't listed, the app isn't installed on that repo, or lacks a permission
   (e.g. Workflows for `.github/workflows/`); `~/.config/boxen/tokens.log` has
   cron-time failures. The VM's clock must be right.
 

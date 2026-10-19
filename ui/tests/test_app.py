@@ -10,7 +10,7 @@ from boxen_ui import procs
 from boxen_ui.app import BoxenApp, editor_argv
 from boxen_ui.jobs import parse_approval, question_project
 from boxen_ui.screens import (ApprovalScreen, ConfirmScreen, GlobalMenuScreen, NewProjectScreen, QuestionScreen,
-                              wrap_question)
+                              ReposScreen, wrap_question)
 from boxen_ui.tmux import hold_script
 
 SIZE = (120, 35)
@@ -616,6 +616,7 @@ async def test_command_palette_lists_actions(world):
         await started(pilot, app)
         titles = [c.title for c in app.get_system_commands(app.dashboard)]
         assert "Up: caulker" in titles and "Remove: caulker" in titles and "Self-update boxen" in titles
+        assert "GitHub repos: caulker" in titles and "Add found repo: caulker" in titles
         await pilot.press("ctrl+p")
         await pilot.pause(0.3)
         assert "CommandPalette" in type(app.screen).__name__
@@ -986,6 +987,7 @@ async def test_injection_harness(world):
     c = doc["projects"][0]
     c["server"] = "connected" + P
     c["repo"] = "r" + P
+    c["repos"] = [{"repo": "r" + P, "state": P, "origin": True}]
     c["container"]["id"] = P * 2
     c["sidecars"][0]["image"] = P
     c["sidecars"].append(sidecar("caulker", "x" + P, P))
@@ -998,14 +1000,22 @@ async def test_injection_harness(world):
     w.write("capture.txt", "cap " + P + "\n\x1b[31mred\x1b[0m\n")
     w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@3", "name": "caulker/shell" + P}])
     w.rules([{"args": ["logs", "caulker", "--tail", "300"], "out": ["log " + P]},
+             {"args": ["repos", "caulker", "--suggest"], "out": ["found " + P]},
              {"args": ["up", "caulker"], "out": ["job " + P, "boxen: approval needed (trust) for caulker:", "    q " + P,
                                                  "boxen: to approve, run: boxen up caulker --approve trust"], "rc": 3},
              {"args": ["update", "caulker"], "out": ["fail " + P], "rc": 1}])
     app = BoxenApp(env=w.env)
     async with app.run_test(size=(160, 45)) as pilot:
         await started(pilot, app)
+        await wait_for(pilot, lambda: app.dashboard.suggest.get("caulker"), what="found repos")
         await pilot.pause(0.5)
         check(app, "overview")
+        await pilot.press("G")
+        await wait_for(pilot, lambda: isinstance(app.screen, ReposScreen), what="repos dialog")
+        await pilot.pause(0.2)
+        check(app, "repos-dialog")
+        await pilot.press("escape")
+        await pilot.pause(0.2)
         app.dashboard.action_sessions_tab()
         await wait_for(pilot, lambda: app.dashboard._sessions, what="sessions")
         await pilot.pause(0.2)
@@ -1053,3 +1063,148 @@ def test_long_lines_split_between_characters():
     sp = LineSplitter(lambda text, frag: out.append((text, frag)))
     sp.feed(b"x" * (SPLIT + 10) + b"\n")
     assert all(f for _t, f in out)
+
+
+# ------------------------------------------------------------ GitHub repos
+
+REPOS_BLOCK = [
+    "boxen: approval needed (repos) for caulker:",
+    "    Let caulker push to: you/fork? Its token will cover these repos.",
+    "boxen: to approve, run: boxen repos caulker add you/fork --yes",
+]
+
+
+def repos_doc(extra=()):
+    doc = four_projects()
+    doc["projects"][0]["github"] = "token partial"
+    doc["projects"][0]["repos"] = [{"repo": "theycallmeboxy/caulker", "state": "ok", "origin": True},
+                                   {"repo": "upstream/lib", "state": "not-installed", "origin": False},
+                                   {"repo": "theycallmeboxy/private", "state": "no-access", "origin": False}] + list(extra)
+    return doc
+
+
+def repo_cells(app):
+    t = app.dashboard.query_one("#repos")
+    return [[t.get_cell_at((r, c)).plain for c in range(3)] for r in range(t.row_count)]
+
+
+@aio
+async def test_repos_table_and_found_add_with_approval(world):
+    w = world(ls=repos_doc())
+    w.rules([{"args": ["repos", "caulker", "--suggest"], "out": ["you/fork"]},
+             {"args": ["repos", "caulker", "add", "you/fork"], "out": REPOS_BLOCK, "rc": 3}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: len(repo_cells(app)) == 4, what="repos table with the found row")
+        assert repo_cells(app) == [["theycallmeboxy/caulker", "ok", "origin"],
+                                   ["upstream/lib", "not your repo", ""],
+                                   ["theycallmeboxy/private", "no access", ""],
+                                   ["you/fork", "found, not listed", "a adds"]]
+        assert "token partial" in screen_text(app) and "partial" in screen_text(app)
+        await pilot.press("a")                 # the only found one
+        await wait_for(pilot, lambda: isinstance(app.screen, ApprovalScreen), what="approval dialog")
+        assert "Let caulker push to: you/fork?" in str(app.screen.query_one("#approval-block").render())
+        assert "boxen repos caulker add you/fork --yes" in str(app.screen.query_one("#approval-cmd").render())
+        assert app.focused is app.screen.query_one("#no")
+        await press_button(pilot, app, "#yes")
+        await job_done(pilot, app, 2)
+        assert [c["args"] for c in w.boxen_calls()] == [["repos", "caulker", "add", "you/fork"],
+                                                         ["repos", "caulker", "add", "you/fork", "--yes"]]
+        assert all(c["agent"] == "1" for c in w.boxen_calls())
+
+
+@aio
+async def test_repos_dialog_add_validates_and_remove(world):
+    w = world(ls=repos_doc())
+    w.rules([{"args": ["repos", "caulker", "add", "you/fork", "myorg/x"], "out": [
+        "boxen: approval needed (repos) for caulker:",
+        "    Let caulker push to: you/fork, myorg/x? Its token will cover these repos.",
+        "boxen: to approve, run: boxen repos caulker add you/fork myorg/x --yes"], "rc": 3}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await pilot.press("G")
+        await wait_for(pilot, lambda: isinstance(app.screen, ReposScreen), what="repos dialog")
+        inp = app.screen.query_one("#repo-input")
+        for bad in ("you", "a/b/c", "git@github.com:a/b", "https://gitlab.com/a/b", "a/../b", "[bold]x/y"):
+            inp.value = bad
+            await press_button(pilot, app, "#add")
+            assert isinstance(app.screen, ReposScreen), bad
+            assert "isn't a GitHub repo" in str(app.screen.query_one("#error").render())
+        inp.value = "you/fork, https://github.com/myorg/x.git YOU/fork"
+        await press_button(pilot, app, "#add")
+        await wait_for(pilot, lambda: isinstance(app.screen, ApprovalScreen), what="approval dialog")
+        await press_button(pilot, app, "#yes")
+        await job_done(pilot, app, 2)
+        assert [c["args"] for c in w.boxen_calls()][-2:] == [
+            ["repos", "caulker", "add", "you/fork", "myorg/x"],
+            ["repos", "caulker", "add", "you/fork", "myorg/x", "--yes"]]
+        # remove: select a listed one, x, confirm
+        await pilot.press("G")
+        await wait_for(pilot, lambda: isinstance(app.screen, ReposScreen), what="repos dialog")
+        t = app.screen.query_one("#repo-list")
+        t.focus()
+        t.move_cursor(row=1)
+        await pilot.pause(0.1)
+        await pilot.press("x")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="confirm")
+        await pilot.press("y")
+        await job_done(pilot, app, 3)
+        assert w.boxen_calls()[-1]["args"] == ["repos", "caulker", "rm", "upstream/lib"]
+
+
+@aio
+async def test_repos_injection_renders_literally(world):
+    evil = [INJECT_LINK, INJECT_CLICK, "\x1b]8;;http://x\x1b\\a\x1b]8;;\x1b\\/b", "a/b\x1b[2J"]
+    w = world(ls=repos_doc(extra=[{"repo": INJECT_CLICK, "state": INJECT_LINK, "origin": True}]))
+    w.rules([{"args": ["repos", "caulker", "--suggest"], "out": evil}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=(160, 45)) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: len(repo_cells(app)) == 8, what="repos table")
+        cells = repo_cells(app)
+        assert cells[3][0] == INJECT_CLICK and cells[4][0] == INJECT_LINK and cells[5][0] == INJECT_CLICK
+        assert cells[6][0] == "a/b" and cells[7][0] == "a/b"            # escapes stripped
+        assert cells[4][2] == "not a repo name"
+        txt = screen_text(app)
+        assert INJECT_LINK in txt
+        # a on an invalid found row adds nothing; the valid ones need a pick
+        t = app.dashboard.query_one("#repos")
+        t.focus()
+        t.move_cursor(row=4)
+        await pilot.press("a")
+        await pilot.pause(0.3)
+        assert w.boxen_calls() == []
+        await pilot.press("G")
+        await wait_for(pilot, lambda: isinstance(app.screen, ReposScreen), what="repos dialog")
+        assert INJECT_LINK in screen_text(app)
+        assert app.is_running
+
+
+def test_parse_approval_repos_shapes():
+    job = ["repos", "a", "add", "you/fork", "https://github.com/myorg/x.git"]
+    block = ["boxen: approval needed (repos) for a:", "    Let a push to: you/fork, myorg/x?",
+             "boxen: to approve, run: boxen repos a add you/fork myorg/x --yes"]
+    got = parse_approval(block, "a", "repos", job)
+    assert got.argv == ["boxen", "repos", "a", "add", "you/fork", "myorg/x", "--yes"] and got.kind == "repos"
+    run = "boxen: to approve, run: "
+    for cmd in [
+        "boxen repos a add you/fork myorg/x evil/extra --yes",       # a repo added
+        "boxen repos a add you/fork --yes",                          # one dropped: not what was asked
+        "boxen repos a add myorg/x you/fork --yes",                  # reordered
+        "boxen repos b add you/fork myorg/x --yes",                  # another project
+        "boxen repos a rm you/fork myorg/x --yes",                   # wrong verb
+        "boxen repos a add you/fork myorg/x",                        # no --yes
+        "boxen repos a add you/fork  myorg/x --yes",                 # double space
+        "boxen repos a add you/fork https://github.com/myorg/x --yes",   # not plain owner/repo
+        "boxen repos a add you/fork myorg/x --yes; rm -rf ~",
+        "boxen up a --approve trust",
+    ]:
+        assert parse_approval(block[:2] + [run + cmd], "a", "repos", job) is None, cmd
+    head_b = ["boxen: approval needed (repos) for b:", block[1], run + "boxen repos b add you/fork myorg/x --yes"]
+    assert parse_approval(head_b, "a", "repos", job) is None                   # another project's question
+    assert parse_approval(block, "a", "up", ["up", "a"]) is None              # asked by an up job
+    assert parse_approval(block, "a", "repos", ["repos", "a", "rm", "you/fork", "myorg/x"]) is None
+    assert parse_approval(block, "a", "repos", ["repos", "a", "add", "you/fork", "myorg/x", "--yes"]) is None
+    assert parse_approval(block, "a", "repos", None) is None

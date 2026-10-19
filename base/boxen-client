@@ -37,6 +37,8 @@ From a project's own container (%s), for this project only:
   ls                                        List projects (read only)
   show                                      This project's sidecars, Dockerfile, services.yaml
   logs [--tail N]                           This project's server output
+  repos [--suggest]                         The GitHub repos this project can push to (read only;
+                                            the user adds more on the VM)
   restart                                   Apply /boxen/services.yaml: recreate this container
   update                                    Apply /boxen/Dockerfile: rebuild the image, recreate this container
 

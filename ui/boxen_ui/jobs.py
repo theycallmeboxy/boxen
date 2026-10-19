@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import procs
-from .config import valid_name
+from .config import REPO_RE, repo_arg, valid_name
 from .textutil import clean_line
 
 MAX_LINES = 5000
@@ -72,7 +72,8 @@ _HEAD = re.compile(r"^boxen: approval needed \(([a-z]+)\) for ([a-z0-9]+(?:[_-][
 _RUN = re.compile(r"^boxen: to approve, run: (.+)$")
 # What each kind of question may be answered with, and which jobs can ask it.
 _ANSWERS = {"trust": ("up", ["--approve", "trust"], ("up", "restart", "new")),
-            "rm": ("rm", ["--yes"], ("rm",))}
+            "rm": ("rm", ["--yes"], ("rm",)),
+            "repos": ("repos", None, ("repos",))}      # its answer: see _repos_answer
 
 
 @dataclass
@@ -85,17 +86,50 @@ class Approval:
     argv: list           # command split; argv[0] == "boxen"
 
 
-def parse_approval(raw, job_project, job_verb):
-    """The approval block a job (`boxen <job_verb> <job_project> ...`) ended
-    with, from its raw output lines (before any cleaning), or None. Taken
-    only when it's exactly what bin/boxen's approval_needed prints and
-    nothing else could have: the run line is the last line of the output;
-    above it only lines indented by 4, up to the header; no line of the
-    block holds a carriage return or an escape character (which could
-    redraw what's shown); the header names the job's own project; and the
-    command is the one answer for that kind of question (trust: boxen up
-    NAME --approve trust, from an up/restart/new job; rm: boxen rm NAME
-    --yes, from an rm job)."""
+def asked_repos(job_args, name):
+    """The repos a `boxen repos NAME add R...` job asked for, as bin/boxen
+    prints them back (each normalized to owner/repo, repeats dropped,
+    ignoring case), or None when job_args isn't exactly that."""
+    if not job_args or len(job_args) < 4 or list(job_args[:3]) != ["repos", name, "add"]:
+        return None
+    out, seen = [], set()
+    for a in job_args[3:]:
+        r = repo_arg(a)
+        if r is None:
+            return None
+        if r.lower() not in seen:
+            seen.add(r.lower())
+            out.append(r)
+    return out
+
+
+def _repos_answer(cmd, name, job_args):
+    """argv for a repos approval's run line: exactly `boxen repos NAME add
+    R1 ... Rn --yes`, every R plain owner/repo, and R1..Rn exactly the repos
+    the job asked for: nothing added, nothing else."""
+    asked = asked_repos(job_args, name)
+    parts = cmd.split(" ")
+    if asked is None or len(parts) < 6 or parts[:4] != ["boxen", "repos", name, "add"] or parts[-1] != "--yes":
+        return None
+    repos = parts[4:-1]
+    if not all(REPO_RE.match(r) and ".." not in r for r in repos) or repos != asked:
+        return None
+    return parts
+
+
+def parse_approval(raw, job_project, job_verb, job_args=None):
+    """The approval block a job (`boxen <job_verb> <job_project> ...`, all
+    of its arguments in job_args) ended with, from its raw output lines
+    (before any cleaning), or None. Taken only when it's exactly what
+    bin/boxen's approval_needed prints and nothing else could have: the run
+    line is the last line of the output; above it only lines indented by 4,
+    up to the header; no line of the block holds a carriage return or an
+    escape character (which could redraw what's shown); the header names
+    the job's own project; and the command is the one answer for that kind
+    of question (trust: boxen up NAME --approve trust, from an
+    up/restart/new job; rm: boxen rm NAME --yes, from an rm job; repos:
+    boxen repos NAME add R... --yes, from a `repos NAME add` job, with
+    exactly the repos it asked for)."""
     lines = list(raw)
     while lines and lines[-1] == "":
         lines.pop()
@@ -120,6 +154,11 @@ def parse_approval(raw, job_project, job_verb):
     if job_verb not in asked_by:
         return None
     cmd = r.group(1)
+    if kind == "repos":
+        argv = _repos_answer(cmd, name, job_args)
+        if argv is None:
+            return None
+        return Approval(kind, name, block[1:-1], block, cmd, argv)
     if cmd != " ".join(["boxen", verb, name] + flags):
         return None
     return Approval(kind, name, block[1:-1], block, cmd, ["boxen", verb, name] + flags)
@@ -287,7 +326,7 @@ class JobManager:
         elif rc == 0:
             job.status = OK
         elif rc == 3:
-            job.approval = parse_approval(job.raw, job.project, job.verb)
+            job.approval = parse_approval(job.raw, job.project, job.verb, job.argv[1:])
             job.status = APPROVAL
         else:
             job.status = FAILED

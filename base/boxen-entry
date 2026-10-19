@@ -16,7 +16,8 @@ if [ -t 0 ]; then
   done
 fi
 # git: for github.com, ask git-credential-boxen (and only it) for
-# credentials; rewrite SSH-style GitHub remotes (common in repos brought
+# credentials, telling it the repo's path (it picks the token for that
+# repo's owner); rewrite SSH-style GitHub remotes (common in repos brought
 # over from a Mac) to HTTPS, since containers authenticate with tokens,
 # not SSH keys. Set at every start (idempotent) because the home folder is
 # a volume that outlives the image.
@@ -24,6 +25,7 @@ if command -v git >/dev/null 2>&1; then
   git config --global init.defaultBranch main
   git config --global --replace-all credential.https://github.com.helper ''
   git config --global --add credential.https://github.com.helper boxen
+  git config --global credential.https://github.com.useHttpPath true
   git config --global --replace-all url.https://github.com/.insteadOf git@github.com:
   git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
 fi 2>/dev/null

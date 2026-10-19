@@ -29,6 +29,13 @@ class Container:
 
 
 @dataclass
+class Repo:
+    repo: str            # owner/repo, from the project's list (untrusted text all the same)
+    state: str           # ok, not-installed, no-access, error, - (not checked yet)
+    origin: bool = False
+
+
+@dataclass
 class Project:
     name: str
     container: object    # Container or None (not created)
@@ -37,6 +44,7 @@ class Project:
     repo: object
     sidecars: list = field(default_factory=list)
     supervisor: bool = False
+    repos: list = field(default_factory=list)    # Repo, the first one first
 
     @property
     def running(self):
@@ -62,8 +70,16 @@ def _project(d, supervisor=False):
             sidecars.append(Sidecar(s["service"], _s(s.get("container")) or "boxen.%s.%s" % (d["name"], s["service"]),
                                     _s(s.get("image"))))
     repo = d.get("repo")
+    repo = repo if isinstance(repo, str) else None
+    repos = []
+    if isinstance(d.get("repos"), list):
+        for r in d["repos"]:
+            if isinstance(r, dict) and isinstance(r.get("repo"), str) and r["repo"]:
+                repos.append(Repo(r["repo"], _s(r.get("state"), "-") or "-", r.get("origin") is True))
+    elif repo:                       # `ls --json` version 1: the origin's repo, no states
+        repos.append(Repo(repo, "-", True))
     return Project(d["name"], cont, _s(d.get("server"), "-"), _s(d.get("github"), "-"),
-                   repo if isinstance(repo, str) else None, sidecars, supervisor)
+                   repo, sidecars, supervisor, repos)
 
 
 def parse_ls(text):
@@ -121,8 +137,8 @@ def container_style(p):
 
 HEALTH_STYLE = {"healthy": GREEN, "unhealthy": RED, "starting": GREY}
 
-_GITHUB = {"token ok": ("ok", GREEN), "token stale": ("stale", AMBER), "no token": ("none", AMBER),
-           "run boxen github": ("setup", AMBER), "-": ("-", GREY)}
+_GITHUB = {"token ok": ("ok", GREEN), "token partial": ("partial", AMBER), "token stale": ("stale", AMBER),
+           "no token": ("none", AMBER), "run boxen github": ("setup", AMBER), "-": ("-", GREY)}
 
 
 def github_short(p):
@@ -149,3 +165,14 @@ def uptime(iso, now=None):
     if s < 86400:
         return "%dh %02dm" % (s // 3600, (s % 3600) // 60)
     return "%dd %dh" % (s // 86400, (s % 86400) // 3600)
+
+
+# A listed repo's state (bin/boxen state.json) -> what the Repos table says.
+_REPO_STATE = {"ok": ("ok", GREEN), "not-installed": ("not your repo", GREY), "no-access": ("no access", AMBER),
+               "error": ("no token right now", RED), "-": ("not checked yet", GREY)}
+
+
+def repo_state(state):
+    """(label, style) for a repo's state; an unknown one is shown as it is,
+    cut short (untrusted: callers clean it like any other text)."""
+    return _REPO_STATE.get(state, (state[:20], ""))

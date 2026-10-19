@@ -96,6 +96,7 @@ Usage: boxen <command> [args]
   resume <name> [N|ID] [--stop|--attach|--force]  Continue an earlier session in the Claude app
   rm <name> [--yes]                               Remove container, image, config, tool installs and sidecar data (keeps the code)
   github [--reset] [--key f.pem]                  Connect GitHub: your app, per-project tokens, commit identity
+  repos <name> [add|rm <owner/repo>...]           The GitHub repos a project's tokens cover (and ones found, unlisted)
   login                                           Sign in to Claude again (shared by every project)
   update [name|all] [--prepare]                   Rebuild images: fresh base and every project, or one project (--prepare: only build)
   self-update                                     Update boxen itself and apply it to every project
@@ -343,14 +344,17 @@ cmd_setup() {
   install_shared_config
 
   # Projects from before env/ existed: move their Dockerfile there now, so
-  # the compose template that expects it works. Done here (and not only in
-  # self-update) because a self-update started by the previous boxen runs
-  # the new installer, and so this, before it re-renders every project.
+  # the compose template that expects it works. Projects from before repo
+  # lists get theirs, from their origin as it is now (seed_repos). Done here
+  # (and not only in self-update) because a self-update started by the
+  # previous boxen runs the new installer, and so this, before it
+  # re-renders every project.
   local n
   while read -r n; do
     [[ -f "$(proj_dir "$n")/compose.yaml" ]] || continue
     migrate_env "$n"
     fresh_compose "$n"
+    seed_repos "$n"
   done < <(projects)
   return 0
 }
@@ -454,16 +458,23 @@ cmd_login() {
 
 # ---------------------------------------------------------------- GitHub
 #
-# A private GitHub App you own mints short-lived tokens (1 hour), each scoped
-# to one project's repo. The app's private key stays on the VM. Containers only
-# see their own token, through a read-only mount of projects/<name>/token, and
-# cron refreshes it every 30 minutes.
+# A private GitHub App you own mints short-lived tokens (1 hour). Which repos
+# a project's tokens cover is a list you keep on the VM,
+# projects/<name>/repos (see `boxen repos`), which is never mounted into a
+# container: the project's git remotes, which its own Claude can change,
+# don't decide what it can reach. One token per owner (you, an org) in the
+# list, scoped to that owner's listed repos, in projects/<name>/token:
+# gh-token.<owner>, gh-token (the default: the first listed repo's owner's)
+# and state.json (each listed repo's state). The app's private key stays on
+# the VM. A container sees only its own token folder, read-only at
+# /run/boxen, and cron refreshes it every 30 minutes.
 
 GH_DIR="$BOXEN_HOME/github"
 GH_KEY="$GH_DIR/app.pem"
 GH_CONF="$GH_DIR/app.conf"
 TOKENS_LOG="$BOXEN_HOME/tokens.log"
 GH_API="https://api.github.com"
+GITSCAN="$BOXEN_REPO/bin/boxen-gitscan"
 
 app_configured() { [[ -s "$GH_KEY" && -s "$GH_CONF" ]]; }
 app_conf() { sed -n "s/^$1=//p" "$GH_CONF" 2>/dev/null | tail -1; }
@@ -504,6 +515,15 @@ gh_app_api() {
   return "$rc"
 }
 gh_msg() { jq -r '.message // empty' <<<"$1" 2>/dev/null || true; }
+# gh_unreachable REPLY: a failed gh_app_api got no answer from GitHub at all
+# (the network, an outage page) rather than GitHub saying no.
+gh_unreachable() {
+  [[ "$(gh_msg "$1")" == "no reply from GitHub"* ]] || ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$1"
+}
+
+# owner and repo: GitHub's own shape (start alphanumeric, no trailing . or -), and no ".."
+REPO_SEG='[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9_])?'
+repo_shape() { [[ $1 =~ ^$REPO_SEG/$REPO_SEG$ && $1 != *..* ]]; }
 
 # github.com remote URL (https or ssh form) -> owner/repo
 github_repo() {
@@ -511,114 +531,351 @@ github_repo() {
   u=${u%.git}
   case $u in
     https://github.com/*)   u=${u#https://github.com/} ;;
-    https://*@github.com/*) u=${u#https://*@github.com/} ;;
     git@github.com:*)       u=${u#git@github.com:} ;;
     ssh://git@github.com/*) u=${u#ssh://git@github.com/} ;;
-    *) return 1 ;;
+    *)
+      # https://user@github.com/ (no / in the user part)
+      [[ $u =~ ^https://[^/@]+@github\.com/ ]] || return 1
+      u=${u#"${BASH_REMATCH[0]}"} ;;
   esac
-  # owner and repo: GitHub's own shape (start alphanumeric, no trailing . or -), and no ".."
-  local seg='[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9_])?'
-  [[ $u =~ ^$seg/$seg$ && $u != *..* ]] || return 1
+  repo_shape "$u" || return 1
   printf '%s\n' "$u"
 }
 
-project_repo() {
-  local url
-  url=$(git -C "$SRC_ROOT/$1" remote get-url origin 2>/dev/null) || return 1
-  github_repo "$url"
+# repo_arg ARG: owner/repo from what someone typed: owner/repo, or a
+# github.com URL.
+repo_arg() {
+  case $1 in
+    *://*|*@*) github_repo "$1" ;;
+    *)         github_repo "https://github.com/$1" ;;
+  esac
 }
 
 mkdir_private() { mkdir -p "$1" && chmod 700 "$1"; }
 
 token_dir() { printf '%s/token' "$(proj_dir "$1")"; }
+repos_file() { printf '%s/repos' "$(proj_dir "$1")"; }
 
-# token_state NAME: for `boxen ls`, from the token file alone (no network).
-# Tokens last an hour and cron renews them every 30 minutes, so one older
-# than 55 minutes means the refresh isn't happening.
-token_state() {
-  local f now
-  f="$(token_dir "$1")/gh-token"
-  if (( $# > 1 )); then
-    [[ -n "$2" ]] || { echo "-"; return; }          # the repo, already looked up: none
-  else
-    project_repo "$1" >/dev/null 2>&1 || { echo "-"; return; }
+# listed_repos NAME: the project's repo list, one owner/repo per line as
+# written there, the first one first. Comments (#), blank lines and lines
+# that aren't a repo are skipped; a repo listed twice (in any case) counts
+# once. No list: nothing.
+listed_repos() {
+  local f line seen=" "
+  f=$(repos_file "$1")
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%%#*}
+    line=${line//[[:space:]]/}
+    line=${line%.git}
+    repo_shape "$line" || continue
+    [[ "$seen" != *" ${line,,} "* ]] || continue
+    seen+="${line,,} "
+    printf '%s\n' "$line"
+  done < "$f"
+}
+
+# bad_repo_lines NAME: lines of the list that aren't a repo (hand edits).
+bad_repo_lines() {
+  local f line r
+  f=$(repos_file "$1")
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    r=${line%%#*}
+    r=${r//[[:space:]]/}
+    [[ -z "$r" ]] || repo_shape "${r%.git}" || printf '%s\n' "$line"
+  done < "$f"
+}
+
+repos_header() {
+  cat <<EOF
+# GitHub repos the $1 project's tokens cover, one owner/repo per line; the
+# first is the default for gh. Written by boxen: change it with
+# 'boxen repos $1 add|rm owner/repo'. The project's git remotes never change it.
+EOF
+}
+
+# write_repos NAME < content: replace the list atomically (a temp file in
+# the project dir, then mv).
+write_repos() {
+  local f tmp
+  f=$(repos_file "$1")
+  tmp=$(mktemp -p "$(proj_dir "$1")" .repos.XXXXXX) || return 1
+  cat > "$tmp"
+  chmod 0644 "$tmp"
+  mv -fT "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+# origin_repo NAME: owner/repo of the project's origin, if it's on GitHub,
+# read from the code folder's git config as text by boxen-gitscan (git is
+# never run on a folder the container controls).
+origin_repo() { "$GITSCAN" origin "$SRC_ROOT/$1" 2>/dev/null || true; }
+
+# found_repos NAME: every GitHub repo the code folder's git configs name:
+# all remotes, nested repos, submodules (boxen-gitscan; at most 2 s). Written
+# by the container, so untrusted, but only ever owner/repo.
+found_repos() { "$GITSCAN" scan "$SRC_ROOT/$1" 2>/dev/null || true; }
+
+# unlisted_repos NAME: found_repos that aren't in the list.
+unlisted_repos() {
+  local r listed
+  listed=" $(listed_repos "$1" | tr '\n' ' ') "
+  listed=${listed,,}
+  while IFS= read -r r; do
+    repo_shape "$r" || continue
+    [[ "$listed" == *" ${r,,} "* ]] || printf '%s\n' "$r"
+  done < <(found_repos "$1")
+}
+
+# seed_repos NAME [REPO]: a project without a list gets one: REPO (what
+# `new` clones; none if empty), else the project's origin now if that's on
+# GitHub, else an empty list. Happens once (`new`, `setup`, or else the
+# first token refresh); after that, origin is never asked again.
+seed_repos() {
+  local n=$1 repo=${2-} f
+  [[ "$n" != supervisor && -d "$(proj_dir "$n")" ]] || return 0
+  f=$(repos_file "$n")
+  [[ ! -e "$f" && ! -L "$f" ]] || return 0
+  (( $# > 1 )) || repo=$(origin_repo "$n")
+  { repos_header "$n"; [[ -z "$repo" ]] || printf '%s\n' "$repo"; } | write_repos "$n"
+}
+
+# repo_states NAME REPO...: each repo's state from token/state.json, a
+# line each: ok, not-installed, no-access, error, or - (not known yet).
+repo_states() {
+  local n=$1 f r out
+  shift
+  (( $# )) || return 0
+  f="$(token_dir "$n")/state.json"
+  if [[ -f "$f" ]] && out=$(jq -r '(if type == "object" then . else {} end) as $s | $ARGS.positional[]
+        | ($s[ascii_downcase] // "-")
+        | if IN("ok", "not-installed", "no-access", "error") then . else "-" end' "$f" --args "$@" 2>/dev/null); then
+    printf '%s\n' "$out"
+    return 0
   fi
+  for r in "$@"; do echo "-"; done
+}
+
+# github_state NAME STATE...: the GITHUB column of `boxen ls`, from the
+# listed repos' states (repo_states) and the token files' age, no network:
+# "-" with nothing listed; "token ok" when every listed repo is covered,
+# "token partial" when some are, "no token" when none is; "token stale" when
+# a token is older than 55 minutes (tokens last an hour and cron renews them
+# every 30 minutes, so the refresh isn't happening).
+github_state() {
+  local n=$1 s ok=0 dir
+  shift
+  (( $# )) || { echo "-"; return; }
   app_configured || { echo "run boxen github"; return; }
-  [[ -f "$f" ]] || { echo "no token"; return; }
-  printf -v now '%(%s)T' -1
-  if (( now - $(stat -c %Y "$f") < 3300 )); then echo "token ok"; else echo "token stale"; fi
-}
-
-# app_account OWNER: true if the boxen app is installed on that account (you,
-# or an org you added it to). Only asked when a repo lookup fails.
-APP_ACCOUNTS=""
-app_account() {
-  if [[ -z "$APP_ACCOUNTS" ]]; then
-    APP_ACCOUNTS=$(gh_app_api GET "/app/installations?per_page=100" \
-                     | jq -r '.[].account.login' 2>/dev/null | tr 'A-Z' 'a-z') || true
-    # If GitHub can't be asked, assume it's yours so the real error is shown.
-    [[ -n "$APP_ACCOUNTS" ]] || { APP_ACCOUNTS="?"; }
+  dir=$(token_dir "$n")
+  for s in "$@"; do [[ "$s" != ok ]] || ok=$((ok + 1)); done
+  # A token from a boxen before repo lists: renewed at the next refresh.
+  if [[ ! -f "$dir/state.json" && -f "$dir/gh-token" ]]; then ok=$#; fi
+  (( ok )) || { echo "no token"; return; }
+  if [[ -n "$(find "$dir" -maxdepth 1 -type f \( -name gh-token -o -name 'gh-token.*' \) -mmin +55 2>/dev/null)" ]]; then
+    echo "token stale"
+  elif (( ok == $# )); then
+    echo "token ok"
+  else
+    echo "token partial"
   fi
-  [[ "$APP_ACCOUNTS" == "?" ]] && return 0
-  grep -qxF "$(tr 'A-Z' 'a-z' <<<"$1")" <<<"$APP_ACCOUNTS"
 }
 
-# mint_token owner/repo dir: write a 1-hour token for just that repo to
-# dir/gh-token (atomically, so a reader never sees half a token). Prints
-# the expiry time.
-mint_token() {
-  local repo=$1 dir=$2 out inst tok
-  out=$(gh_app_api GET "/repos/$repo/installation") || {
-    # Someone else's repo (a clone of an upstream project): the app can only
-    # be installed on accounts you control, so no token is possible. Not an
-    # error; return 2 so the caller can say so.
-    if ! app_account "${repo%%/*}"; then return 2; fi
-    warn "$repo: the boxen GitHub App can't access it ($(gh_msg "$out")). Add it to the app's installation: $(app_install_url)"
+# installations: "login id" lines (login in lower case) in INSTALLS, every
+# account the app is installed on (you, orgs you added it to). Asked once
+# per run; fails when GitHub couldn't be asked. Call it directly, never in
+# $( ), or the answer isn't kept.
+INSTALLS="" INSTALLS_RC=""
+installations() {
+  local out
+  if [[ -z "$INSTALLS_RC" ]]; then
+    INSTALLS_RC=1
+    if out=$(gh_app_api GET "/app/installations?per_page=100") \
+       && INSTALLS=$(jq -r '.[] | "\(.account.login | ascii_downcase) \(.id)"' <<<"$out" 2>/dev/null); then
+      INSTALLS_RC=0
+    fi
+  fi
+  return "$INSTALLS_RC"
+}
+
+# Per repo (lower case) after a mint: ok, not-installed, no-access or error
+# (see mint_owner); per owner (lower case): its token's expiry.
+declare -A RSTATE=() OWNER_EXP=()
+set_state() {
+  local s=$1 r
+  shift
+  for r in "$@"; do RSTATE[${r,,}]=$s; done
+}
+
+# write_token DIR FILE TOKEN: atomically (a reader never sees half a
+# token), mode 0600.
+write_token() {
+  (umask 077; printf '%s\n' "$3" > "$1/.$2.tmp") && mv -f "$1/.$2.tmp" "$1/$2"
+}
+
+# mint_request INSTALLATION REPO...: a token covering just those repos.
+mint_request() {
+  local inst=$1
+  shift
+  gh_app_api POST "/app/installations/$inst/access_tokens" \
+    "$(jq -nc '{repositories: $ARGS.positional}' --args "${@#*/}")"
+}
+
+# mint_owner DIR OWNER REPO...: one token for the REPOs (owner/repo, all
+# OWNER's) in DIR/gh-token.<owner>, with one request. Each repo's state goes
+# in RSTATE: ok; not-installed (the app isn't on that account: someone
+# else's repo, so no token is possible; not an error); no-access (it is,
+# but the installation doesn't include this repo); error (GitHub couldn't
+# be asked; a token already there is kept). When GitHub refuses the request
+# (it does, whole, if any repo is out of reach), each repo is asked about
+# alone, and the token is for the rest. Fails on errors only.
+mint_owner() {
+  local dir=$1 owner=$2 ol=${2,,} inst="" out="" tok r rc=0 ok=()
+  shift 2
+  if installations; then
+    inst=$(awk -v o="$ol" '$1 == o { print $2; exit }' <<<"$INSTALLS")
+    if [[ -z "$inst" ]]; then
+      set_state not-installed "$@"
+      rm -f "$dir/gh-token.$ol"
+      return 0
+    fi
+  else
+    # No list of installations: ask about the first repo.
+    if out=$(gh_app_api GET "/repos/$1/installation"); then inst=$(jq -r '.id // empty' <<<"$out"); fi
+  fi
+  if ! [[ "$inst" =~ ^[0-9]+$ ]]; then
+    warn "$owner: couldn't find the GitHub App's installation ($(gh_msg "$out")); keeping the token there was"
+    set_state error "$@"
     return 1
-  }
-  inst=$(jq -r .id <<<"$out")
-  out=$(gh_app_api POST "/app/installations/$inst/access_tokens" \
-          "$(jq -nc --arg r "${repo#*/}" '{repositories: [$r]}')") || {
-    warn "$repo: couldn't get a token ($(gh_msg "$out"))"
+  fi
+  if (( $# > 500 )); then
+    warn "$owner: more than 500 repos listed; only the first 500 get a token"
+    set_state error "${@:501}"
+    set -- "${@:1:500}"
+    rc=1
+  fi
+  if out=$(mint_request "$inst" "$@"); then
+    ok=("$@")
+  elif gh_unreachable "$out"; then
+    warn "$owner: couldn't get a token ($(gh_msg "$out")); keeping the one there was"
+    set_state error "$@"
     return 1
-  }
+  else
+    for r in "$@"; do
+      if out=$(gh_app_api GET "/repos/$r/installation") && [[ "$(jq -r '.id // empty' <<<"$out")" == "$inst" ]]; then
+        ok+=("$r")
+      elif gh_unreachable "$out"; then
+        set_state error "$r"
+        rc=1
+      else
+        set_state no-access "$r"
+        warn "$r: the boxen GitHub App can't access it ($(gh_msg "$out")). Add it to the app's installation: $(app_install_url)"
+      fi
+    done
+    if (( ${#ok[@]} )) && ! out=$(mint_request "$inst" "${ok[@]}"); then
+      warn "$owner: couldn't get a token ($(gh_msg "$out"))"
+      set_state error "${ok[@]}"
+      return 1
+    fi
+  fi
+  if (( ${#ok[@]} == 0 )); then
+    (( rc )) || rm -f "$dir/gh-token.$ol"
+    return "$rc"
+  fi
   tok=$(jq -r '.token // empty' <<<"$out")
-  [[ -n "$tok" ]] || { warn "$repo: GitHub's reply had no token"; return 1; }
-  mkdir_private "$dir"
-  (umask 077; printf '%s\n' "$tok" > "$dir/.gh-token.tmp")
-  mv -f "$dir/.gh-token.tmp" "$dir/gh-token"
-  jq -r .expires_at <<<"$out"
+  if [[ -z "$tok" ]]; then
+    warn "$owner: GitHub's reply had no token"
+    set_state error "${ok[@]}"
+    return 1
+  fi
+  write_token "$dir" "gh-token.$ol" "$tok"
+  OWNER_EXP[$ol]=$(jq -r '.expires_at // empty' <<<"$out")
+  set_state ok "${ok[@]}"
+  return "$rc"
 }
 
-# Refresh one project's token. A no-op when GitHub isn't set up; removes the
-# token when the project has no GitHub remote (yet). Quiet except for
-# failures, unless `boxen tokens` asked for the per-project report
-# (TOKENS_VERBOSE). Leaves what it found in REPO_STATE for write_status:
-# unconfigured, none, yours, not-yours or failed.
-REPO_STATE=""
-refresh_project() {
-  local n=$1 dir repo exp
-  REPO_STATE=unconfigured
-  app_configured || return 0
+# mint_project NAME: a token per owner in the project's list (mint_owner),
+# the default gh-token (the first listed repo's owner's, or if that has
+# none, the next one's that has), no token file for an owner no longer
+# listed, and state.json: each listed repo's state. Fails when minting
+# failed for some owner.
+mint_project() {
+  local n=$1 dir r ol def="" f rc=0 args=()
+  local -a repos=() owners=()
+  local -A by=()
   dir=$(token_dir "$n")
   mkdir_private "$dir"
-  if ! repo=$(project_repo "$n"); then
+  RSTATE=() OWNER_EXP=()
+  mapfile -t repos < <(listed_repos "$n")
+  for r in "${repos[@]}"; do
+    ol=${r%%/*}
+    ol=${ol,,}
+    if [[ -z "${by[$ol]+x}" ]]; then owners+=("$ol"); by[$ol]=""; fi
+    by[$ol]+="$r "
+  done
+  for ol in "${owners[@]}"; do
+    # shellcheck disable=SC2086  # owner/repo never has a space
+    mint_owner "$dir" "$ol" ${by[$ol]} || rc=1
+  done
+  for r in "${repos[@]}"; do
+    ol=${r%%/*}
+    ol=${ol,,}
+    if [[ -s "$dir/gh-token.$ol" ]]; then def=$ol; break; fi
+  done
+  if [[ -n "$def" ]]; then
+    write_token "$dir" gh-token "$(cat "$dir/gh-token.$def")"
+  else
     rm -f "$dir/gh-token"
-    REPO_STATE=none
-    [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s no GitHub remote; no token\n' "$n"
-    return 0
   fi
-  local rc=0
-  exp=$(mint_token "$repo" "$dir") || rc=$?
-  if (( rc == 2 )); then
-    rm -f "$dir/gh-token"
-    REPO_STATE=not-yours
-    [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s %-36s not your repo: pulls work (public), no token to push\n' "$n" "$repo"
-    return 0
+  for f in "$dir"/gh-token.*; do
+    [[ -e "$f" ]] || continue
+    ol=${f##*/gh-token.}
+    [[ -n "${by[$ol]+x}" ]] || rm -f "$f"
+  done
+  for r in "${repos[@]}"; do args+=("${r,,}" "${RSTATE[${r,,}]:-error}"); done
+  (umask 077
+   jq -n '$ARGS.positional as $a | [range(0; $a | length; 2) | {key: $a[.], value: $a[. + 1]}] | from_entries' \
+     --args "${args[@]}" > "$dir/.state.json.tmp") && mv -f "$dir/.state.json.tmp" "$dir/state.json"
+  return "$rc"
+}
+
+# repo_state_text STATE: what a repo's state means, in a few words.
+repo_state_text() {
+  case $1 in
+    ok)            echo "ok" ;;
+    not-installed) echo "not your repo" ;;
+    no-access)     echo "no access" ;;
+    error)         echo "no token right now" ;;
+    *)             if app_configured; then echo "not checked yet"; else echo "run boxen github"; fi ;;
+  esac
+}
+
+# Refresh one project's tokens (mint_project), first giving it a repo list
+# if it has none (seed_repos). A no-op when GitHub isn't set up, and for the
+# supervisor, which has no token. Quiet except for failures, unless `boxen
+# tokens` asked for the per-project report (TOKENS_VERBOSE).
+refresh_project() {
+  local n=$1 r ol rc=0 msg repos=()
+  [[ "$n" != supervisor ]] || return 0
+  seed_repos "$n"
+  app_configured || return 0
+  mint_project "$n" || rc=1
+  [[ -n "${TOKENS_VERBOSE:-}" ]] || return "$rc"
+  mapfile -t repos < <(listed_repos "$n")
+  if (( ${#repos[@]} == 0 )); then
+    printf '  %-24s no GitHub repos listed; no token (boxen repos %s add owner/repo)\n' "$n" "$n"
   fi
-  (( rc == 0 )) || { REPO_STATE=failed; return 1; }
-  REPO_STATE=yours
-  [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s %-36s token valid until %s\n' "$n" "$repo" "$exp"
+  for r in "${repos[@]}"; do
+    ol=${r%%/*}
+    case ${RSTATE[${r,,}]:-error} in
+      ok)            msg="token valid until ${OWNER_EXP[${ol,,}]:-?}" ;;
+      not-installed) msg="not your repo: pulls work (public), no token to push" ;;
+      no-access)     msg="no access: add it to the app's installation" ;;
+      *)             msg="no token right now (see above)" ;;
+    esac
+    printf '  %-24s %-36s %s\n' "$n" "$r" "$msg"
+  done
+  return "$rc"
 }
 
 # Hidden command: cron runs `tokens --quiet`; `boxen github` runs it to mint
@@ -669,7 +926,7 @@ install_cron() {
   info "cron refreshes tokens every 30 minutes and at boot (problems go to $TOKENS_LOG)"
 }
 
-env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
+env_get() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -1; }
 
 # set_env KEY VALUE in boxen.env: replace an existing (or commented-out) line,
 # else append.
@@ -844,6 +1101,123 @@ EOF
       info "restarted ${#running[@]} running project(s) so they pick up the git identity"
     fi
   fi
+}
+
+# repos NAME [--suggest | add REPO... [--yes] | rm REPO...]: the GitHub repos
+# the project's tokens cover (see the GitHub section above).
+#   repos NAME            the list, each with its state, and the repos found in
+#                         the project folder that aren't listed
+#   repos NAME --suggest  just those found ones, one owner/repo per line
+#   repos NAME add|rm     change the list (owner/repo or https://github.com/...)
+#                         and mint the tokens again at once
+# In agent mode, `add` widens what a project can reach, so it's a question
+# for a person (approval_needed, kind repos) unless --yes; `rm` only
+# narrows it and needs none.
+cmd_repos() {
+  local usage="usage: boxen repos <name> [--suggest | add <owner/repo>... [--yes] | rm <owner/repo>...]"
+  require_project "${1:-}"
+  local n=$1
+  [[ "$n" != supervisor ]] || die "the supervisor has no GitHub token; repos are per project"
+  case ${2:-} in
+    "")        (( $# == 1 )) || die "$usage"; repos_show "$n" ;;
+    --suggest) (( $# == 2 )) || die "$usage"; unlisted_repos "$n" ;;
+    add|rm)    repos_change "$@" ;;
+    *)         die "$usage" ;;
+  esac
+}
+
+# repos_show NAME: the list with each repo's state (from the last token
+# refresh), the origin marked, then what's in the folder but not listed.
+repos_show() {
+  local n=$1 origin i r mark line repos=() states=() found=() bad=()
+  mapfile -t repos < <(listed_repos "$n")
+  mapfile -t states < <(repo_states "$n" "${repos[@]}")
+  mapfile -t bad < <(bad_repo_lines "$n")
+  origin=$(origin_repo "$n")
+  echo "$n: GitHub repos (its tokens cover only these):"
+  (( ${#repos[@]} )) || echo "    none (add one: boxen repos $n add owner/repo)"
+  for i in "${!repos[@]}"; do
+    r=${repos[i]}
+    mark=""
+    [[ "${r,,}" != "${origin,,}" ]] || mark="  (origin)"
+    printf '    %-40s %s%s\n' "$r" "$(repo_state_text "${states[i]:--}")" "$mark"
+  done
+  for line in "${bad[@]}"; do
+    printf '    ignored (not owner/repo): %s\n' "$line"
+  done
+  if [[ -n "$origin" && " ${repos[*],,} " != *" ${origin,,} "* ]]; then
+    echo "$n: origin $origin isn't listed: pushes to it won't work"
+  fi
+  mapfile -t found < <(unlisted_repos "$n")
+  if (( ${#found[@]} )); then
+    echo "Found in the project folder but not listed:"
+    printf '    %s\n' "${found[@]}"
+    echo "  to add: boxen repos $n add <owner/repo>"
+  fi
+}
+
+# repos_change NAME add|rm ARG... [--yes]
+repos_change() {
+  local n=$1 op=$2 yes=0 a r seen=" " listed want=() keep=() missing=() line
+  shift 2
+  for a in "$@"; do
+    case $a in
+      --yes|-y) yes=1 ;;
+      -*) die "unknown option '$a'" ;;
+      *)
+        r=$(repo_arg "$a") || die "'$a' isn't a GitHub repo (owner/repo or https://github.com/owner/repo)"
+        [[ "$seen" == *" ${r,,} "* ]] || { want+=("$r"); seen+="${r,,} "; } ;;
+    esac
+  done
+  (( ${#want[@]} )) || die "usage: boxen repos $n $op <owner/repo>..."
+  lock_project "$n"
+  seed_repos "$n"
+  listed=" $(listed_repos "$n" | tr '\n' ' ') "
+  listed=${listed,,}
+  if [[ "$op" == add ]]; then
+    for r in "${want[@]}"; do
+      [[ "$listed" == *" ${r,,} "* ]] || missing+=("$r")
+    done
+    if (( ${#missing[@]} == 0 )); then
+      echo "$n: already listed: ${want[*]}"
+      repos_show "$n"
+      return 0
+    fi
+    # GitHub mints a token for at most 500 repos.
+    local -A per=()
+    while IFS= read -r r; do
+      a=${r%%/*}
+      per[${a,,}]=$(( ${per[${a,,}]:-0} + 1 ))
+      (( per[${a,,}] <= 500 )) || die "$a: at most 500 repos per owner"
+    done < <(listed_repos "$n"; printf '%s\n' "${missing[@]}")
+    if agent_mode && (( ! yes )); then
+      r=$(printf '%s, ' "${want[@]}")
+      approval_needed repos "$n" "boxen repos $n add ${want[*]} --yes" \
+        <<<"Let $n push to: ${r%, }? Its token will cover these repos." || return $?
+    fi
+    { cat "$(repos_file "$n")"; printf '%s\n' "${missing[@]}"; } | write_repos "$n"
+    echo "$n: added ${missing[*]}"
+  else
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      r=${line%%#*}
+      r=${r//[[:space:]]/}
+      r=${r%.git}
+      if [[ -n "$r" && "$seen" == *" ${r,,} "* ]]; then continue; fi
+      keep+=("$line")
+    done < "$(repos_file "$n")"
+    for r in "${want[@]}"; do
+      [[ "$listed" == *" ${r,,} "* ]] || warn "$n: $r isn't listed"
+    done
+    printf '%s\n' "${keep[@]}" | write_repos "$n"
+    echo "$n: removed ${want[*]}"
+  fi
+  if app_configured; then
+    refresh_project "$n" || true
+  else
+    warn "GitHub isn't set up yet ('boxen github'): no tokens until it is"
+  fi
+  write_status "$n" >/dev/null || true
+  repos_show "$n"
 }
 
 # ------------------------------------------------------------ new project
@@ -1412,11 +1786,12 @@ sidecar_names() {
 }
 
 # write_status NAME: env/STATUS.md, the project's live facts for the Claude
-# inside it (/boxen/STATUS.md): code path, GitHub repo and whether pushes
-# work (from the token refresh just done, REPO_STATE), sidecars, timezone,
-# boxen version. Rewritten at every start.
+# inside it (/boxen/STATUS.md): code path, the GitHub repos it can push to
+# (its list, each with its state from the last token refresh), whether its
+# origin is one of them, repos in its folder that aren't, sidecars,
+# timezone, boxen version. Rewritten at every start and `boxen repos` change.
 write_status() {
-  local n=$1 pdir repo push ver tz
+  local n=$1 pdir ver tz origin r i mark found=() repos=() states=()
   pdir=$(proj_dir "$n")
   [[ -d "$pdir/env" || -L "$pdir/env" ]] || mkdir "$pdir/env"
   env_path "$n" STATUS.md >/dev/null || return 2
@@ -1432,23 +1807,42 @@ write_status() {
     } | write_env "$n" STATUS.md
     return
   fi
-  repo=$(project_repo "$n" 2>/dev/null || true)
-  case $REPO_STATE in
-    yours)        push="yours (token ok)" ;;
-    not-yours)    push="not your repo: pull works if public, push won't — fork to push" ;;
-    failed)       push="yours, but no token right now (see 'boxen ls' on the VM); push may fail" ;;
-    unconfigured) [[ -n "$repo" ]] && push="GitHub isn't connected on the VM yet ('boxen github'); push needs that" || push="no GitHub remote" ;;
-    *)            push="no GitHub remote" ;;
-  esac
-  [[ -n "$repo" ]] || push="no GitHub remote"
+  mapfile -t repos < <(listed_repos "$n")
+  mapfile -t states < <(repo_states "$n" "${repos[@]}")
+  origin=$(origin_repo "$n")
+  mapfile -t found < <(unlisted_repos "$n")
   tz=$(env_get TZ)
   {
     echo "# $n"
     echo
     echo "- Project: $n"
     echo "- Code: $SRC_ROOT/$n (same path on the VM)"
-    echo "- GitHub repo: ${repo:-none}"
-    echo "- Push status: $push"
+    echo "- GitHub repos (this project can push to):"
+    if (( ${#repos[@]} == 0 )); then
+      echo "    none: ask the user to add one (on the VM: boxen repos $n add owner/repo)"
+    fi
+    for i in "${!repos[@]}"; do
+      r=${repos[i]}
+      mark=""
+      [[ "${r,,}" != "${origin,,}" ]] || mark=" (origin)"
+      case ${states[i]:--} in
+        ok)            echo "    - $r — ok: the token covers it$mark" ;;
+        not-installed) echo "    - $r — not your repo: the GitHub App isn't on that account, so no token; pulls work if it's public$mark" ;;
+        no-access)     echo "    - $r — no access: the GitHub App isn't installed on this repo; the user adds it to the app's installation$mark" ;;
+        error)         echo "    - $r — no token right now (see 'boxen ls' on the VM); push may fail$mark" ;;
+        *)             if app_configured; then echo "    - $r — not checked yet$mark"
+                       else echo "    - $r — GitHub isn't connected on the VM yet ('boxen github'); push needs that$mark"; fi ;;
+      esac
+    done
+    if [[ -n "$origin" && " ${repos[*],,} " != *" ${origin,,} "* ]]; then
+      echo "- origin $origin is not in this project's list: pushes to it won't work; ask the user to add it"
+    fi
+    if (( ${#found[@]} )); then
+      r=$(printf '%s, ' "${found[@]:0:5}")
+      r=${r%, }
+      (( ${#found[@]} <= 5 )) || r+=", and $(( ${#found[@]} - 5 )) more"
+      echo "- Found in the project folder but not listed: $r"
+    fi
     echo "- Sidecars (hostname = name, on this project's network):"
     if [[ -f "$pdir/compose.services.yaml" ]]; then
       jq -r '.services | to_entries[] | "    - \(.key) — \(.value.image) — reachable as hostname \(.key)"' "$pdir/compose.services.yaml" 2>/dev/null || echo "    (unreadable)"
@@ -1573,16 +1967,19 @@ cmd_new() {
   create_project "$name"
 
   if [[ -n "$url" ]]; then
+    # The repo cloned starts the project's list of repos its tokens cover.
+    local repo
+    repo=$(github_repo "$url" || true)
+    seed_repos "$name" "$repo"
     if app_configured; then
-      local repo
-      repo=$(github_repo "$url") || die "'$url' isn't a github.com repo URL"
-      local rc=0
-      mint_token "$repo" "$(token_dir "$name")" >/dev/null || rc=$?
-      if (( rc == 2 )); then
-        info "$repo isn't yours, so there's no token for it; cloning works if it's public. To push changes, fork it and clone your fork."
-      elif (( rc )); then
-        die "no GitHub token for $repo, so it can't be cloned (see above)"
-      fi
+      [[ -n "$repo" ]] || die "'$url' isn't a github.com repo URL"
+      refresh_project "$name" || true
+      case $(repo_states "$name" "$repo") in
+        ok) ;;
+        not-installed)
+          info "$repo isn't yours, so there's no token for it; cloning works if it's public. To push changes, fork it, then 'boxen repos $name add <you>/<repo>'." ;;
+        *) die "no GitHub token for $repo, so it can't be cloned (see above)" ;;
+      esac
     else
       warn "GitHub isn't set up ('boxen github'); cloning a private repo will fail unless GH_TOKEN is in boxen.env"
     fi
@@ -1590,6 +1987,8 @@ cmd_new() {
     run_quiet "cloning $url" dc "$name" run --rm --no-deps -T claude git clone "$url" .
   fi
 
+  # Code already in the folder (or none): the list starts from its origin.
+  seed_repos "$name"
   # From here on the project exists; keep it even if the start needs a retry.
   trap - EXIT
   NEW_PDIR=""
@@ -1652,17 +2051,20 @@ cmd_supervisor() {
 # collect_projects: what `ls` shows, for every project, in L_* arrays (one
 # entry per project, in projects order): container status, restarts,
 # StartedAt and id ("" when there's no container), server state, GitHub
-# token state and repo. One `docker inspect` for every container, server
-# states from server_state_cached, one git call per project. DOCKER_OK=0
-# when docker couldn't be asked at all.
+# token state, the first listed repo, every listed repo and its state
+# (space-separated) and the origin's repo. One `docker inspect` for every
+# container, server states from server_state_cached, one boxen-gitscan for
+# every origin, one jq per project with repos. DOCKER_OK=0 when docker
+# couldn't be asked at all.
 L_NAME=() L_STATUS=() L_RESTARTS=() L_STARTED=() L_ID=() L_SERVER=() L_GITHUB=() L_REPO=()
+L_REPOS=() L_RSTATES=() L_ORIGIN=()
 DOCKER_OK=1
 collect_projects() {
-  local n i out line rc=0 names=() repo
+  local n i out line rc=0 names=() dirs=() repos=() states=()
   local -A st=()
   mapfile -t L_NAME < <(projects)
   (( ${#L_NAME[@]} )) || return 0
-  for n in "${L_NAME[@]}"; do names+=("boxen-$n"); done
+  for n in "${L_NAME[@]}"; do names+=("boxen-$n"); dirs+=("$SRC_ROOT/$n"); done
   if command -v docker >/dev/null; then
     out=$(docker inspect -f 'C {{.Name}} {{.State.Status}} {{.RestartCount}} {{.State.StartedAt}} {{.Id}}' \
             "${names[@]}" 2>&1) || rc=$?
@@ -1676,6 +2078,7 @@ collect_projects() {
       DOCKER_OK=0
     fi
   done <<<"$out"
+  mapfile -t L_ORIGIN < <("$GITSCAN" origin "${dirs[@]}" 2>/dev/null || true)
   for i in "${!L_NAME[@]}"; do
     n=${L_NAME[$i]}
     L_STATUS[i]="" L_RESTARTS[i]=0 L_STARTED[i]="" L_ID[i]="" L_SERVER[i]="-"
@@ -1685,9 +2088,13 @@ collect_projects() {
         L_SERVER[i]=$(server_state_cached "$n" "${L_ID[i]}" "${L_STARTED[i]}")
       fi
     fi
-    repo=$(project_repo "$n" 2>/dev/null || true)
-    L_REPO[i]=$repo
-    L_GITHUB[i]=$(token_state "$n" "$repo")
+    mapfile -t repos < <(listed_repos "$n")
+    mapfile -t states < <(repo_states "$n" "${repos[@]}")
+    L_REPO[i]=${repos[0]:-}
+    L_REPOS[i]=${repos[*]}
+    L_RSTATES[i]=${states[*]}
+    L_ORIGIN[i]=${L_ORIGIN[i]:-}
+    L_GITHUB[i]=$(github_state "$n" "${states[@]}")
   done
 }
 
@@ -1711,24 +2118,31 @@ cmd_ls() {
 # ls --json: one JSON document for boxen ui (and anything else that wants
 # it), built by a single jq from collect_projects and each project's
 # compose.services.yaml:
-#   {"version": 1, "docker": true|false,
+#   {"version": 2, "docker": true|false,
 #    "projects": [{"name", "container": {"status", "restarts", "started_at",
 #                  "id"} | null, "server", "github", "repo": "owner/repo" | null,
+#                  "repos": [{"repo", "state", "origin": true|false}],
 #                  "sidecars": [{"service", "container", "image"}]}, ...],
 #    "supervisor": {... the same ...} | null}
-# "server" is "-" when the container isn't running, as in `ls`; sidecars
-# are the configured ones (their live state is Docker's to tell).
+# "server" is "-" when the container isn't running, as in `ls`; "repo" is
+# the first listed repo (what the project's tokens default to), "repos"
+# all of them with their state from the last token refresh (ok,
+# not-installed, no-access, error, "-" not known yet) and whether it's the
+# origin; sidecars are the configured ones (their live state is Docker's to
+# tell). No network.
+LS_FIELDS=11
 cmd_ls_json() {
   local i f args=() files=()
   collect_projects
   for i in "${!L_NAME[@]}"; do
     args+=("${L_NAME[i]}" "${L_STATUS[i]}" "${L_RESTARTS[i]}" "${L_STARTED[i]}" "${L_ID[i]}"
-           "${L_SERVER[i]}" "${L_GITHUB[i]}" "${L_REPO[i]}")
+           "${L_SERVER[i]}" "${L_GITHUB[i]}" "${L_REPO[i]}" "${L_REPOS[i]}" "${L_RSTATES[i]}" "${L_ORIGIN[i]}")
     f="$(proj_dir "${L_NAME[i]}")/compose.services.yaml"
     if [[ -f "$f" ]]; then files+=(--rawfile "sc$i" "$f"); fi
   done
-  jq -n --argjson docker "$( (( DOCKER_OK )) && echo true || echo false)" "${files[@]}" '
-    [$ARGS.positional | range(0; length; 8) as $o | .[$o:$o + 8]]
+  jq -n --argjson docker "$( (( DOCKER_OK )) && echo true || echo false)" --argjson nf "$LS_FIELDS" "${files[@]}" '
+    def words: split(" ") | map(select(. != ""));
+    [$ARGS.positional | range(0; length; $nf) as $o | .[$o:$o + $nf]]
     | to_entries
     | map(.key as $i | .value as $v | {
         name: $v[0],
@@ -1736,12 +2150,15 @@ cmd_ls_json() {
                     else {status: $v[1], restarts: ($v[2] | tonumber? // 0), started_at: $v[3], id: $v[4]} end),
         server: $v[5], github: $v[6],
         repo: (if $v[7] == "" then null else $v[7] end),
+        repos: ([$v[8] | words, ($v[9] | words)] | transpose
+                | map({repo: .[0], state: (.[1] // "-"),
+                       origin: ($v[10] != "" and (.[0] | ascii_downcase) == ($v[10] | ascii_downcase))})),
         sidecars: (try ($ARGS.named["sc\($i)"] // "{}" | fromjson | .services // {} | to_entries
                         | map({service: .key,
                                container: (.value.container_name // "boxen.\($v[0]).\(.key)"),
                                image: (.value.image // "")}))
                    catch [])})
-    | {version: 1, docker: $docker,
+    | {version: 2, docker: $docker,
        projects: map(select(.name != "supervisor")),
        supervisor: (map(select(.name == "supervisor")) | first // null)}' --args "${args[@]}"
 }
@@ -2058,6 +2475,7 @@ self_update_files() {
   rerender_compose "$n" "$2"
   write_override_example "$n"
   mkdir_private "$(token_dir "$n")"
+  seed_repos "$n"
   [[ "$n" != supervisor ]] || write_supervisor_claude_md
 }
 
@@ -2071,6 +2489,7 @@ cmd_regen() {
   rerender_compose "$1"
   write_override_example "$1"
   mkdir_private "$(token_dir "$1")"
+  seed_repos "$1"
   start_project "$1"
 }
 
@@ -2165,6 +2584,7 @@ case "$cmd" in
   resume)   cmd_resume "$@" ;;
   rm)       cmd_rm "$@" ;;
   github)   cmd_github "$@" ;;
+  repos)    cmd_repos "$@" ;;
   login)    cmd_login ;;
   update)   cmd_update "$@" ;;
   self-update) cmd_self_update ;;

@@ -83,13 +83,15 @@ class FakeDocker(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 
 def project(name, status="running", server="connected", github="token ok", repo=None, restarts=0,
-            sidecars=()):
+            sidecars=(), repos=None):
     c = None
     if status is not None:
         c = {"status": status, "restarts": restarts, "started_at": "2026-10-19T08:00:00.123456789Z",
              "id": (name.encode().hex() + "0" * 64)[:64]}
+    if repos is None:
+        repos = [{"repo": repo, "state": "ok" if github == "token ok" else "-", "origin": True}] if repo else []
     return {"name": name, "container": c, "server": server if status == "running" else "-",
-            "github": github, "repo": repo, "sidecars": list(sidecars)}
+            "github": github, "repo": repo, "repos": list(repos), "sidecars": list(sidecars)}
 
 
 def sidecar(project_name, svc, image, status="running", health=None):
@@ -192,7 +194,9 @@ class Env:
             return [json.loads(line) for line in f if line.strip()]
 
     def boxen_calls(self, skip_ls=True):
-        return [c for c in self._calls("boxen.jsonl") if not (skip_ls and c["args"] == ["ls", "--json"])]
+        return [c for c in self._calls("boxen.jsonl")
+                if not (skip_ls and (c["args"] == ["ls", "--json"]
+                                     or (c["args"][:1] == ["repos"] and c["args"][-1:] == ["--suggest"])))]
 
     def tmux_calls(self, cmd=None):
         out = [c["argv"] for c in self._calls("tmux.jsonl")]

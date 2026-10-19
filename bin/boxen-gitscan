@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""boxen-gitscan: the GitHub repos a project folder's git config names.
+
+    boxen-gitscan origin DIR...   one line per DIR: owner/repo of the git repo's
+                                  `origin` there, or an empty line
+    boxen-gitscan scan DIR        every owner/repo that any remote (url and
+                                  pushurl), submodule or .gitmodules entry names,
+                                  in DIR's repo and the repos nested in it (up to
+                                  3 folders down, submodules and worktrees
+                                  included), DIR's origin first; one per line
+
+The project folder belongs to the project's container, so everything here is
+untrusted and git itself is never run on it: a repo's config can make git
+run programs (core.fsmonitor, hooks, ...) and read other files (include,
+includeIf). The config files are read as text instead: only the remote and
+submodule URLs are looked at, include and includeIf are never followed, and
+every file is opened component by component without following a symlink, so
+nothing outside DIR is ever read. Heavy folders (node_modules, .venv,
+vendor, build trees) are skipped, and a scan stops after 2 seconds. What comes
+out is only ever owner/repo, in GitHub's own shape (the same rules as
+bin/boxen github_repo).
+"""
+import os
+import re
+import stat
+import sys
+import time
+
+SEG = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?"
+REPO = re.compile(r"^%s/%s$" % (SEG, SEG))
+PREFIXES = (re.compile(r"^https://github\.com/"), re.compile(r"^https://[^/@]+@github\.com/"),
+            re.compile(r"^git@github\.com:"), re.compile(r"^ssh://git@github\.com/"))
+SKIP = {"node_modules", ".venv", "venv", "vendor", "build", "dist", "target", "__pycache__", ".cache",
+        ".tox", ".nox", ".gradle", ".next", ".mypy_cache", ".pytest_cache", "site-packages", "bower_components"}
+DEPTH = 3                 # nested repos: up to this many folders below DIR
+MODULES_DEPTH = 6         # .git/modules/<path>/modules/...
+SECONDS = 2.0
+MAX_FILE = 1 << 20        # a config bigger than this isn't one
+MAX_DIRS = 20000
+
+_SECTION = re.compile(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\](.*)$')
+_KEY = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)\s*(?:=(.*))?$")
+
+
+def github_repo(url):
+    """owner/repo from a github.com URL (https or ssh form), else None."""
+    u = url.strip().rstrip("/")
+    if u.endswith(".git"):
+        u = u[:-4]
+    for p in PREFIXES:
+        m = p.match(u)
+        if m:
+            u = u[m.end():]
+            break
+    else:
+        return None
+    return u if REPO.match(u) and ".." not in u else None
+
+
+def value(raw):
+    """A git config value: quotes removed, escapes taken, a comment cut."""
+    out, quoted, i = [], False, 0
+    raw = raw.strip()
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw):
+            out.append({"n": "\n", "t": "\t", "b": "\b"}.get(raw[i + 1], raw[i + 1]))
+            i += 2
+            continue
+        if c == '"':
+            quoted = not quoted
+        elif c in "#;" and not quoted:
+            break
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out).strip()
+
+
+def urls(text):
+    """(section, subsection, url) for every remote.*.url, remote.*.pushurl
+    and submodule.*.url in a git config's text, in order. Nothing else is
+    interpreted: [include] and [includeIf] are sections like any other."""
+    sec = sub = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line[0] == "[":
+            m = _SECTION.match(line)
+            if not m:
+                sec = sub = None
+                continue
+            sec, sub = m.group(1).lower(), m.group(2)
+            if sub is None and "." in sec:            # [remote.origin], the old form
+                sec, sub = sec.split(".", 1)
+            line = m.group(3).strip()
+            if not line or line[0] in "#;":
+                continue
+        m = _KEY.match(line)
+        if not m or m.group(2) is None:
+            continue
+        key = m.group(1).lower()
+        if (sec == "remote" and key in ("url", "pushurl")) or (sec == "submodule" and key == "url"):
+            yield sec, sub, value(m.group(2))
+
+
+def open_under(root_fd, rel, directory=False):
+    """A descriptor for root/rel, opened one component at a time without
+    following a symlink anywhere (None if it isn't there, or is one)."""
+    parts = [p for p in rel.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        return None
+    fd = os.dup(root_fd)
+    try:
+        for i, p in enumerate(parts):
+            last = i == len(parts) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            if not last or directory:
+                flags |= os.O_DIRECTORY
+            else:
+                flags |= os.O_NONBLOCK
+            nfd = os.open(p, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def read_under(root_fd, rel):
+    """The text of the regular file root/rel (see open_under), or None."""
+    fd = open_under(root_fd, rel)
+    if fd is None:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE:
+            return None
+        chunks, n = [], 0
+        while n <= MAX_FILE:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+            n += len(b)
+        return b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def gitdir_of(root_fd, rel):
+    """The git dir (relative to root) of the worktree root/rel: rel/.git,
+    or where a .git file points (a submodule or worktree), if that's inside
+    root; and the config to read there (a worktree's is its common dir's)."""
+    base = rel.rstrip("/")
+    dot = (base + "/.git") if base else ".git"
+    fd = open_under(root_fd, dot, directory=True)
+    if fd is not None:
+        os.close(fd)
+        gd = dot
+    else:
+        text = read_under(root_fd, dot)
+        if not text or not text.startswith("gitdir:"):
+            return None
+        target = text[len("gitdir:"):].strip()
+        target = target.splitlines()[0].strip() if target else ""
+        if not target or target.startswith("/"):
+            return None                          # absolute: never outside the folder
+        gd = os.path.normpath(os.path.join(base, target)) if base else os.path.normpath(target)
+        if gd == ".." or gd.startswith("../"):
+            return None
+    common = read_under(root_fd, gd + "/commondir")
+    if common and common.strip() and not common.strip().startswith("/"):
+        c = os.path.normpath(os.path.join(gd, common.strip().splitlines()[0]))
+        if c != ".." and not c.startswith("../"):
+            return gd, c + "/config"
+    return gd, gd + "/config"
+
+
+def config_repos(text, origin_only=False):
+    out = []
+    for sec, sub, url in urls(text or ""):
+        if origin_only and not (sec == "remote" and sub == "origin"):
+            continue
+        r = github_repo(url)
+        if r:
+            out.append((sec, sub, r))
+    return out
+
+
+def origin_of(path):
+    try:
+        root = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return ""
+    try:
+        g = gitdir_of(root, "")
+        if g is None:
+            return ""
+        found = config_repos(read_under(root, g[1]), origin_only=True)
+        # the url git uses to fetch is the first one
+        urls_ = [r for sec, sub, r in found]
+        return urls_[0] if urls_ else ""
+    finally:
+        os.close(root)
+
+
+def relative_url(base, url):
+    """A submodule URL relative to its superproject's (../lib.git): resolved
+    against base (owner/repo), else None."""
+    if not base or not (url.startswith("./") or url.startswith("../")):
+        return None
+    parts = base.split("/")
+    for p in url.rstrip("/").split("/"):
+        if p == "..":
+            if not parts:
+                return None
+            parts.pop()
+        elif p and p != ".":
+            parts.append(p)
+    r = "/".join(parts)
+    if r.endswith(".git"):
+        r = r[:-4]
+    return r if REPO.match(r) and ".." not in r else None
+
+
+def scan(path, seconds=SECONDS):
+    deadline = time.monotonic() + seconds
+    found, seen = [], set()
+
+    def add(r):
+        if r and r.lower() not in seen:
+            seen.add(r.lower())
+            found.append(r)
+    o = origin_of(path)
+    add(o)
+    try:
+        root = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return found
+    try:
+        dirs = 0
+        configs = []                          # (git dir's config, its origin for relative urls)
+        done = set()
+        for dirpath, dirnames, filenames, _dfd in os.fwalk(".", dir_fd=root, follow_symlinks=False):
+            dirs += 1
+            if time.monotonic() > deadline or dirs > MAX_DIRS:
+                break
+            rel = "" if dirpath == "." else dirpath[2:]
+            depth = 0 if not rel else rel.count("/") + 1
+            here = None
+            if ".git" in dirnames or ".git" in filenames:
+                g = gitdir_of(root, rel)
+                if g is not None and g[1] not in done:
+                    done.add(g[1])
+                    text = read_under(root, g[1])
+                    for sec, sub, r in config_repos(text):
+                        add(r)
+                    here = (config_repos(text, origin_only=True) or [(None, None, None)])[0][2]
+                    configs.append(g[0])
+            if ".gitmodules" in filenames:
+                for sec, sub, url in urls(read_under(root, (rel + "/.gitmodules") if rel else ".gitmodules") or ""):
+                    if sec == "submodule":
+                        add(github_repo(url) or relative_url(here, url))
+            # never into a git dir (its modules/ are read below), skipped
+            # folders, or past the depth limit
+            dirnames[:] = [d for d in dirnames if d != ".git" and d not in SKIP and depth < DEPTH]
+        # Submodules' own git dirs: .git/modules/<path>[/modules/<path>...]/config
+        for gd in configs:
+            mfd = open_under(root, gd + "/modules", directory=True)
+            if mfd is None:
+                continue
+            try:
+                for dp, dn, fn, _ in os.fwalk(".", dir_fd=mfd, follow_symlinks=False):
+                    if time.monotonic() > deadline:
+                        break
+                    r = "" if dp == "." else dp[2:]
+                    if "config" in fn and r:
+                        for sec, sub, rp in config_repos(read_under(mfd, r + "/config")):
+                            add(rp)
+                    if r.count("/") >= MODULES_DEPTH:
+                        dn[:] = []
+            finally:
+                os.close(mfd)
+    finally:
+        os.close(root)
+    return found
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "origin":
+        for p in argv[1:]:
+            sys.stdout.write(origin_of(p) + "\n")
+        return 0
+    if len(argv) == 2 and argv[0] == "scan":
+        secs = SECONDS
+        try:
+            secs = float(os.environ.get("BOXEN_SCAN_SECONDS", SECONDS))
+        except ValueError:
+            pass
+        for r in scan(argv[1], secs):
+            sys.stdout.write(r + "\n")
+        return 0
+    sys.stderr.write("usage: boxen-gitscan origin DIR... | scan DIR\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

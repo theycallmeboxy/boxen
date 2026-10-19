@@ -1,6 +1,8 @@
 """Tests for bin/boxen's `ls` (--json, the state cache), its project locks,
-`ui`, ui/install-venv.sh and boxen-agentd's probe handling, with fake
-docker, tmux and python3 commands. Run: python3 -m pytest tests"""
+`ui`, GitHub repo lists and tokens (`repos`, `tokens`, discovery, STATUS.md;
+the container's git credential helper and gh wrapper), ui/install-venv.sh and
+boxen-agentd's probe handling and allowlist, with fake docker, tmux, curl
+(the GitHub API) and python3 commands. Run: python3 -m pytest tests"""
 import fcntl
 import hashlib
 import json
@@ -46,7 +48,8 @@ if a[:1] == ["logs"]:
 if a[:1] == ["compose"]:
     time.sleep(float(os.environ.get("FAKE_COMPOSE_SLEEP", "0")))
     sys.exit(0)
-if a[:1] in (["build"], ["tag"], ["builder"]) or a[:2] == ["image", "prune"]:
+if a[:1] in (["build"], ["tag"], ["builder"], ["info"], ["volume"], ["run"]) or a[:2] in (
+        ["image", "prune"], ["image", "inspect"]):
     sys.exit(0)
 sys.stderr.write("fake docker: unhandled %r\n" % a); sys.exit(1)
 '''
@@ -81,6 +84,8 @@ def vm(tmp_path):
     subprocess.run(["git", "init", "-q", str(src / "alpha")], check=True)
     subprocess.run(["git", "-C", str(src / "alpha"), "remote", "add", "origin",
                     "https://github.com/theycallmeboxy/alpha.git"], check=True)
+    # alpha's repo list, as `boxen setup` seeds it from its origin
+    (home / "projects" / "alpha" / "repos").write_text("# header\ntheycallmeboxy/alpha\n")
     state = {
         "boxen-alpha": {"status": "running", "restarts": 2, "started": STARTED, "id": "a" * 64,
                         "logs": "Remote Control starts...\nConnected\n"},
@@ -108,19 +113,20 @@ def ls_json(vm):
 
 def test_ls_json(vm):
     doc = ls_json(vm)
-    assert doc["version"] == 1 and doc["docker"] is True
+    assert doc["version"] == 2 and doc["docker"] is True
     assert [p["name"] for p in doc["projects"]] == ["alpha", "beta"]
     alpha, beta = doc["projects"]
     assert alpha["container"] == {"status": "running", "restarts": 2, "started_at": STARTED, "id": "a" * 64}
     assert alpha["server"] == "connected"
     assert alpha["github"] == "run boxen github"           # remote, but no GitHub App yet
     assert alpha["repo"] == "theycallmeboxy/alpha"
+    assert alpha["repos"] == [{"repo": "theycallmeboxy/alpha", "state": "-", "origin": True}]
     # the configured sidecars only (their state is Docker's); empty fields stay in place
     assert alpha["sidecars"] == [
         {"service": "db", "container": "boxen.alpha.db", "image": "postgres:16"},
         {"service": "cache", "container": "boxen.alpha.cache", "image": ""}]
     assert beta == {"name": "beta", "container": None, "server": "-", "github": "-", "repo": None,
-                    "sidecars": []}
+                    "repos": [], "sidecars": []}
     sup = doc["supervisor"]
     assert sup["name"] == "supervisor" and sup["container"]["status"] == "exited" and sup["server"] == "-"
     calls = docker_calls(vm)
@@ -133,7 +139,7 @@ def test_ls_json(vm):
 def test_ls_json_no_projects_and_docker_down(vm):
     shutil.rmtree(vm["home"] / "projects")
     (vm["home"] / "projects").mkdir()
-    assert ls_json(vm) == {"version": 1, "docker": True, "projects": [], "supervisor": None}
+    assert ls_json(vm) == {"version": 2, "docker": True, "projects": [], "supervisor": None}
     (vm["home"] / "projects" / "solo").mkdir()
     (vm["home"] / "projects" / "solo" / "compose.yaml").write_text("x")
     (vm["fake"] / "down").write_text("")
@@ -677,6 +683,461 @@ def test_agentd_probes(tmp_path):
         log = (home / "agent.log").read_text()
         assert "bad request" not in log and '"shell"' in log
         assert log.count("[alpha]") == 1 and "empty connection" in log
+    finally:
+        proc.terminate()
+        proc.wait(5)
+
+
+# ------------------------------------------------------- GitHub repo lists
+
+FAKE_CURL = r'''#!PYTHON
+"""The GitHub API, as bin/boxen's gh_app_api calls it (curl -s
+--fail-with-body -X METHOD ... [-d JSON] URL), from $FAKE_DIR/github.json:
+{"installations": [{"login", "id", "repos": [names] | "all"}], "down": bool}.
+Each call is logged to $FAKE_DIR/curl.jsonl."""
+import json, os, re, sys
+d = os.environ["FAKE_DIR"]
+a = sys.argv[1:]
+method, body, url, i = "GET", None, a[-1], 0
+while i < len(a) - 1:
+    if a[i] in ("-X", "-d"):
+        if a[i] == "-X": method = a[i + 1]
+        else: body = a[i + 1]
+        i += 2
+        continue
+    i += 1
+with open(os.path.join(d, "curl.jsonl"), "a") as f:
+    f.write(json.dumps({"method": method, "url": url, "body": json.loads(body) if body else None}) + "\n")
+gh = json.load(open(os.path.join(d, "github.json")))
+if gh.get("down"):
+    sys.exit(7)
+path = url.split("https://api.github.com", 1)[1]
+insts = gh.get("installations", [])
+
+def out(obj, fail=False):
+    sys.stdout.write(json.dumps(obj))
+    sys.exit(22 if fail else 0)
+
+def find(owner):
+    return next((x for x in insts if x["login"].lower() == owner.lower()), None)
+
+def can(x, repo):
+    return x["repos"] == "all" or repo.lower() in [r.lower() for r in x["repos"]]
+
+if path.startswith("/app/installations?"):
+    out([{"id": x["id"], "account": {"login": x["login"]}} for x in insts])
+m = re.match(r"^/repos/([^/]+)/([^/]+)/installation$", path)
+if m:
+    x = find(m.group(1))
+    if x and can(x, m.group(2)):
+        out({"id": x["id"]})
+    out({"message": "Not Found"}, True)
+m = re.match(r"^/app/installations/(\d+)/access_tokens$", path)
+if m and method == "POST":
+    x = [y for y in insts if str(y["id"]) == m.group(1)][0]
+    names = json.loads(body)["repositories"]
+    if not all(can(x, n) for n in names):
+        out({"message": "There is at least one repository that does not exist or is not accessible to the "
+                        "parent installation."}, True)
+    out({"token": "tok-%s-%s" % (x["login"].lower(), ",".join(names)), "expires_at": "2026-10-19T12:00:00Z"})
+out({"message": "fake: unhandled %s %s" % (method, path)}, True)
+'''
+
+INSTALLS = [{"login": "TheyCallMeBoxy", "id": 11, "repos": ["alpha", "beta", "gamma"]},
+            {"login": "myorg", "id": 22, "repos": "all"}]
+
+
+@pytest.fixture
+def gh(vm):
+    """vm with a configured GitHub App (a real key, so make_jwt works), a
+    fake GitHub API (curl), boxen.env, and alpha's list removed (seeding
+    is under test)."""
+    gdir = vm["home"] / "github"
+    gdir.mkdir()
+    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+                    "-out", str(gdir / "app.pem")], check=True, capture_output=True)
+    (gdir / "app.conf").write_text("CLIENT_ID=Iv1.test\nAPP_SLUG=boxen-test\n")
+    (vm["home"] / "boxen.env").write_text("TZ=UTC\n")
+    write_exe(str(vm["bin"] / "curl"), FAKE_CURL.replace("#!PYTHON", "#!" + sys.executable))
+    (vm["fake"] / "github.json").write_text(json.dumps({"installations": INSTALLS}))
+    (vm["home"] / "projects" / "alpha" / "repos").unlink()
+    vm["src"] = vm["tmp"] / "src"
+    vm["pdir"] = vm["home"] / "projects" / "alpha"
+    vm["tok"] = vm["pdir"] / "token"
+    return vm
+
+
+def boxen(vm, *args, agent=False, **kw):
+    env = dict(vm["env"], **({"BOXEN_AGENT": "1"} if agent else {}))
+    return subprocess.run([BOXEN] + list(args), env=env, capture_output=True, text=True, timeout=120, **kw)
+
+
+def api_calls(vm):
+    p = vm["fake"] / "curl.jsonl"
+    out = [json.loads(line) for line in open(p)] if p.exists() else []
+    p.unlink(missing_ok=True)
+    return [(c["method"], c["url"].replace("https://api.github.com", ""), c["body"]) for c in out]
+
+
+def listed(vm, name="alpha"):
+    text = (vm["home"] / "projects" / name / "repos").read_text()
+    return [x for x in text.splitlines() if x and not x.startswith("#")]
+
+
+def state(vm):
+    return json.loads((vm["tok"] / "state.json").read_text())
+
+
+def tokens(vm):
+    return {p.name: p.read_text().strip() for p in sorted(vm["tok"].iterdir()) if p.name.startswith("gh-token")}
+
+
+def git(*args):
+    subprocess.run(["git"] + list(args), check=True, capture_output=True)
+
+
+def test_seed_lazily_from_origin_then_origin_is_ignored(gh):
+    out = boxen(gh, "tokens", "alpha")
+    assert out.returncode == 0, out.stderr
+    assert listed(gh) == ["theycallmeboxy/alpha"]
+    assert "theycallmeboxy/alpha" in out.stdout and "token valid until 2026-10-19T12:00:00Z" in out.stdout
+    assert tokens(gh) == {"gh-token": "tok-theycallmeboxy-alpha", "gh-token.theycallmeboxy": "tok-theycallmeboxy-alpha"}
+    assert state(gh) == {"theycallmeboxy/alpha": "ok"}
+    for f in gh["tok"].iterdir():
+        assert f.stat().st_mode & 0o777 == 0o600, f
+    # The project's Claude points origin at another repo the app could reach:
+    # its token doesn't follow.
+    git("-C", str(gh["src"] / "alpha"), "remote", "set-url", "origin", "https://github.com/myorg/secret.git")
+    api_calls(gh)
+    assert boxen(gh, "tokens", "alpha").returncode == 0
+    assert listed(gh) == ["theycallmeboxy/alpha"]
+    assert not any("secret" in json.dumps(c) for c in api_calls(gh))
+    assert "gh-token.myorg" not in tokens(gh)
+    doc = ls_json(gh)["projects"][0]
+    assert doc["repos"] == [{"repo": "theycallmeboxy/alpha", "state": "ok", "origin": False}]
+    assert doc["github"] == "token ok"
+    out = boxen(gh, "repos", "alpha")
+    assert "origin myorg/secret isn't listed" in out.stdout
+    assert "Found in the project folder but not listed:\n    myorg/secret\n" in out.stdout
+
+
+def test_seed_on_setup(gh):
+    shutil.copy(os.path.join(REPO, "templates", "boxen.env"), gh["home"] / "boxen.env")
+    out = boxen(gh, "setup")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert listed(gh) == ["theycallmeboxy/alpha"]
+    assert listed(gh, "beta") == []                     # no code, no origin: an empty list
+    assert not (gh["home"] / "projects" / "supervisor" / "repos").exists()
+    assert "boxen repos alpha add|rm" in (gh["pdir"] / "repos").read_text()
+    # a list that exists is never reseeded
+    (gh["pdir"] / "repos").write_text("myorg/x\n")
+    assert boxen(gh, "setup").returncode == 0
+    assert listed(gh) == ["myorg/x"]
+
+
+def test_seed_on_new_from_the_clone_url(gh):
+    out = boxen(gh, "new", "gamma", "https://github.com/TheyCallMeBoxy/gamma.git")
+    pdir = gh["home"] / "projects" / "gamma"
+    assert listed(gh, "gamma") == ["TheyCallMeBoxy/gamma"], out.stdout + out.stderr
+    assert (pdir / "token" / "gh-token.theycallmeboxy").read_text().strip() == "tok-theycallmeboxy-gamma"
+    # someone else's repo: listed (not-installed), no token, the clone still runs
+    out = boxen(gh, "new", "delta", "https://github.com/upstream/delta")
+    assert listed(gh, "delta") == ["upstream/delta"]
+    assert "isn't yours" in out.stdout and "boxen repos delta add" in out.stdout
+    assert json.loads((gh["home"] / "projects" / "delta" / "token" / "state.json").read_text()) == \
+        {"upstream/delta": "not-installed"}
+    assert any(c[:2] == ["compose", "--project-directory"] and "clone" in c for c in docker_calls(gh))
+
+
+def test_repos_add_rm_and_validation(gh):
+    assert boxen(gh, "tokens", "alpha").returncode == 0
+    for bad in ("a", "a/b/c", "-x/y", "a/../b", "https://gitlab.com/a/b", "a/b;rm", "a/.."):
+        out = boxen(gh, "repos", "alpha", "add", bad)
+        assert out.returncode == 1 and ("isn't a GitHub repo" in out.stderr or "unknown option" in out.stderr), bad
+    assert boxen(gh, "repos", "alpha", "add").returncode == 1
+    assert boxen(gh, "repos", "alpha", "frob", "a/b").returncode == 1
+    assert boxen(gh, "repos", "supervisor").returncode == 1
+    assert listed(gh) == ["theycallmeboxy/alpha"]
+    out = boxen(gh, "repos", "alpha", "add", "https://github.com/myorg/x.git", "myorg/Y", "MyOrg/x")
+    assert out.returncode == 0, out.stderr
+    assert listed(gh) == ["theycallmeboxy/alpha", "myorg/x", "myorg/Y"]
+    assert "myorg/x                                  ok" in out.stdout
+    assert tokens(gh)["gh-token.myorg"] == "tok-myorg-x,Y"
+    # already listed (any case): nothing to do
+    out = boxen(gh, "repos", "alpha", "add", "MYORG/X")
+    assert out.returncode == 0 and "already listed" in out.stdout
+    # rm keeps other lines (comments too) as they were
+    text = (gh["pdir"] / "repos").read_text()
+    (gh["pdir"] / "repos").write_text(text + "# my note\n")
+    out = boxen(gh, "repos", "alpha", "rm", "myorg/x", "MyOrg/y")
+    assert out.returncode == 0, out.stderr
+    assert listed(gh) == ["theycallmeboxy/alpha"]
+    assert (gh["pdir"] / "repos").read_text() == text.replace("myorg/x\nmyorg/Y\n", "") + "# my note\n"
+    assert "gh-token.myorg" not in tokens(gh)        # that owner's token is gone
+    assert state(gh) == {"theycallmeboxy/alpha": "ok"}
+    out = boxen(gh, "repos", "alpha", "rm", "nobody/here")
+    assert "nobody/here isn't listed" in out.stderr
+
+
+def test_repos_add_needs_approval_in_agent_mode(gh):
+    assert boxen(gh, "tokens", "alpha").returncode == 0
+    api_calls(gh)
+    out = boxen(gh, "repos", "alpha", "add", "myorg/x", "https://github.com/myorg/y", agent=True)
+    assert out.returncode == 3
+    assert out.stdout == ("boxen: approval needed (repos) for alpha:\n"
+                          "    Let alpha push to: myorg/x, myorg/y? Its token will cover these repos.\n"
+                          "boxen: to approve, run: boxen repos alpha add myorg/x myorg/y --yes\n")
+    assert listed(gh) == ["theycallmeboxy/alpha"] and api_calls(gh) == []
+    out = boxen(gh, "repos", "alpha", "add", "myorg/x", "myorg/y", "--yes", agent=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert listed(gh) == ["theycallmeboxy/alpha", "myorg/x", "myorg/y"]
+    # narrowing needs no approval
+    out = boxen(gh, "repos", "alpha", "rm", "myorg/y", agent=True)
+    assert out.returncode == 0 and listed(gh) == ["theycallmeboxy/alpha", "myorg/x"]
+
+
+def test_minting_one_request_per_owner(gh):
+    (gh["pdir"] / "repos").write_text("TheyCallMeBoxy/alpha\nmyorg/one\ntheycallmeboxy/beta\nmyorg/two\n")
+    (gh["tok"]).mkdir()
+    (gh["tok"] / "gh-token.gone").write_text("old\n")          # an owner no longer listed
+    out = boxen(gh, "tokens", "alpha")
+    assert out.returncode == 0, out.stderr
+    calls = api_calls(gh)
+    posts = [c for c in calls if c[0] == "POST"]
+    assert posts == [("POST", "/app/installations/11/access_tokens", {"repositories": ["alpha", "beta"]}),
+                     ("POST", "/app/installations/22/access_tokens", {"repositories": ["one", "two"]})]
+    assert [c[1] for c in calls if c[0] == "GET"] == ["/app/installations?per_page=100"]    # asked once
+    assert tokens(gh) == {"gh-token": "tok-theycallmeboxy-alpha,beta",
+                          "gh-token.myorg": "tok-myorg-one,two",
+                          "gh-token.theycallmeboxy": "tok-theycallmeboxy-alpha,beta"}
+    assert state(gh) == {"theycallmeboxy/alpha": "ok", "myorg/one": "ok", "theycallmeboxy/beta": "ok",
+                         "myorg/two": "ok"}
+
+
+def test_partial_failure_retries_per_repo(gh):
+    (gh["pdir"] / "repos").write_text("upstream/thing\ntheycallmeboxy/alpha\ntheycallmeboxy/private\n")
+    out = boxen(gh, "tokens", "alpha")
+    assert out.returncode == 0, out.stderr
+    assert "theycallmeboxy/private: the boxen GitHub App can't access it" in out.stderr
+    calls = api_calls(gh)
+    assert [c for c in calls if c[0] == "POST"] == [
+        ("POST", "/app/installations/11/access_tokens", {"repositories": ["alpha", "private"]}),
+        ("POST", "/app/installations/11/access_tokens", {"repositories": ["alpha"]})]
+    assert ("GET", "/repos/theycallmeboxy/private/installation", None) in calls
+    assert not any("upstream" in c[1] for c in calls)               # not installed there: nothing asked
+    assert state(gh) == {"upstream/thing": "not-installed", "theycallmeboxy/alpha": "ok",
+                         "theycallmeboxy/private": "no-access"}
+    # the default is the first listed repo's owner that has a token
+    assert tokens(gh) == {"gh-token": "tok-theycallmeboxy-alpha", "gh-token.theycallmeboxy": "tok-theycallmeboxy-alpha"}
+    assert "not your repo" in out.stdout and "no access" in out.stdout
+    doc = ls_json(gh)["projects"][0]
+    assert doc["github"] == "token partial" and doc["repo"] == "upstream/thing"
+    assert [(r["repo"], r["state"], r["origin"]) for r in doc["repos"]] == [
+        ("upstream/thing", "not-installed", False), ("theycallmeboxy/alpha", "ok", True),
+        ("theycallmeboxy/private", "no-access", False)]
+    plain = boxen(gh, "ls").stdout
+    assert "token partial" in plain
+    # GitHub unreachable: errors, and the token there is kept
+    (gh["fake"] / "github.json").write_text(json.dumps({"installations": INSTALLS, "down": True}))
+    out = boxen(gh, "tokens", "--quiet", "alpha")
+    assert out.returncode == 1
+    assert tokens(gh)["gh-token.theycallmeboxy"] == "tok-theycallmeboxy-alpha"
+    assert state(gh)["theycallmeboxy/alpha"] == "error"
+
+
+def test_github_column_stale(gh):
+    assert boxen(gh, "tokens", "alpha").returncode == 0
+    old = time.time() - 3600
+    for f in gh["tok"].iterdir():
+        os.utime(f, (old, old))
+    assert ls_json(gh)["projects"][0]["github"] == "token stale"
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_discovery_reads_configs_as_text(gh):
+    a = gh["src"] / "alpha"
+    pwned = gh["tmp"] / "pwned"
+    secret = gh["tmp"] / "secret.cfg"
+    secret.write_text('[remote "x"]\n\turl = https://github.com/leak/fromvm\n')
+    with open(a / ".git" / "config", "a") as f:
+        f.write('[core]\n\tfsmonitor = touch %s\n[include]\n\tpath = %s\n[includeIf "gitdir:/"]\n\tpath = %s\n'
+                '[remote "fork"]\n\turl = git@github.com:fork/alpha.git\n\tpushurl = "https://github.com/fork/push" ; c\n'
+                % (pwned, secret, secret))
+    git("init", "-q", str(a / "libs" / "nested"))
+    git("-C", str(a / "libs" / "nested"), "remote", "add", "up", "https://github.com/nested/lib")
+    write(a / ".gitmodules", '[submodule "sub"]\n\tpath = sub\n\turl = ../sibling.git\n')
+    write(a / ".git" / "modules" / "sub" / "config", '[remote "origin"]\n\turl = https://github.com/mod/sub\n')
+    write(a / "sub" / ".git", "gitdir: ../.git/modules/sub\n")
+    git("init", "-q", str(a / "node_modules" / "dep"))
+    git("-C", str(a / "node_modules" / "dep"), "remote", "add", "origin", "https://github.com/heavy/dep")
+    git("init", "-q", str(a / "a" / "b" / "c" / "d"))         # deeper than 3
+    git("-C", str(a / "a" / "b" / "c" / "d"), "remote", "add", "origin", "https://github.com/deep/repo")
+    os.symlink(gh["tmp"], a / "link")                          # never followed
+    write(a / "evil" / ".git", "gitdir: %s\n" % gh["tmp"])     # pointing outside: never read
+    write(gh["tmp"] / "config", '[remote "o"]\n\turl = https://github.com/leak/outside\n')
+    write(a / "junk" / ".git" / "config", '[remote "o"]\n\turl = https://github.com/[bold]x/y\n'
+                                          '[remote "p"]\n\turl = https://evil.com/x@github.com/a/b\n')
+    out = boxen(gh, "repos", "alpha", "--suggest")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["theycallmeboxy/alpha", "fork/alpha", "fork/push", "theycallmeboxy/sibling",
+                                  "nested/lib", "mod/sub"]
+    assert not pwned.exists()
+    full = boxen(gh, "repos", "alpha").stdout
+    assert "Found in the project folder but not listed:" in full and "leak" not in full
+    # the listed one isn't suggested
+    (gh["pdir"] / "repos").write_text("theycallmeboxy/alpha\nfork/alpha\n")
+    assert boxen(gh, "repos", "alpha", "--suggest").stdout.split() == ["fork/push", "theycallmeboxy/sibling",
+                                                                       "nested/lib", "mod/sub"]
+    assert not pwned.exists()
+
+
+def test_discovery_time_box(gh):
+    a = gh["src"] / "alpha"
+    for i in range(300):
+        (a / ("d%d" % i) / "x" / "y").mkdir(parents=True)
+    t = time.monotonic()
+    out = subprocess.run([os.path.join(REPO, "bin", "boxen-gitscan"), "scan", str(a)], capture_output=True,
+                         text=True, env=dict(gh["env"], BOXEN_SCAN_SECONDS="0.01"))
+    assert out.returncode == 0 and time.monotonic() - t < 2
+    assert out.stdout.split()[:1] == ["theycallmeboxy/alpha"]
+
+
+def test_status_md_lists_repos(gh):
+    a = gh["src"] / "alpha"
+    git("-C", str(a), "remote", "set-url", "origin", "https://github.com/fork/alpha")
+    git("-C", str(a), "remote", "add", "up", "https://github.com/up/one")
+    (gh["pdir"] / "repos").write_text("theycallmeboxy/alpha\nupstream/x\n")
+    (gh["pdir"] / "env").mkdir(exist_ok=True)
+    out = boxen(gh, "repos", "alpha", "add", "theycallmeboxy/nope")
+    assert out.returncode == 0, out.stderr
+    st = (gh["pdir"] / "env" / "STATUS.md").read_text()
+    assert "- GitHub repos (this project can push to):\n" \
+           "    - theycallmeboxy/alpha — ok: the token covers it\n" \
+           "    - upstream/x — not your repo: the GitHub App isn't on that account, so no token; " \
+           "pulls work if it's public\n" \
+           "    - theycallmeboxy/nope — no access: " in st
+    assert "- origin fork/alpha is not in this project's list: pushes to it won't work; ask the user to add it\n" in st
+    assert "- Found in the project folder but not listed: fork/alpha, up/one\n" in st
+    assert "Push status" not in st
+    (gh["pdir"] / "repos").write_text("fork/alpha\n")
+    boxen(gh, "repos", "alpha", "rm", "nothing/here")
+    st = (gh["pdir"] / "env" / "STATUS.md").read_text()
+    assert "    - fork/alpha — not your repo" in st and "(origin)" in st and "is not in this project's list" not in st
+
+
+# --------------------------------------------- inside the container
+
+def run_helper(tokdir, stdin, env=None, args=("get",)):
+    return subprocess.run(["sh", os.path.join(REPO, "base", "git-credential-boxen")] + list(args), input=stdin,
+                          capture_output=True, text=True,
+                          env=dict({"PATH": os.environ["PATH"], "BOXEN_TOKEN_DIR": str(tokdir)}, **(env or {})))
+
+
+def test_credential_helper_picks_the_owners_token(tmp_path):
+    d = tmp_path / "run"
+    d.mkdir()
+    (d / "gh-token").write_text("DEFAULT\n")
+    (d / "gh-token.myorg").write_text("ORG\n")
+    req = "protocol=https\nhost=github.com\npath=%s\n\n"
+    ans = "username=x-access-token\npassword=%s\n"
+    assert run_helper(d, req % "MyOrg/x.git").stdout == ans % "ORG"
+    assert run_helper(d, req % "other/x.git").stdout == ans % "DEFAULT"
+    assert run_helper(d, "protocol=https\nhost=github.com\n\n").stdout == ans % "DEFAULT"      # no path
+    assert run_helper(d, req % "../gh-token.myorg/x").stdout == ans % "DEFAULT"              # not an owner
+    assert run_helper(d, "protocol=https\nhost=evil.com\npath=myorg/x\n\n").stdout == ""
+    assert run_helper(d, req % "myorg/x", args=("store",)).stdout == ""
+    (d / "gh-token").unlink()
+    assert run_helper(d, req % "other/x", env={"GH_TOKEN": "ENV"}).stdout == ans % "ENV"
+    out = run_helper(d, req % "other/x")
+    assert out.returncode == 0 and out.stdout == "" and out.stderr == ""
+    out = run_helper(tmp_path / "nowhere", req % "myorg/x")
+    assert out.returncode == 0 and out.stdout == "" and out.stderr == ""
+
+
+def test_gh_wrapper_picks_the_token(tmp_path):
+    d = tmp_path / "run"
+    d.mkdir()
+    (d / "gh-token").write_text("DEFAULT\n")
+    (d / "gh-token.a").write_text("A\n")
+    (d / "gh-token.b").write_text("B\n")
+    fake = tmp_path / "gh-real"
+    write_exe(str(fake), '#!/bin/sh\nprintf "%s|" "${GH_TOKEN:-none}" "$@"\n')
+    wrapper = tmp_path / "gh"
+    write_exe(str(wrapper), open(os.path.join(REPO, "base", "gh")).read().replace("/usr/bin/gh", str(fake)))
+    work = tmp_path / "work"
+    git("init", "-q", str(work))
+
+    def gh_(*args, env=None):
+        e = dict({"PATH": os.environ["PATH"], "BOXEN_TOKEN_DIR": str(d), "HOME": str(tmp_path)}, **(env or {}))
+        return subprocess.run([str(wrapper)] + list(args), capture_output=True, text=True, cwd=work, env=e).stdout
+    assert gh_("pr", "list") == "DEFAULT|pr|list|"                    # no origin: the default
+    git("-C", str(work), "remote", "add", "origin", "git@github.com:B/repo.git")
+    assert gh_("pr", "list") == "B|pr|list|"                          # the origin's owner
+    assert gh_("pr", "list", "-R", "a/x") == "A|pr|list|-R|a/x|"
+    assert gh_("-R", "https://github.com/A/x", "issue", "list") == "A|-R|https://github.com/A/x|issue|list|"
+    assert gh_("pr", "view", "--repo=a/x") == "A|pr|view|--repo=a/x|"
+    assert gh_("pr", "view", "--repo", "c/x") == "DEFAULT|pr|view|--repo|c/x|"   # no token for c
+    assert gh_("pr", "view", env={"GH_REPO": "a/x"}) == "A|pr|view|"
+    assert gh_("api", "--", "-R", "a/x") == "B|api|--|-R|a/x|"           # after --: an argument
+    assert gh_("pr", "list", "-R", "gitlab.com/a/x") == "DEFAULT|pr|list|-R|gitlab.com/a/x|"
+    for f in d.iterdir():
+        f.unlink()
+    assert gh_("pr", "list", env={"GH_TOKEN": "ENV"}) == "ENV|pr|list|"
+
+
+def test_entrypoint_sets_use_http_path():
+    text = open(os.path.join(REPO, "base", "boxen-entry")).read()
+    assert "git config --global credential.https://github.com.useHttpPath true" in text
+
+
+# ------------------------------------------------------------ agentd repos
+
+def agentd_module():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("boxen_agentd", os.path.join(REPO, "bin", "boxen-agentd"))
+    spec = importlib.util.spec_from_loader("boxen_agentd", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_agentd_repos_is_read_only_and_project_scoped():
+    ag = agentd_module()
+    assert ag.validate(["repos", "alpha"]) is None
+    assert ag.validate(["repos", "alpha", "--suggest"]) is None
+    for bad in (["repos"], ["repos", "alpha", "add", "a/b"], ["repos", "alpha", "add", "a/b", "--yes"],
+                ["repos", "alpha", "rm", "a/b"], ["repos", "alpha", "--yes"], ["repos", "Alpha"]):
+        assert ag.validate(bad), bad
+    assert ag.scope(["repos"], "alpha") == (["repos", "alpha"], None)
+    assert ag.scope(["repos", "--suggest"], "alpha") == (["repos", "alpha", "--suggest"], None)
+    assert ag.scope(["repos", "alpha"], "alpha") == (["repos", "alpha"], None)
+    for bad in (["repos", "beta"], ["repos", "alpha", "add", "a/b"], ["repos", "add", "a/b"],
+                ["repos", "alpha", "rm", "a/b"]):
+        assert ag.scope(bad, "alpha")[1], bad
+    assert ag.job_key(["repos", "alpha"]) == "alpha"
+    assert "repos" in ag.PROJECT_ONLY_VERBS
+
+
+def test_agentd_repos_on_sockets(tmp_path):
+    home = tmp_path / "h"
+    (home / "projects" / "alpha").mkdir(parents=True)
+    proc = start_agentd(home)
+    try:
+        sock = home / "agent" / "agent.sock"
+        psock = home / "projects" / "alpha" / "agent" / "agent.sock"
+        wait_path(sock)
+        wait_path(psock)
+        r = poke(sock, b'{"argv": ["repos", "alpha"]}\n')
+        assert "isn't available here" in r and '"exit": 2' in r
+        r = poke(psock, b'{"argv": ["repos", "alpha", "add", "a/b", "--yes"]}\n')
+        assert "not allowed from a project" in r
+        r = poke(psock, b'{"argv": ["repos"]}\n')          # allowed: boxen runs (and fails: no compose.yaml)
+        assert "no such project: alpha" in r and '"exit": 1' in r
     finally:
         proc.terminate()
         proc.wait(5)

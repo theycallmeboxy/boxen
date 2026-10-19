@@ -13,6 +13,7 @@ REPO_DIR = os.path.dirname(os.path.dirname(PKG_DIR))
 NAME_RE = re.compile(r"^[a-z0-9]+([_-][a-z0-9]+)*$")
 _SEG = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?"
 GITHUB_URL_RE = re.compile(r"^https://github\.com/%s/%s(\.git)?$" % (_SEG, _SEG))
+REPO_RE = re.compile(r"^%s/%s$" % (_SEG, _SEG))
 RESERVED = ("all", "supervisor", "global", "dashboard", "ui")
 
 
@@ -37,6 +38,30 @@ def url_problem(url):
         return None
     if not GITHUB_URL_RE.match(url) or ".." in url:
         return "only https://github.com/owner/repo URLs (containers have no SSH keys)"
+    return None
+
+
+def repo_arg(s):
+    """owner/repo from owner/repo or https://github.com/owner/repo[.git], as
+    bin/boxen's repo_arg normalizes it (boxen-agentd takes these two forms),
+    else None."""
+    if not isinstance(s, str) or not s or any(c.isspace() for c in s):
+        return None
+    u = s if "://" in s else "https://github.com/" + s
+    if u.endswith("/"):
+        u = u[:-1]
+    if u.endswith(".git"):
+        u = u[:-4]
+    if not u.startswith("https://github.com/"):
+        return None
+    r = u[len("https://github.com/"):]
+    return r if REPO_RE.match(r) and ".." not in r else None
+
+
+def repo_problem(s):
+    """Why s can't be added to a project's repos, or None."""
+    if repo_arg(s) is None:
+        return "%r isn't a GitHub repo: owner/repo or https://github.com/owner/repo" % s[:60]
     return None
 
 

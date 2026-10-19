@@ -33,13 +33,13 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Label, Log, Select, Sparkline, Static, TabbedContent, TabPane
 
 from . import edit, files, procs, sysinfo
-from .config import PKG_DIR, Config, valid_name
+from .config import PKG_DIR, Config, repo_arg, valid_name
 from .docker_api import DockerAPI, DockerError, cpu_percent, memory
 from .jobs import APPROVAL, FAILED, OK, RUNNING, STOPPED, Busy, JobManager, fmt_elapsed, question_project
 from .model import (AMBER, GREEN, GREY, HEALTH_STYLE, RED, RUNNING_JOB, SERVER_STYLE, container_short,
-                    container_style, github_short, parse_ls, server_short, uptime)
+                    container_style, github_short, parse_ls, repo_state, server_short, uptime)
 from .screens import (ApprovalScreen, ConfirmScreen, GlobalMenuScreen, HelpScreen, NewProjectScreen,
-                      QuestionScreen)
+                      QuestionScreen, ReposScreen)
 from .textutil import ansi_text, clean_line, text
 from .tmux import GLOBAL, Tmux, in_boxen_tmux, window_name
 
@@ -51,6 +51,7 @@ SESSION_ID = re.compile(r"^[0-9a-f]{8}$")
 JOB_STYLE = {RUNNING: RUNNING_JOB, OK: GREEN, FAILED: RED, APPROVAL: AMBER, STOPPED: GREY}
 SESSION_STYLE = {"live": GREEN, "partial": AMBER, "carried": GREY}
 LS_ACTIVE, LS_IDLE, STATS_EVERY, SYS_EVERY = 5, 60, 3, 5
+SUGGEST_EVERY = 30          # `boxen repos NAME --suggest` for the selected project, at most this often
 
 PROJECT_ACTIONS = [
     # (action, palette title, description)
@@ -65,6 +66,8 @@ PROJECT_ACTIONS = [
     ("sessions_tab", "Sessions", "earlier conversations: continue one in the Claude app"),
     ("terminals_tab", "Terminals", "the project's terminal windows, with a live preview"),
     ("files_tab", "Files", "the project's env files: edit one in vim"),
+    ("repos", "GitHub repos", "the repos this project's token covers: add (asks), remove"),
+    ("repo_add_found", "Add found repo", "add the repo found in the project folder, selected in Overview (asks)"),
     ("rm", "Remove", "remove the project's container, image and config (asks; keeps the code)"),
 ]
 GLOBAL_PALETTE = [
@@ -167,6 +170,7 @@ class Dashboard(Screen):
     .spark-row Sparkline { width: 1fr; height: 1; }
     .spark-row .now { width: 18; padding-left: 1; }
     #sidecars { height: auto; max-height: 8; }
+    #repos { height: auto; max-height: 8; }
     #ov-apply, #ov-status { height: auto; color: $text-muted; }
     #sess-status, #logs-status, #term-status, #files-note, #sess-help { height: auto; color: $text-muted; }
     #sessions { height: 1fr; }
@@ -200,6 +204,8 @@ class Dashboard(Screen):
         Binding("J", "toggle_jobs", "Jobs"),
         Binding("f", "follow_logs", "Follow"),
         Binding("a", "session_attach", "Attach"),
+        Binding("a", "repo_add_found", "Add repo"),
+        Binding("G", "repos", "Repos"),
         Binding("x", "session_stop", "Close"),
         Binding("e", "edit_file", "Edit"),
         Binding("ctrl+r,f5", "refresh", "Refresh", show=False),
@@ -209,7 +215,8 @@ class Dashboard(Screen):
     ]
     # Keys that only mean something on one tab: shown (and live) only there.
     TAB_ACTIONS = {"follow_logs": ("logs",), "session_attach": ("sessions-tab",),
-                   "session_stop": ("sessions-tab",), "edit_file": ("files-tab",)}
+                   "session_stop": ("sessions-tab",), "edit_file": ("files-tab",),
+                   "repo_add_found": ("overview",)}
 
     def __init__(self, cfg, env):
         super().__init__()
@@ -244,6 +251,8 @@ class Dashboard(Screen):
         self._last_row = 0
         self._log_source = "server"
         self._sessions = []
+        self.suggest = {}           # project -> (monotonic time, [found repo, ...]) from repos --suggest
+        self._repo_rows = []        # Overview's repos table: ("listed" | "found", repo) by row
         self._loaded = {}           # tab -> project it shows
         self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="boxen-ui")
 
@@ -263,7 +272,7 @@ class Dashboard(Screen):
                             yield Static(Text(""), id="getting-started")
                             with Vertical(id="ov-content"):
                                 with Grid(id="ov-grid"):
-                                    for key in ("container", "server", "github", "code"):
+                                    for key in ("container", "server", "code"):
                                         yield Label(key, classes="k")
                                         yield Static(Text(""), classes="v", id="ov-" + key)
                                 with Horizontal(classes="spark-row"):
@@ -274,6 +283,8 @@ class Dashboard(Screen):
                                     yield Label("memory")
                                     yield Sparkline([], id="spark-mem")
                                     yield Static(Text(""), classes="now", id="mem-now")
+                                yield Static(Text("GitHub repos"), classes="section", id="repos-title")
+                                yield DataTable(id="repos", cursor_type="row")
                                 yield Static("Sidecars", classes="section")
                                 yield DataTable(id="sidecars", cursor_type="none", show_cursor=False)
                                 yield Static("Last apply", classes="section")
@@ -317,6 +328,9 @@ class Dashboard(Screen):
         fl = self.query_one("#files", DataTable)
         for label, key in (("FILE", "label"), ("PATH", "path"), ("", "state")):
             fl.add_column(Text(label, style="bold"), key=key)
+        rt = self.query_one("#repos", DataTable)
+        for label, key in (("REPO", "repo"), ("STATE", "state"), ("", "mark")):
+            rt.add_column(Text(label, style="bold"), key=key)
         jt = self.query_one("#job-table", DataTable)
         for label, key in (("#", "n"), ("STATUS", "st"), ("TIME", "t"), ("COMMAND", "cmd")):
             jt.add_column(Text(label, style="bold"), key=key)
@@ -728,13 +742,105 @@ class Dashboard(Screen):
                 Text("  %s" % clean_line(c.id[:12]), style=GREY))
         srv = server_short(p)
         val("server", Text(clean_line(p.server if p.running else "stopped"), style=SERVER_STYLE.get(srv, "")))
-        g, gstyle = github_short(p)
-        val("github", clean_line(p.repo) if p.repo else Text("no GitHub remote", style=GREY),
-            "  ", Text(clean_line(p.github), style=gstyle))
         val("code", clean_line(os.path.join(self.cfg.src_root, p.name)))
+        self._render_repos()
+        self._load_suggest(p)
         self._render_stats()
         self._render_sidecars()
         self._thread(self._overview_files_thread, p.name)
+
+    # GitHub repos (Overview)
+
+    def _found(self, name):
+        """The repos found in the project's folder but not listed (from its
+        last `boxen repos NAME --suggest`): untrusted text, shown as such."""
+        return list(self.suggest.get(name, (0, []))[1])
+
+    def _load_suggest(self, p, force=False):
+        if p is None or p.supervisor or ("suggest", p.name) in self._busy:
+            return
+        last = self.suggest.get(p.name)
+        if not force and last is not None and time.monotonic() - last[0] < SUGGEST_EVERY:
+            return
+        self._busy.add(("suggest", p.name))
+        self.run_worker(self._suggest_worker(p.name), group="suggest", exit_on_error=False)
+
+    async def _suggest_worker(self, name):
+        try:
+            rc, out, _err = await procs.run([self.cfg.boxen, "repos", name, "--suggest"], env=self.jobs.env,
+                                            timeout=30)
+            found = [ln.strip() for ln in out.splitlines() if ln.strip()][:50] if rc == 0 else []
+            self.suggest[name] = (time.monotonic(), found)
+            if name == self.selected:
+                self._render_repos()
+        finally:
+            self._busy.discard(("suggest", name))
+
+    def _render_repos(self):
+        p = self.current()
+        t = self.query_one("#repos", DataTable)
+        title = self.query_one("#repos-title", Static)
+        t.clear()
+        self._repo_rows = []
+        if p is None:
+            return
+        _g, gstyle = github_short(p)
+        title.update(Text.assemble("GitHub repos  ", (clean_line(p.github), gstyle), ("   G changes them", GREY)))
+        if p.supervisor:
+            t.add_row(Text("the supervisor has no GitHub token", style=GREY), Text(""), Text(""))
+            return
+        for r in p.repos:
+            label, style = repo_state(r.state)
+            t.add_row(text(r.repo), Text(clean_line(label), style=style), Text("origin" if r.origin else "", style=GREY))
+            self._repo_rows.append(("listed", r.repo))
+        for f in self._found(p.name):
+            t.add_row(text(f), Text("found, not listed", style=AMBER),
+                      Text("a adds" if repo_arg(f) else "not a repo name", style=GREY))
+            self._repo_rows.append(("found", f))
+        if not self._repo_rows:
+            t.add_row(Text("none: G adds one", style=GREY), Text(""), Text(""))
+
+    def action_repos(self):
+        p = self._need_project()
+        if not p:
+            return
+        if p.supervisor:
+            self.notify("The supervisor has no GitHub token.", severity="warning", markup=False)
+            return
+
+        def done(res):
+            if not res:
+                return
+            op, repos = res
+            if op == "add":
+                self.start_job(["repos", p.name, "add"] + repos, project=p.name)
+            elif op == "rm":
+                self._confirm("Remove %s from %s's repos?" % (", ".join(repos), p.name),
+                              "Its tokens stop covering %s at once; adding it back asks again."
+                              % ", ".join(repos),
+                              lambda: self.start_job(["repos", p.name, "rm"] + repos, project=p.name),
+                              yes="Remove")
+        self.app.push_screen(ReposScreen(p.name, p.repos, self._found(p.name)), done)
+
+    def action_repo_add_found(self):
+        """a on Overview: add the found repo the Repos table's cursor is on
+        (or the only one), through boxen's approval question."""
+        p = self._need_project()
+        if not p or p.supervisor:
+            return
+        t = self.query_one("#repos", DataTable)
+        found = [r for kind, r in self._repo_rows if kind == "found" and repo_arg(r)]
+        pick = None
+        i = t.cursor_row
+        if 0 <= i < len(self._repo_rows) and self._repo_rows[i][0] == "found" and repo_arg(self._repo_rows[i][1]):
+            pick = self._repo_rows[i][1]
+        elif len(found) == 1:
+            pick = found[0]
+        if pick is None:
+            self.notify("Select a found repo in the GitHub repos table (or press G)." if found
+                        else "No repos found in the project folder that aren't listed.", markup=False)
+            return
+        self.start_job(["repos", p.name, "add", repo_arg(pick)], project=p.name)
 
     def _render_sidecars(self):
         p = self.current()
@@ -1352,6 +1458,10 @@ class Dashboard(Screen):
                           lambda: self.start_job(["restart", name], project=name), yes="Apply now")
         # The state changed: look again now rather than at the next poll.
         self.call_later(self.refresh_ls)
+        if job.project and job.project in self.suggest:
+            del self.suggest[job.project]
+            if job.project == self.selected:
+                self._load_suggest(self.current(), force=True)
         if job.project == self.selected and job.verb == "resume" and self.active_tab() == "sessions-tab":
             self.load_sessions()
 

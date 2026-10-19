@@ -28,8 +28,9 @@ in the container.
 
 A project's socket is scoped to that project, and the project is the one
 whose socket took the connection, never anything in the request: `ls`,
-`show`, `logs`, `restart` and `update` for itself (a missing name is filled
-in; another project's name is refused), nothing else. `restart` and
+`show`, `logs`, `repos` (read only: never add or rm, which only the user
+can do, on the VM), `restart` and `update` for itself (a missing
+name is filled in; another project's name is refused), nothing else. `restart` and
 `update` recreate the container the client lives in, so they go in two
 steps: `boxen <verb> <name> --prepare` (checks, renders, builds; nothing
 recreated) runs with its output streamed to the client, and only if it
@@ -72,10 +73,12 @@ COOLDOWN = 60.0           # between a project's own restart/update requests
 GLOBAL_WAIT = 600.0       # a global job waits this long for project jobs
 # Verbs whose first argument names the one project they touch (unless it's
 # "all"); the rest take the global lock.
-PROJECT_SCOPED = ("up", "restart", "down", "logs", "show", "update", "resume", "tokens")
+PROJECT_SCOPED = ("up", "restart", "down", "logs", "show", "update", "resume", "tokens", "repos")
 # What a project's own socket may ask for (the name is the socket's).
-PROJECT_VERBS = ("ls", "show", "logs", "restart", "update")
+PROJECT_VERBS = ("ls", "show", "logs", "repos", "restart", "update")
 DETACHED_VERBS = ("restart", "update")
+# Verbs only a project's own socket takes (for itself), never the supervisor's.
+PROJECT_ONLY_VERBS = ("repos",)
 
 NAME = re.compile(r"^[a-z0-9]+([_-][a-z0-9]+)*$")
 NUMBER = re.compile(r"^[0-9]+$")
@@ -205,6 +208,16 @@ def check_rm(args):
     return flags(args[1:], {"--yes": 0})
 
 
+def check_repos(args):
+    """Read only: a project's own socket may look at its repo list (scope
+    fills in the name); changing the list is the user's, on the VM."""
+    if not args or not name(args[0]):
+        return "needs a project name"
+    if args[1:] not in ([], ["--suggest"]):
+        return "only the list (and --suggest) here; the user changes it on the VM"
+    return None
+
+
 def check_tokens(args):
     if not args:
         return None
@@ -226,6 +239,7 @@ VERBS = {
     "resume": check_resume,
     "rm": check_rm,
     "tokens": check_tokens,
+    "repos": check_repos,
 }
 
 
@@ -255,7 +269,8 @@ def scope(argv, project):
     """For a request on project's own socket: the argv to run (the name
     filled in when it's missing) or an error. Only the verbs in
     PROJECT_VERBS, each for that project alone, with no options except
-    logs --tail."""
+    logs --tail and repos --suggest (repos is read only here: no add, no
+    rm)."""
     verb = argv[0]
     if verb not in PROJECT_VERBS:
         return None, "not allowed from a project"
@@ -266,6 +281,8 @@ def scope(argv, project):
         rest = [project] + rest
     if rest[0] != project:
         return None, "not allowed from a project"
+    if verb == "repos" and rest[1:] in ([], ["--suggest"]):
+        return [verb] + rest, None
     if verb != "logs" and len(rest) != 1:
         return None, "not allowed from a project"
     return [verb] + rest, None
@@ -499,6 +516,8 @@ def handle(conn, project=None):
             log(data[:200].decode("utf-8", "replace"), "exit=2 bad request", project)
             return
         why = shape(argv)
+        if why is None and project is None and argv[0] in PROJECT_ONLY_VERBS:
+            why = "'%s' isn't available here" % argv[0]
         if why is None and project is not None:
             argv, why = scope(argv, project)
         if why is None:
