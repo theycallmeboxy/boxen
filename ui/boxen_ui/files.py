@@ -1,10 +1,11 @@
 """Reading a project's files without following links.
 
-A project's env/ folder (and its code folder) can be written from inside
-its container, so a file there can be a symlink planted to make the VM side
-read something else (the GitHub App's key, say). Like bin/boxen env_read,
-these open every path component that could be a link with O_NOFOLLOW and
-check what was opened is a regular file, then read from that descriptor."""
+A project's folder (~/src/<name>, .boxen/ in it included) is written by its
+agent, so a file there can be a symlink planted to make the VM side read
+something else (the GitHub App's key, say). Like bin/boxen env_read, these
+open every path component that could be a link with O_NOFOLLOW and check
+that what was opened is a regular file, then read from that descriptor."""
+import errno
 import os
 import stat
 
@@ -14,85 +15,90 @@ class Refused(Exception):
 
 
 _FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
-def _read_fd(fd, limit, tail):
+def _read_fd(fd, limit):
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise Refused("not a regular file")
-    if tail and st.st_size > limit:
-        os.lseek(fd, st.st_size - limit, os.SEEK_SET)
-    data = os.read(fd, limit)
-    return data.decode("utf-8", "replace")
+    return os.read(fd, limit).decode("utf-8", "replace")
 
 
-def read_file(path, limit=65536, tail=False):
-    """The file at path (the last component not followed), up to limit
-    bytes (the last limit bytes with tail). None when it doesn't exist;
-    Refused when it's a link or not a regular file."""
+def open_dir(base, parts):
+    """A descriptor for base/parts[0]/.../parts[-1], every one of parts
+    opened without following links (base itself is boxen's: ~/src/<name>
+    or projects/<name>, opened without following a link either). Raises
+    FileNotFoundError, or Refused for a link or a non-folder."""
     try:
-        fd = os.open(path, _FLAGS)
+        fd = os.open(base, _DIR)
     except FileNotFoundError:
-        return None
+        raise
     except OSError as e:
-        if e.errno == 40:          # ELOOP: a symlink
-            raise Refused("is a symlink") from None
-        raise Refused(e.strerror or str(e)) from None
-    try:
-        return _read_fd(fd, limit, tail)
-    finally:
+        raise Refused("%s is a symlink or not a folder" % base if e.errno in (errno.ELOOP, errno.ENOTDIR)
+                      else (e.strerror or str(e))) from None
+    shown = ""
+    for part in parts:
+        shown = os.path.join(shown, part)
+        try:
+            nfd = os.open(part, _DIR, dir_fd=fd)
+        except FileNotFoundError:
+            os.close(fd)
+            raise
+        except OSError as e:
+            os.close(fd)
+            raise Refused("%s/ is a symlink or not a folder" % shown if e.errno in (errno.ELOOP, errno.ENOTDIR)
+                          else (e.strerror or str(e))) from None
         os.close(fd)
+        fd = nfd
+    return fd
 
 
-def read_env_file(proj_dir, name, limit=65536):
-    """env/<name> of a project dir: env/ and the file both opened without
-    following links. None when missing; Refused for a link."""
+def read_under(base, rel, limit=65536):
+    """The file base/rel[0]/.../rel[-1], up to limit bytes, with nothing
+    under base followed if it's a link. None when it (or a folder on the
+    way) doesn't exist; Refused for a link or anything but a plain file."""
     try:
-        dfd = os.open(os.path.join(proj_dir, "env"), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        dfd = open_dir(base, rel[:-1])
     except FileNotFoundError:
         return None
-    except OSError as e:
-        raise Refused("env/ is a symlink" if e.errno in (40, 20) else (e.strerror or str(e))) from None
     try:
         try:
-            fd = os.open(name, _FLAGS, dir_fd=dfd)
+            fd = os.open(rel[-1], _FLAGS, dir_fd=dfd)
         except FileNotFoundError:
             return None
         except OSError as e:
-            raise Refused("env/%s is a symlink" % name if e.errno == 40 else (e.strerror or str(e))) from None
+            raise Refused("%s is a symlink" % os.path.join(*rel) if e.errno == errno.ELOOP
+                          else (e.strerror or str(e))) from None
         try:
-            return _read_fd(fd, limit, False)
+            return _read_fd(fd, limit)
+        except Refused:
+            raise Refused("%s isn't a plain file" % os.path.join(*rel)) from None
         finally:
             os.close(fd)
     finally:
         os.close(dfd)
 
 
-def tail_lines(path, n=20):
-    text = read_file(path, limit=65536, tail=True)
-    if text is None:
-        return None
-    lines = text.splitlines()
-    return lines[-n:]
-
-
-def plain_file_problem(path, parents=()):
-    """Why path shouldn't be opened in an editor, or None: it (or one of
-    parents, which must be folders) is a symlink, or it exists and isn't a
-    regular file. A missing file is fine (the editor creates it)."""
-    for d in parents:
-        try:
-            st = os.lstat(d)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            return "%s is a symlink or not a folder; refusing" % d
+def state_under(base, rel):
+    """For the Files tab: "file", "missing" (it, or a folder on the way,
+    isn't there), or why it would be refused."""
     try:
-        st = os.lstat(path)
+        dfd = open_dir(base, rel[:-1])
     except FileNotFoundError:
-        return None
+        return "missing"
+    except Refused as e:
+        return str(e)
+    try:
+        st = os.stat(rel[-1], dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "missing"
+    except OSError as e:
+        return e.strerror or str(e)
+    finally:
+        os.close(dfd)
     if stat.S_ISLNK(st.st_mode):
-        return "%s is a symlink; refusing" % path
+        return "%s is a symlink" % os.path.join(*rel)
     if not stat.S_ISREG(st.st_mode):
-        return "%s isn't a regular file" % path
-    return None
+        return "%s isn't a plain file" % os.path.join(*rel)
+    return "file"

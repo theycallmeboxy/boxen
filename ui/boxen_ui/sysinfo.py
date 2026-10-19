@@ -1,6 +1,5 @@
 """The VM at a glance, for the header. Blocking; called from a thread."""
 import os
-import socket
 import subprocess
 
 
@@ -40,31 +39,6 @@ def disk_free(path):
             if p in ("/", ""):
                 return None
             p = os.path.dirname(p.rstrip("/")) or "/"
-
-
-def agent_up(sock_path):
-    """Whether something accepts connections on the boxen agent's socket.
-    Connects and closes without sending anything (boxen-agentd treats that
-    as a probe: no reply, not logged)."""
-    path = sock_path
-    dfd = None
-    try:
-        if len(path.encode()) > 100:
-            # Too long for sockaddr_un: go through the folder's descriptor.
-            dfd = os.open(os.path.dirname(path), os.O_PATH | os.O_DIRECTORY)
-            path = "/proc/self/fd/%d/%s" % (dfd, os.path.basename(path))
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(1.0)
-        try:
-            s.connect(path)
-            return True
-        finally:
-            s.close()
-    except OSError:
-        return False
-    finally:
-        if dfd is not None:
-            os.close(dfd)
 
 
 def git_hash(repo):

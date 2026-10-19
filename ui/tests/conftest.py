@@ -1,6 +1,6 @@
 """Fixtures for boxen ui's headless tests (needs textual and pytest:
-python -m pytest ui/tests): fake boxen, docker and tmux
-commands, a fake Docker Engine API on a unix socket, and a BOXEN_HOME."""
+python -m pytest ui/tests): fake boxen, docker, tmux and claude commands, a
+fake Docker Engine API on a unix socket, a BOXEN_HOME and a ~/src."""
 import asyncio
 import functools
 import html
@@ -82,34 +82,34 @@ class FakeDocker(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         super().__init__(path, _Handler)
 
 
-def project(name, status="running", server="connected", github="token ok", repo=None, restarts=0,
+def project(name, state="running", status=None, sessions=0, serve="off", github="token ok", repo=None,
             sidecars=(), repos=None):
+    """A project as `boxen ls --json` (version 3) lists it; state None: no
+    build container yet. The path is filled in by Env.set_ls."""
     c = None
-    if status is not None:
-        c = {"status": status, "restarts": restarts, "started_at": "2026-10-19T08:00:00.123456789Z",
-             "id": (name.encode().hex() + "0" * 64)[:64]}
+    if state is not None:
+        c = {"state": state, "status": status if status is not None else
+             ("Up 2 hours" if state == "running" else "Exited (0) 3 hours ago")}
     if repos is None:
         repos = [{"repo": repo, "state": "ok" if github == "token ok" else "-", "origin": True}] if repo else []
-    return {"name": name, "container": c, "server": server if status == "running" else "-",
-            "github": github, "repo": repo, "repos": list(repos), "sidecars": list(sidecars)}
+    return {"name": name, "container": c, "sidecars": list(sidecars), "sessions": sessions, "serve": serve,
+            "github": github, "repo": repo, "repos": list(repos)}
 
 
-def sidecar(project_name, svc, image, status="running", health=None):
-    """A sidecar as `ls --json` lists it; status and health (what Docker
-    would say) are for the fake Docker API only."""
-    return {"service": svc, "container": "boxen.%s.%s" % (project_name, svc), "image": image,
-            "_status": status, "_health": health}
+def sidecar(project_name, svc, state="running", health=None):
+    """A sidecar as `ls --json` lists it (Docker's status text with the
+    health in it, as docker ps says it)."""
+    status = ("Up 2 hours" + (" (%s)" % health if health else "")) if state == "running" else "Exited (0) 1 hour ago"
+    return {"service": svc, "container": "boxen.%s.%s" % (project_name, svc), "state": state, "status": status}
 
 
 def four_projects():
     return {"projects": [
-        project("caulker", repo="theycallmeboxy/caulker",
-                sidecars=[sidecar("caulker", "postgres", "postgres:16", health="healthy"),
-                          sidecar("caulker", "redis", "redis:7")]),
-        project("beta", status="exited", github="-"),
-        project("gamma", server="waiting for an answer: run boxen up gamma", github="token stale",
-                restarts=2, repo="theycallmeboxy/gamma"),
-    ], "supervisor": project("supervisor", github="-")}
+        project("caulker", repo="theycallmeboxy/caulker", sessions=2, serve="on",
+                sidecars=[sidecar("caulker", "postgres", health="healthy"), sidecar("caulker", "redis")]),
+        project("beta", state="exited", github="-"),
+        project("gamma", state=None, serve="stopped", github="token stale", repo="theycallmeboxy/gamma"),
+    ], "v1": []}
 
 
 class Env:
@@ -135,20 +135,21 @@ class Env:
         self.server = None
         if docker:
             names, states = {}, {}
-            for p in (self.ls["projects"] + ([self.ls["supervisor"]] if self.ls.get("supervisor") else [])):
+            for p in self.ls["projects"]:
                 if p["container"]:
-                    states["boxen-%s" % p["name"]] = (p["container"]["status"], None)
-                if p["container"] and p["container"]["status"] == "running":
-                    names["boxen-%s" % p["name"]] = 0.25 if p["name"] == "caulker" else 0.05
-                    for s in p["sidecars"]:
-                        if s.get("_status"):
-                            states[s["container"]] = (s["_status"], s.get("_health"))
-                        if s.get("_status") == "running":
-                            names[s["container"]] = 0.02
+                    states["boxen.%s.env" % p["name"]] = (p["container"]["state"], None)
+                if p["container"] and p["container"]["state"] == "running":
+                    names["boxen.%s.env" % p["name"]] = 0.25 if p["name"] == "caulker" else 0.05
+                for s in p["sidecars"]:
+                    health = "healthy" if "(healthy)" in s["status"] else None
+                    states[s["container"]] = (s["state"], health)
+                    if s["state"] == "running":
+                        names[s["container"]] = 0.02
             self.server = FakeDocker(self.sock, names, root, states)
             threading.Thread(target=self.server.serve_forever, daemon=True).start()
         for p in self.ls["projects"]:
-            os.makedirs(os.path.join(self.home, "projects", p["name"], "env"), exist_ok=True)
+            os.makedirs(os.path.join(self.home, "projects", p["name"]), exist_ok=True)
+            os.makedirs(os.path.join(self.src, p["name"], ".boxen"), exist_ok=True)
         self.env = {
             "PATH": self.bin + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", root),
@@ -158,7 +159,7 @@ class Env:
             "BOXEN_HOME": self.home,
             "BOXEN_SRC": self.src,
             "BOXEN_REPO": os.path.dirname(UI_DIR),
-            "DOCKER_HOST": "unix://" + self.sock,
+            "BOXEN_DOCKER_HOST": "unix://" + self.sock,
             "XDG_STATE_HOME": os.path.join(root, "state"),
             "TMUX": "/tmp/tmux-1000/boxen,4242,0",
             "EDITOR": "vim",
@@ -168,10 +169,12 @@ class Env:
     def set_ls(self, doc):
         self.ls = doc
         out = json.loads(json.dumps(doc))
-        out.setdefault("version", 1)
+        out.setdefault("version", 3)
         out.setdefault("docker", True)
-        for p in out["projects"] + ([out["supervisor"]] if out.get("supervisor") else []):
-            p["sidecars"] = [{k: v for k, v in s.items() if not k.startswith("_")} for s in p["sidecars"]]
+        out.setdefault("src", self.src)
+        out.setdefault("v1", [])
+        for p in out["projects"]:
+            p.setdefault("path", os.path.join(self.src, p["name"]))
         with open(os.path.join(self.fake, "ls.json"), "w") as f:
             json.dump(out, f)
 

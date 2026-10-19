@@ -1,20 +1,20 @@
 """Editing a project's file (Files tab, e) without trusting its path.
 
-The file can live where the project's container writes (env/, the code
-folder), so the editor never gets the real path: the dashboard reads the
-file without following links (files.py) into a private folder (0700) and
-opens the editor on that copy in a tmux window, which runs
+Some of the files live where the project's agent writes (~/src/<name>/.boxen/),
+so the editor never gets the real path: the dashboard reads the file without
+following links (files.py) into a private folder (0700) and opens the editor
+on that copy in a tmux window, which runs
 
     python -P -m boxen_ui.edit <private folder>/spec.json
 
 That runs the editor (vim with modelines off: a file can't set options),
-and when it exits writes the copy back the way bin/boxen's write_env does:
-to a temp file next to it (in the project folder for env/ files, where the
-container can't reach), then a rename over the target, which replaces a
-link put there meanwhile rather than following it. Only when the content
-changed, and only if the target is still a plain file with the content the
-copy started from (else the copy is kept and the window says where). The
-outcome goes to result.json in the private folder for the dashboard.
+and when it exits writes the copy back: to a temp file next to the target,
+then a rename over the target, which replaces a link put there meanwhile
+rather than following it. Every folder on the way below the project's own
+folder is opened without following links. Only when the content changed,
+and only if the target is still a plain file with the content the copy
+started from (else the copy is kept and the window says where). The outcome
+goes to result.json in the private folder for the dashboard.
 """
 import hashlib
 import json
@@ -46,23 +46,22 @@ def private_dir(env=None):
     return tempfile.mkdtemp(prefix="boxen-ui-edit-", dir=base)      # mode 0700
 
 
-def prepare(project, label, target, proj_dir, env_file, editor, env=None):
-    """Copy target into a private folder; returns the spec (a dict, also
-    written to spec.json there). Raises files.Refused or OSError."""
-    name = os.path.basename(target)
-    if env_file:
-        text = files.read_env_file(proj_dir, name, limit=1024 * 1024)
-    else:
-        text = files.read_file(target, limit=1024 * 1024)
+def prepare(project, label, base, rel, editor, env=None, template=None):
+    """Copy base/rel... (rel: the path's parts below base, a trusted folder)
+    into a private folder; returns the spec (a dict, also written to
+    spec.json there). A missing file's copy starts as template (bytes) or
+    empty. Raises files.Refused or OSError."""
+    text = files.read_under(base, rel, limit=1024 * 1024)
     data = text.encode("utf-8") if text is not None else None
+    start = data if data is not None else (template or b"")
     d = private_dir(env)
-    copy = os.path.join(d, name)
+    copy = os.path.join(d, rel[-1])
     fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as f:
-        f.write(data or b"")
-    spec = {"project": project, "label": label, "target": target, "proj_dir": proj_dir,
-            "env_file": bool(env_file), "copy": copy, "orig_sha": _sha(data), "editor": list(editor),
-            "dir": d, "result": os.path.join(d, "result.json")}
+        f.write(start)
+    spec = {"project": project, "label": label, "base": base, "rel": list(rel),
+            "target": os.path.join(base, *rel), "copy": copy, "orig_sha": _sha(data), "start_sha": _sha(start),
+            "editor": list(editor), "dir": d, "result": os.path.join(d, "result.json")}
     with open(os.path.join(d, "spec.json"), "w") as f:
         json.dump(spec, f)
     return spec
@@ -73,10 +72,6 @@ def editor_cmd(editor, copy):
     if os.path.basename(argv[0]) in VIM_NAMES:
         argv += ["--cmd", "set nomodeline"]
     return argv + [copy]
-
-
-def _open_dir(path):
-    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
 def _unlink_if(name, dfd, st):
@@ -92,17 +87,18 @@ def _unlink_if(name, dfd, st):
 def write_back(spec, new):
     """Put new (bytes) in place of spec's target. Returns {"status":
     unchanged|written|conflict|refused, "message"}."""
-    if _sha(new) == spec["orig_sha"] or (spec["orig_sha"] is None and new == b""):
+    if _sha(new) in (spec["start_sha"], spec["orig_sha"]) or (spec["orig_sha"] is None and new == b""):
         return {"status": "unchanged", "message": "no changes"}
     target = spec["target"]
-    name = os.path.basename(target)
+    name = spec["rel"][-1]
     try:
-        dfd = _open_dir(os.path.join(spec["proj_dir"], "env") if spec["env_file"] else os.path.dirname(target))
-    except OSError as e:
-        return {"status": "refused", "message": "%s: its folder is a symlink or gone (%s)" % (target, e.strerror)}
+        dfd = files.open_dir(spec["base"], spec["rel"][:-1])
+    except (OSError, files.Refused) as e:
+        return {"status": "refused", "message": "%s: its folder is a symlink or gone (%s)"
+                % (target, getattr(e, "strerror", None) or e)}
     tfd = None
     try:
-        mode = 0o600 if name.endswith(".env") else 0o644
+        mode = 0o644
         try:
             st = os.lstat(name, dir_fd=dfd)
         except FileNotFoundError:
@@ -118,13 +114,12 @@ def write_back(spec, new):
                 return {"status": "conflict", "message": "%s changed while you edited it; not written" % target}
         elif spec["orig_sha"] is not None:
             return {"status": "conflict", "message": "%s was removed while you edited it; not written" % target}
-        # The temp file: in the project folder for env/ files (out of the
-        # container's reach), else next to the target, where the container
-        # can write too. So it's never touched by path once created: created
+        # The temp file goes next to the target, where the agent may write
+        # too. So it's never touched by path once created: created
         # exclusively without following links, mode set on the open file,
         # and before it's renamed into place, the name must still be that
         # very file (device and inode); afterwards the target must be it.
-        tfd = _open_dir(spec["proj_dir"]) if spec["env_file"] else os.dup(dfd)
+        tfd = os.dup(dfd)
         tmp = ".boxen-edit-%s" % secrets.token_hex(6)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                      0o600, dir_fd=tfd)

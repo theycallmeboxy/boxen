@@ -14,26 +14,29 @@ from boxen_ui import edit, files
 
 @pytest.fixture
 def proj(tmp_path):
-    p = tmp_path / "projects" / "a"
-    (p / "env").mkdir(parents=True)
-    (p / "env" / "services.yaml").write_text("services: {}\n")
+    """A project folder (~/src/a) with its .boxen/, which its agent writes."""
+    p = tmp_path / "src" / "a"
+    (p / ".boxen").mkdir(parents=True)
+    (p / ".boxen" / "services.yaml").write_text("services: {}\n")
+    pdir = tmp_path / "projects" / "a"
+    pdir.mkdir(parents=True)
     secret = tmp_path / "app.pem"
     secret.write_text("SECRET KEY")
-    return {"pdir": str(p), "env": p / "env", "secret": secret, "tmp": tmp_path,
+    return {"src": str(p), "env": p / ".boxen", "pdir": str(pdir), "secret": secret, "tmp": tmp_path,
             "rt": {"XDG_RUNTIME_DIR": str(tmp_path / "nonexistent")}}
 
 
-def spec_for(proj, name="services.yaml", env_file=True, target=None):
-    target = target or str(proj["env"] / name)
-    return edit.prepare("a", "env/" + name, target, proj["pdir"], env_file, ["vim"], env=proj["rt"])
+def spec_for(proj, name="services.yaml"):
+    return edit.prepare("a", ".boxen/" + name, proj["src"], [".boxen", name], ["vim"], env=proj["rt"])
 
 
 def test_prepare_copies_privately(proj):
     s = spec_for(proj)
     assert open(s["copy"]).read() == "services: {}\n"
+    assert s["target"] == str(proj["env"] / "services.yaml")
     assert stat.S_IMODE(os.stat(s["dir"]).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(s["copy"]).st_mode) == 0o600
-    assert not s["copy"].startswith(proj["pdir"])
+    assert not s["copy"].startswith(proj["src"])
     assert edit.editor_cmd(["vim"], s["copy"]) == ["vim", "--cmd", "set nomodeline", s["copy"]]
     assert edit.editor_cmd(["nano", "-w"], "f") == ["nano", "-w", "f"]
 
@@ -45,13 +48,22 @@ def test_prepare_refuses_symlinks(proj):
         spec_for(proj)
 
 
+def test_prepare_refuses_a_linked_boxen_folder(proj):
+    real = proj["tmp"] / "elsewhere"
+    os.rename(proj["env"], real)
+    os.symlink(real, proj["env"])
+    with pytest.raises(files.Refused):
+        spec_for(proj)
+    assert files.state_under(proj["src"], [".boxen", "services.yaml"]) == ".boxen/ is a symlink or not a folder"
+
+
 def test_unchanged_and_written(proj):
     s = spec_for(proj)
     assert edit.write_back(s, b"services: {}\n")["status"] == "unchanged"
     r = edit.write_back(s, b"services:\n  db: {image: postgres}\n")
     assert r["status"] == "written"
     assert (proj["env"] / "services.yaml").read_text().startswith("services:\n  db")
-    assert not [f for f in os.listdir(proj["pdir"]) if f.startswith(".boxen-edit-")]
+    assert not [f for f in os.listdir(proj["env"]) if f.startswith(".boxen-edit-")]
 
 
 def test_conflict_when_changed_meanwhile(proj):
@@ -71,7 +83,7 @@ def test_symlink_planted_meanwhile_is_not_followed(proj):
     assert proj["secret"].read_text() == "SECRET KEY"
 
 
-def test_env_folder_swapped_for_a_link(proj):
+def test_boxen_folder_swapped_for_a_link(proj):
     s = spec_for(proj)
     os.rename(proj["env"], proj["tmp"] / "env-real")
     os.symlink(proj["tmp"], proj["env"])
@@ -80,13 +92,34 @@ def test_env_folder_swapped_for_a_link(proj):
     assert not (proj["tmp"] / "services.yaml").exists()
 
 
-def test_new_file(proj, tmp_path):
-    target = os.path.join(proj["pdir"], "compose.override.yaml")
-    s = edit.prepare("a", "compose.override.yaml", target, proj["pdir"], False, ["vim"], env=proj["rt"])
+def test_new_file(proj):
+    target = os.path.join(proj["pdir"], "repos")
+    s = edit.prepare("a", "repos", proj["pdir"], ["repos"], ["vim"], env=proj["rt"])
     assert s["orig_sha"] is None and open(s["copy"]).read() == ""
     assert edit.write_back(s, b"")["status"] == "unchanged"
-    assert edit.write_back(s, b"services: {}\n")["status"] == "written"
-    assert open(target).read() == "services: {}\n"
+    assert edit.write_back(s, b"you/repo\n")["status"] == "written"
+    assert open(target).read() == "you/repo\n"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+
+
+def test_new_file_from_a_template(proj):
+    tpl = b"# example\n# services:\n"
+    target = os.path.join(proj["pdir"], "compose.override.yaml")
+    s = edit.prepare("a", "compose.override.yaml", proj["pdir"], ["compose.override.yaml"], ["vim"],
+                     env=proj["rt"], template=tpl)
+    assert open(s["copy"], "rb").read() == tpl and s["orig_sha"] is None
+    assert edit.write_back(s, tpl)["status"] == "unchanged"         # quitting without a change writes nothing
+    assert not os.path.exists(target)
+    assert edit.write_back(s, b"services:\n")["status"] == "written"
+    assert open(target).read() == "services:\n"
+
+
+def test_missing_boxen_folder_is_refused_not_created(proj):
+    s = spec_for(proj)
+    import shutil
+    shutil.rmtree(proj["env"])
+    r = edit.write_back(s, b"mine\n")
+    assert r["status"] == "refused" and not proj["env"].exists()
 
 
 def test_main_runs_editor_and_reports(proj, tmp_path):
@@ -126,9 +159,8 @@ while not os.path.exists(stop):
 
 
 def test_write_back_race_in_container_writable_folder(tmp_path):
-    """The reviewer's race: in the code folder (writable from the
-    container) the temp file is swapped for a link to a secret between the
-    write and the rename. 3000 tries: the secret's mode and content never
+    """The reviewer's race: in .boxen/ (which the agent writes) the temp
+    file is swapped for a link to a secret between the write and the rename. 3000 tries: the secret's mode and content never
     change, nothing is written through a link, and a write is only reported
     when the target really is the file written."""
     src = tmp_path / "src" / "p"
@@ -138,9 +170,10 @@ def test_write_back_race_in_container_writable_folder(tmp_path):
     secret = tmp_path / "secret.pem"
     secret.write_text("SECRET")
     secret.chmod(0o600)
-    target = src / "CLAUDE.md"
+    target = src / ".boxen" / "Dockerfile"
+    target.parent.mkdir()
     stop = tmp_path / "stop"
-    atk = subprocess.Popen([sys.executable, "-c", ATTACKER, str(src), str(secret), str(stop)])
+    atk = subprocess.Popen([sys.executable, "-c", ATTACKER, str(target.parent), str(secret), str(stop)])
     counts = {}
     bad = 0
     try:
@@ -149,7 +182,7 @@ def test_write_back_race_in_container_writable_folder(tmp_path):
             if target.is_symlink():
                 target.unlink(missing_ok=True)
                 target.write_text("v%d\n" % i)
-            s = edit.prepare("p", "CLAUDE.md", str(target), str(pdir), False, ["vim"],
+            s = edit.prepare("p", ".boxen/Dockerfile", str(src), [".boxen", "Dockerfile"], ["vim"],
                              env={"XDG_RUNTIME_DIR": str(tmp_path / "none")})
             r = edit.write_back(s, b"edited %d\n" % i)
             counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -158,7 +191,7 @@ def test_write_back_race_in_container_writable_folder(tmp_path):
                     bad += 1
             if target.is_symlink():
                 target.unlink(missing_ok=True)
-            for x in src.iterdir():
+            for x in target.parent.iterdir():
                 if x.name.startswith(".boxen-edit-"):
                     x.unlink(missing_ok=True)
             import shutil as _sh

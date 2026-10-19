@@ -4,17 +4,17 @@ Data comes in off the UI thread, on a one-second tick that decides what's
 due: `boxen ls --json` (a subprocess) every 5 s while someone is looking
 (a client attached to the tmux session and the terminal focused), else
 every 60 s, and at once after every job and on ctrl+r; container states
-and stats from the Docker Engine API every 3 s while a client is attached
-(a thread); the VM summary every 5 s (a thread); tmux windows every second
-on the Terminals tab, else every 3 s. Actions run `boxen` as jobs (see
-jobs.py) or open tmux windows (tmux.py). Nothing from outside is ever
-rendered as markup: see textutil.py.
+and stats from the Docker Engine API (your rootless daemon) every 3 s while
+a client is attached (a thread); the VM summary every 5 s (a thread); tmux
+windows every second on the Sessions tab, else every 3 s. Actions run
+`boxen` as jobs (see jobs.py) or open tmux windows (tmux.py): Claude
+sessions in the project's folder, shells, the editor. Nothing from outside
+is ever rendered as markup: see textutil.py.
 """
 import asyncio
 import collections
 import json
 import os
-import re
 import shlex
 import shutil
 import signal
@@ -34,67 +34,70 @@ from textual.widgets import DataTable, Footer, Label, Log, Select, Sparkline, St
 
 from . import edit, files, procs, sysinfo
 from .config import PKG_DIR, Config, repo_arg, valid_name
-from .docker_api import DockerAPI, DockerError, cpu_percent, memory
-from .jobs import APPROVAL, FAILED, OK, RUNNING, STOPPED, Busy, JobManager, fmt_elapsed, question_project
-from .model import (AMBER, GREEN, GREY, HEALTH_STYLE, RED, RUNNING_JOB, SERVER_STYLE, container_short,
-                    container_style, github_short, parse_ls, repo_state, server_short, uptime)
-from .screens import (ApprovalScreen, ConfirmScreen, GlobalMenuScreen, HelpScreen, NewProjectScreen,
-                      QuestionScreen, ReposScreen)
+from .docker_api import DockerAPI, DockerError, cpu_percent, health_of, memory
+from .jobs import FAILED, OK, RUNNING, STOPPED, Busy, JobManager, fmt_elapsed
+from .model import (AMBER, GREEN, GREY, HEALTH_STYLE, RED, RUNNING_JOB, container_short, container_style,
+                    github_short, parse_ls, repo_state, serve_short, state_style)
+from .screens import ConfirmScreen, GlobalMenuScreen, HelpScreen, NewProjectScreen, ReposScreen
 from .textutil import ansi_text, clean_line, text
-from .tmux import GLOBAL, Tmux, in_boxen_tmux, window_name
+from .tmux import GLOBAL, Tmux, in_boxen_tmux, kind_of, serve_window, window_name
 
 UI_DIR = os.path.dirname(PKG_DIR)
-SEP = "--sep--"
 HIST = 60
 HIST_FORGET = 300           # drop a container's series after it's been gone this long
-SESSION_ID = re.compile(r"^[0-9a-f]{8}$")
-JOB_STYLE = {RUNNING: RUNNING_JOB, OK: GREEN, FAILED: RED, APPROVAL: AMBER, STOPPED: GREY}
-SESSION_STYLE = {"live": GREEN, "partial": AMBER, "carried": GREY}
+JOB_STYLE = {RUNNING: RUNNING_JOB, OK: GREEN, FAILED: RED, STOPPED: GREY}
 LS_ACTIVE, LS_IDLE, STATS_EVERY, SYS_EVERY = 5, 60, 3, 5
 SUGGEST_EVERY = 30          # `boxen repos NAME --suggest` for the selected project, at most this often
+# A Claude session, as `boxen claude` starts one. The tmux server was started
+# without DOCKER_HOST (bin/boxen), and this makes sure of it: nothing an
+# agent runs gets a way to the Docker daemon.
+CLAUDE_ARGV = ["env", "-u", "DOCKER_HOST", "claude"]
+# Control characters out of a followed log, as bin/boxen env_logs does, so a
+# sidecar's output can't drive your terminal.
+FOLLOW_SH = ("docker -H \"$1\" logs -f --tail 100 \"$2\" 2>&1 "
+             "| LC_ALL=C tr -d '\\000-\\010\\013\\014\\016-\\037\\177'")
 
 PROJECT_ACTIONS = [
     # (action, palette title, description)
-    ("up", "Up", "start, or apply env/compose changes"),
-    ("down", "Down", "stop the container (asks first)"),
-    ("restart", "Restart", "recreate the container (asks first)"),
-    ("update_project", "Update", "rebuild the project's image and recreate it (asks first)"),
-    ("shell", "Shell", "bash inside the container, in a terminal window"),
-    ("claude", "Claude", "a terminal Claude session inside the container"),
-    ("logs_tab", "Logs", "the server's output"),
-    ("follow_logs", "Follow logs", "the server's output, live, in a terminal window"),
-    ("sessions_tab", "Sessions", "earlier conversations: continue one in the Claude app"),
-    ("terminals_tab", "Terminals", "the project's terminal windows, with a live preview"),
-    ("files_tab", "Files", "the project's env files: edit one in vim"),
-    ("repos", "GitHub repos", "the repos this project's token covers: add (asks), remove"),
+    ("claude", "Claude", "switch to the project's Claude session, or start one"),
+    ("claude_new", "New Claude session", "another Claude session in the project folder"),
+    ("serve", "Serve on/off", "a Remote Control server for the project, to start sessions from the Claude app"),
+    ("up", "Up", "build and start the build container and sidecars, applying .boxen/ changes"),
+    ("down", "Down", "stop the build container and sidecars (asks first)"),
+    ("shell", "Build shell", "a root shell in the build container, in a terminal window"),
+    ("vm_shell", "VM shell", "a shell on the VM in the project folder, in a terminal window"),
+    ("sessions_tab", "Sessions", "the project's windows: Claude sessions, serve, shells, with a live preview"),
+    ("logs_tab", "Logs", "the sidecars' output"),
+    ("files_tab", "Files", "the build environment, your override and the repos list: edit one in vim"),
+    ("repos", "GitHub repos", "the repos this project's tokens cover: add, remove"),
     ("repo_add_found", "Add found repo", "add the repo found in the project folder, selected in Overview (asks)"),
-    ("rm", "Remove", "remove the project's container, image and config (asks; keeps the code)"),
+    ("rm", "Remove", "remove the project from boxen: build container, image, data, settings (asks; keeps the code)"),
 ]
 GLOBAL_PALETTE = [
     ("new", "New project", "create a project, optionally cloning a GitHub repo"),
-    ("global_update_all", "Update everything", "rebuild the base image and every project"),
+    ("global_update_all", "Update everything", "rebuild the base image and every project's build container"),
     ("global_self_update", "Self-update boxen", "pull the latest boxen and apply it (terminal)"),
     ("global_tokens", "Refresh GitHub tokens", "mint fresh tokens for every project"),
     ("global_github", "Connect GitHub", "GitHub App and commit identity (terminal)"),
-    ("global_login", "Sign in to Claude", "shared by every project (terminal)"),
-    ("global_import_mac", "Moving from a Mac", "how to bring your work over (terminal)"),
-    ("global_supervisor", "Set up the supervisor", "run boxen from the Claude app (terminal)"),
+    ("global_doctor", "Check this VM", "boxen doctor: rootless Docker, the sandbox and isolation"),
+    ("global_migrate", "Move from boxen v1", "bring v1 projects over (terminal)"),
     ("refresh", "Refresh", "look at everything again now"),
     ("toggle_jobs", "Jobs panel", "show or hide the jobs panel"),
     ("restart_dashboard", "Restart dashboard", "start the dashboard again (after a boxen update)"),
     ("help", "Keys", "every key boxen ui knows"),
     ("detach", "Detach", "leave boxen ui running; `boxen ui` comes back"),
-    ("quit_all", "Quit boxen ui", "stop jobs and close every boxen ui window"),
+    ("quit_all", "Quit dashboard", "stop the dashboard and its jobs; sessions and windows keep running"),
 ]
 GETTING_STARTED = """No projects yet.
 
   n   new project: a name, a GitHub repo (optional)
-  g   setup: GitHub, Claude sign-in, the supervisor,
-      and "Moving from a Mac" (bring your work over)
+  g   setup: GitHub, check this VM (doctor),
+      and "Move from boxen v1"
 
-More in the README: "Create a project" and
-"Moving from a Mac", in
+More in the README, in
 %s"""
+WINDOW_WHAT = {"claude": "Claude session", "serve": "Remote Control server", "shell": "build container shell",
+               "vm-shell": "VM shell"}
 
 
 def editor_argv(env=None):
@@ -111,6 +114,20 @@ def editor_argv(env=None):
     return ["vim"] if shutil.which("vim", path=env.get("PATH")) else ["vi"]
 
 
+def window_what(kind):
+    if kind in WINDOW_WHAT:
+        return WINDOW_WHAT[kind]
+    if kind.startswith("edit-"):
+        return "editing " + kind[len("edit-"):]
+    if kind.startswith("logs-"):
+        return "log: " + kind[len("logs-"):]
+    return kind
+
+
+def _plural(n, word, words=None):
+    return "%d %s" % (n, word if n == 1 else (words or word + "s"))
+
+
 def _fmt_cpu(v):
     if v is None:
         return Text("-", style=GREY)
@@ -121,26 +138,9 @@ def _fmt_mem(v):
     return Text("-", style=GREY) if v is None else Text(sysinfo.human_bytes(v))
 
 
-def _ellipsis(s, width):
-    return s if len(s) <= width else s[:max(0, width - 1)] + "…"
-
-
 class ProjectTable(DataTable):
     BINDINGS = [Binding("j", "cursor_down", "Down", show=False),
                 Binding("k", "cursor_up", "Up", show=False)]
-
-
-class SessionTable(DataTable):
-    """A click only moves the cursor; Enter or a double click acts."""
-
-    async def _on_click(self, event):
-        meta = event.style.meta
-        row = meta.get("row") if meta else None
-        if isinstance(row, int) and 0 <= row < self.row_count:
-            self.move_cursor(row=row)
-            if event.chain >= 2:
-                self.action_select_cursor()
-        event.stop()
 
 
 class Dashboard(Screen):
@@ -169,17 +169,15 @@ class Dashboard(Screen):
     .spark-row Label { width: 11; text-style: bold; }
     .spark-row Sparkline { width: 1fr; height: 1; }
     .spark-row .now { width: 18; padding-left: 1; }
-    #sidecars { height: auto; max-height: 8; }
+    #sidecars { height: auto; max-height: 10; }
     #repos { height: auto; max-height: 8; }
-    #ov-apply, #ov-status { height: auto; color: $text-muted; }
-    #sess-status, #logs-status, #term-status, #files-note, #sess-help { height: auto; color: $text-muted; }
-    #sessions { height: 1fr; }
+    #logs-status, #win-status, #files-note { height: auto; color: $text-muted; }
     #logs-bar { height: 3; }
     #log-source { width: 30; }
     #logs-bar Static { padding: 1 0 0 2; color: $text-muted; }
     #log-view { height: 1fr; }
-    #term-list { height: auto; max-height: 7; }
-    #term-preview { height: 1fr; border: round $panel; padding: 0 1; overflow: hidden; }
+    #win-list { height: auto; max-height: 9; }
+    #win-preview { height: 1fr; border: round $panel; padding: 0 1; overflow: hidden; }
     #files { height: auto; }
     #jobs { height: auto; }
     #jobs-bar { height: 1; background: $panel; padding: 0 1; }
@@ -193,20 +191,20 @@ class Dashboard(Screen):
     BINDINGS = [
         Binding("question_mark", "help", "Keys"),
         Binding("q", "detach", "Detach"),
+        Binding("c", "claude", "Claude"),
+        Binding("C", "claude_new", "New session", show=False),
+        Binding("S", "serve", "Serve"),
         Binding("u", "up", "Up"),
         Binding("d", "down", "Down"),
-        Binding("r", "restart", "Restart"),
-        Binding("U", "update_project", "Update"),
         Binding("s", "shell", "Shell"),
-        Binding("c", "claude", "Claude"),
+        Binding("v", "vm_shell", "VM shell", show=False),
         Binding("n", "new", "New"),
         Binding("g", "global_menu", "Global"),
         Binding("J", "toggle_jobs", "Jobs"),
         Binding("f", "follow_logs", "Follow"),
-        Binding("a", "session_attach", "Attach"),
+        Binding("x", "window_close", "Close"),
         Binding("a", "repo_add_found", "Add repo"),
         Binding("G", "repos", "Repos"),
-        Binding("x", "session_stop", "Close"),
         Binding("e", "edit_file", "Edit"),
         Binding("ctrl+r,f5", "refresh", "Refresh", show=False),
         Binding("l", "logs_tab", "Logs", show=False),
@@ -214,8 +212,7 @@ class Dashboard(Screen):
         Binding("Q", "quit_all", "Quit", show=False),
     ]
     # Keys that only mean something on one tab: shown (and live) only there.
-    TAB_ACTIONS = {"follow_logs": ("logs",), "session_attach": ("sessions-tab",),
-                   "session_stop": ("sessions-tab",), "edit_file": ("files-tab",),
+    TAB_ACTIONS = {"follow_logs": ("logs",), "window_close": ("sessions-tab",), "edit_file": ("files-tab",),
                    "repo_add_found": ("overview",)}
 
     def __init__(self, cfg, env):
@@ -227,6 +224,7 @@ class Dashboard(Screen):
         self.jobs.external_global = self._external_global
         self.projects = []
         self.by_name = {}
+        self.v1 = []                # boxen v1 projects not migrated yet
         self.selected = None
         self.ls_error = None
         self.ls_loaded = False
@@ -242,15 +240,14 @@ class Dashboard(Screen):
         self.hist = {}              # project -> (cpu deque, mem deque)
         self._hist_seen = {}        # project -> when its container was last running
         self.windows = []
+        self._win_rows = None
         self.compact = None
         self.selected_job = None
         self.pending_edits = {}     # result.json path -> edit spec
         self._busy = set()          # refreshes in flight
         self._due = {}              # what -> monotonic time it last ran
         self._ticks = 0
-        self._last_row = 0
-        self._log_source = "server"
-        self._sessions = []
+        self._log_source = None
         self.suggest = {}           # project -> (monotonic time, [found repo, ...]) from repos --suggest
         self._repo_rows = []        # Overview's repos table: ("listed" | "found", repo) by row
         self._loaded = {}           # tab -> project it shows
@@ -272,7 +269,7 @@ class Dashboard(Screen):
                             yield Static(Text(""), id="getting-started")
                             with Vertical(id="ov-content"):
                                 with Grid(id="ov-grid"):
-                                    for key in ("container", "server", "code"):
+                                    for key in ("container", "sessions", "serve", "folder"):
                                         yield Label(key, classes="k")
                                         yield Static(Text(""), classes="v", id="ov-" + key)
                                 with Horizontal(classes="spark-row"):
@@ -287,30 +284,22 @@ class Dashboard(Screen):
                                 yield DataTable(id="repos", cursor_type="row")
                                 yield Static("Sidecars", classes="section")
                                 yield DataTable(id="sidecars", cursor_type="none", show_cursor=False)
-                                yield Static("Last apply", classes="section")
-                                yield Static(Text(""), id="ov-apply")
-                                yield Static("STATUS.md", classes="section")
-                                yield Static(Text(""), id="ov-status")
                     with TabPane("Sessions", id="sessions-tab"):
-                        yield Static(Text(""), id="sess-status")
-                        yield SessionTable(id="sessions", cursor_type="row")
-                        yield Static(Text("⏎ continue in app · a terminal · x close · ctrl+r refresh"),
-                                     id="sess-help")
+                        yield Static(Text(""), id="win-status")
+                        yield DataTable(id="win-list", cursor_type="row")
+                        yield Static(Text(""), id="win-preview")
                     with TabPane("Logs", id="logs"):
                         with Horizontal(id="logs-bar"):
-                            yield Select([(Text("server"), "server")], id="log-source", allow_blank=False,
-                                         value="server")
+                            yield Select([], id="log-source", allow_blank=True, prompt="sidecar")
                             yield Static(Text("ctrl+r refresh · f follow in a terminal"))
                         yield Static(Text(""), id="logs-status")
                         yield Log(id="log-view", max_lines=2000)
-                    with TabPane("Terminals", id="terminals"):
-                        yield Static(Text(""), id="term-status")
-                        yield DataTable(id="term-list", cursor_type="row")
-                        yield Static(Text(""), id="term-preview")
                     with TabPane("Files", id="files-tab"):
                         yield Static(Text("e edits a private copy of the selected file in vim ($EDITOR if set; "
-                                          "modelines off), saved back when you quit it. A full editor comes in "
-                                          "phase 2."), id="files-note")
+                                          "modelines off), saved back when you quit it. .boxen/ is the "
+                                          "project's build environment, which its agent may edit too; the "
+                                          "override and repos are yours alone. u applies changes."),
+                                     id="files-note")
                         yield DataTable(id="files", cursor_type="row")
         with Vertical(id="jobs", classes="collapsed"):
             yield Static(Text(""), id="jobs-bar")
@@ -320,11 +309,9 @@ class Dashboard(Screen):
         yield Footer()
 
     def on_mount(self):
-        ss = self.query_one("#sessions", DataTable)
-        ss.add_column(Text("", style="bold"), key="n")
-        tl = self.query_one("#term-list", DataTable)
-        tl.add_column(Text("WINDOW", style="bold"), key="name")
-        tl.add_column(Text("STATE", style="bold"), key="state")
+        wl = self.query_one("#win-list", DataTable)
+        for label, key in (("WINDOW", "name"), ("WHAT", "what"), ("STATE", "state")):
+            wl.add_column(Text(label, style="bold"), key=key)
         fl = self.query_one("#files", DataTable)
         for label, key in (("FILE", "label"), ("PATH", "path"), ("", "state")):
             fl.add_column(Text(label, style="bold"), key=key)
@@ -379,13 +366,13 @@ class Dashboard(Screen):
         if self._is_due("git", 60):
             self._refresh_git()
         self._check_edits()
-        # tmux windows: every second on the Terminals tab, else every 3 s
-        # (the attach state, the self-update lock).
-        if "tick" in self._busy or (self.active_tab() != "terminals" and self._ticks % 3):
+        # tmux windows: every second on the Sessions tab, else every 3 s
+        # (the attach state, the self-update lock, Overview's window count).
+        if "tick" in self._busy or (self.active_tab() != "sessions-tab" and self._ticks % 3):
             return
         self._busy.add("tick")
         try:
-            await self._refresh_terminals()
+            await self._refresh_windows()
         finally:
             self._busy.discard("tick")
 
@@ -405,17 +392,6 @@ class Dashboard(Screen):
         t.append("  %s" % clean_line(socket.gethostname()), style="bold")
         t.append("  ")
         t.append("git %s" % (self.git or "?"), style=GREY)
-        t.append("   agent ")
-        agent = s.get("agent")
-        has_sup = any(p.supervisor for p in self.projects)
-        if agent:
-            t.append("up", style=GREEN)
-        elif agent is None:
-            t.append("?", style=GREY)
-        elif has_sup:
-            t.append("down", style=AMBER)
-        else:
-            t.append("down (supervisor not set up)", style=GREY)
         t.append("   docker ")
         if self.cfg.docker_problem:
             t.append(self.cfg.docker_problem, style=AMBER)
@@ -454,12 +430,19 @@ class Dashboard(Screen):
 
     def _render_banner(self):
         b = self.query_one("#banner", Static)
+        t = Text()
         if self.git and self.git_start and self.git != self.git_start:
-            b.update(Text.assemble(("boxen was updated ", "bold"), "(%s → %s): restart the dashboard to use it: "
-                                   "ctrl+p → Restart dashboard, or boxen ui --restart" % (self.git_start, self.git)))
-            b.add_class("shown")
-        else:
-            b.remove_class("shown")
+            t.append("boxen was updated ", style="bold")
+            t.append("(%s → %s): restart the dashboard to use it: ctrl+p → Restart dashboard, or boxen ui --restart"
+                     % (self.git_start, self.git))
+        if self.v1:
+            if t.plain:
+                t.append("\n")
+            t.append("boxen v1 projects not moved yet: ", style="bold")
+            t.append(clean_line(", ".join(self.v1))[:200])
+            t.append(". Run boxen migrate (g → Move from boxen v1).")
+        b.update(t)
+        b.set_class(bool(t.plain), "shown")
 
     def _refresh_git(self):
         self._thread(self._git_thread)
@@ -505,8 +488,7 @@ class Dashboard(Screen):
             self._busy.discard("sys")
 
     def _sys_thread(self):
-        out = {"load": sysinfo.load(), "mem": sysinfo.memory(), "disk_root": sysinfo.disk_free("/"),
-               "agent": sysinfo.agent_up(self.cfg.agent_sock)}
+        out = {"load": sysinfo.load(), "mem": sysinfo.memory(), "disk_root": sysinfo.disk_free("/")}
         root = self.docker_root
         if self.cfg.docker_sock is None:
             out["docker_ok"] = None
@@ -556,20 +538,22 @@ class Dashboard(Screen):
                 self.ls_error = (lines[-1] if lines else "exit %d" % rc)
             else:
                 try:
-                    projects, docker = parse_ls(out)
+                    ls = parse_ls(out, self.cfg.src_root)
                 except ValueError as e:
                     self.ls_error = str(e)
                 else:
                     self.ls_error = None
                     first = not self.projects
-                    self.projects = projects
-                    self.ls_docker = docker
-                    self.by_name = {p.name: p for p in projects}
+                    self.projects = ls.projects
+                    self.ls_docker = ls.docker
+                    self.v1 = ls.v1
+                    self.by_name = {p.name: p for p in ls.projects}
                     if first:
                         self.refresh_stats()
             self.ls_loaded = True
             self._render_projects(force=True if self._stale_changed() else False)
             self._render_header()
+            self._render_banner()
             self._render_selected()
         finally:
             self._busy.discard("ls")
@@ -591,42 +575,48 @@ class Dashboard(Screen):
         t = self.query_one("#projects", ProjectTable)
         t.clear(columns=True)
         cols = [("PROJECT (stale)" if self.ls_error else "PROJECT", "name"),
-                ("CTR" if compact else "CONTAINER", "ctr"), ("SERVER", "srv"), ("CPU", "cpu"), ("MEM", "mem")]
+                ("CTR" if compact else "CONTAINER", "ctr"), ("SESS", "sess"), ("SERVE", "serve"),
+                ("CPU", "cpu"), ("MEM", "mem")]
         if not compact:
             cols.append(("GITHUB", "gh"))
         for label, key in cols:
             t.add_column(Text(label, style="bold"), key=key)
         sc = self.query_one("#sidecars", DataTable)
         sc.clear(columns=True)
-        cols = [("SERVICE", "svc")] + ([] if compact else [("IMAGE", "img")]) + \
-               [("STATUS", "st"), ("HEALTH", "h"), ("CPU", "cpu"), ("MEM", "mem")]
+        cols = [("SERVICE", "svc"), ("STATE", "st"), ("HEALTH", "h"), ("CPU", "cpu"), ("MEM", "mem")] + \
+               ([] if compact else [("STATUS", "status")])
         for label, key in cols:
             sc.add_column(Text(label, style="bold"), key=key)
         self._render_projects(force=True)
         self._render_sidecars()
-        if self._sessions:
-            self._render_sessions()
 
-    def _container_text(self, name):
-        """(state, health) of a container as Docker says now, else None."""
-        return self.live.get(name)
+    def _env_state(self, p):
+        """(state, health) of the build container: as Docker says now, else
+        as boxen ls said; None when it doesn't exist."""
+        live = self.live.get(p.env_container)
+        if live is not None:
+            return live
+        if p.container is None:
+            return None
+        return p.container.state, health_of(p.container.status)
+
+    def _env_running(self, p):
+        st = self._env_state(p)
+        return st is not None and st[0] == "running"
 
     def _project_cells(self, p):
         stale = bool(self.ls_error)
-        name = Text(clean_line(p.name)[:24], style="bold cyan" if p.supervisor else "bold")
+        name = Text(clean_line(p.name)[:24], style="bold")
         if not self.ls_docker:
-            ctr_t, srv_t = Text("?", style=GREY), Text("?", style=GREY)
+            ctr_t = Text("?", style=GREY)
         else:
-            ctr = container_short(p)
-            style = container_style(p)
-            if p.container is not None and p.container.restarts:
-                ctr_t = Text("%s ↻%d" % (clean_line(ctr), p.container.restarts), style=style)
-            else:
-                ctr_t = Text(clean_line(ctr), style=style)
-            srv = server_short(p)
-            srv_t = Text(clean_line(srv), style=SERVER_STYLE.get(srv, ""))
-        st = self.stats.get("boxen-%s" % p.name, {}) if p.running else {}
-        cells = [name, ctr_t, srv_t, _fmt_cpu(st.get("cpu")), _fmt_mem(st.get("mem"))]
+            st = self._env_state(p)
+            ctr_t = (Text(clean_line(st[0]), style=state_style(*st)) if st is not None
+                     else Text(container_short(p), style=container_style(p)))
+        sess_t = Text(str(p.sessions), style="bold") if p.sessions else Text("-", style=GREY)
+        sv, sv_style = serve_short(p)
+        st = self.stats.get(p.env_container, {}) if self._env_running(p) else {}
+        cells = [name, ctr_t, sess_t, Text(sv, style=sv_style), _fmt_cpu(st.get("cpu")), _fmt_mem(st.get("mem"))]
         if not self.compact:
             g, style = github_short(p)
             cells.append(Text(clean_line(g), style=style))
@@ -637,21 +627,13 @@ class Dashboard(Screen):
 
     def _render_projects(self, force=False):
         t = self.query_one("#projects", ProjectTable)
-        keys = []
-        for p in self.projects:
-            if p.supervisor and keys:
-                keys.append(SEP)
-            keys.append(p.name)
+        keys = [p.name for p in self.projects]
         have = [k.value for k in t.rows]
-        ncols = len(t.columns)
         if force or have != keys:
             sel = self.selected
             t.clear()
             for k in keys:
-                if k == SEP:
-                    t.add_row(*[Text("─" * 4, style=GREY)] * ncols, key=SEP)
-                else:
-                    t.add_row(*self._project_cells(self.by_name[k]), key=k)
+                t.add_row(*self._project_cells(self.by_name[k]), key=k)
             if keys:
                 idx = keys.index(sel) if sel in keys else 0
                 t.move_cursor(row=idx)
@@ -662,23 +644,12 @@ class Dashboard(Screen):
         else:
             colkeys = [c.value for c in t.columns]
             for k in keys:
-                if k == SEP:
-                    continue
                 for ck, cell in zip(colkeys, self._project_cells(self.by_name[k]), strict=True):
                     t.update_cell(k, ck, cell)
 
     @on(DataTable.RowHighlighted, "#projects")
     def _project_highlighted(self, ev):
         key = ev.row_key.value if ev.row_key is not None else None
-        t = self.query_one("#projects", ProjectTable)
-        if key == SEP:
-            step = 1 if ev.cursor_row >= self._last_row else -1
-            target = ev.cursor_row + step
-            if not 0 <= target < t.row_count:
-                target = ev.cursor_row - step
-            t.move_cursor(row=target)
-            return
-        self._last_row = ev.cursor_row
         if key:
             self.select_project(key)
 
@@ -715,11 +686,7 @@ class Dashboard(Screen):
             self.query_one("#overview").add_class("empty")
             return
         self.query_one("#overview").remove_class("empty")
-        t = Text()
-        t.append(clean_line(p.name), style="bold")
-        if p.supervisor:
-            t.append("  (supervisor: runs boxen for you from the Claude app)", style=GREY)
-        title.update(t)
+        title.update(Text(clean_line(p.name), style="bold"))
 
         def val(key, *parts):
             v = Text(no_wrap=True, overflow="ellipsis")
@@ -730,24 +697,47 @@ class Dashboard(Screen):
                     v.append(part)
             self.query_one("#ov-" + key, Static).update(v)
 
-        c = p.container
+        st = self._env_state(p)
         if not self.ls_docker:
-            val("container", Text("unknown: Docker isn't answering", style=GREY))
-        elif c is None:
-            val("container", Text("not created", style=GREY))
+            val("container", Text("unknown: rootless Docker isn't answering", style=GREY))
+        elif st is None:
+            val("container", Text("not created", style=GREY), Text("  u builds and starts it", style=GREY))
         else:
-            up = uptime(c.started_at) if c.status == "running" else None
-            val("container", Text(clean_line(c.status), style=container_style(p)),
-                "  up %s" % up if up else "", "  %d restart%s" % (c.restarts, "" if c.restarts == 1 else "s"),
-                Text("  %s" % clean_line(c.id[:12]), style=GREY))
-        srv = server_short(p)
-        val("server", Text(clean_line(p.server if p.running else "stopped"), style=SERVER_STYLE.get(srv, "")))
-        val("code", clean_line(os.path.join(self.cfg.src_root, p.name)))
+            val("container", Text(clean_line(st[0]), style=state_style(*st)),
+                "  %s" % clean_line(p.container.status) if p.container and p.container.status else "",
+                Text("  %s" % clean_line(p.env_container), style=GREY))
+        self._render_sessions_line()
+        if p.serve == "on":
+            val("serve", Text("on", style=GREEN), ": start sessions from the Claude app",
+                Text("  (window %s)" % clean_line(serve_window(p.name)), style=GREY))
+        elif p.serve == "stopped":
+            val("serve", Text("stopped", style=AMBER), ": on, but its window isn't running; S starts it again")
+        else:
+            val("serve", Text("off", style=GREY), Text("  S keeps a Remote Control server up, to start sessions "
+                                                     "from the Claude app", style=GREY))
+        val("folder", clean_line(p.path))
         self._render_repos()
         self._load_suggest(p)
         self._render_stats()
         self._render_sidecars()
-        self._thread(self._overview_files_thread, p.name)
+
+    def _claude_windows(self, name, running=True):
+        return [w for w in self.windows if w.name == name and not (running and w.finished)]
+
+    def _render_sessions_line(self):
+        p = self.current()
+        if p is None:
+            return
+        v = Text(no_wrap=True, overflow="ellipsis")
+        if p.sessions:
+            v.append(_plural(p.sessions, "Claude process", "Claude processes") + " in the folder", style="bold")
+        else:
+            v.append("none running", style=GREY)
+        nw = len(self._claude_windows(p.name))
+        if nw:
+            v.append("  %s here (Sessions tab)" % _plural(nw, "window"), style=GREY)
+        v.append("  c %s, C starts another" % ("switches to one" if nw else "starts one"), style=GREY)
+        self.query_one("#ov-sessions", Static).update(v)
 
     # GitHub repos (Overview)
 
@@ -757,7 +747,7 @@ class Dashboard(Screen):
         return list(self.suggest.get(name, (0, []))[1])
 
     def _load_suggest(self, p, force=False):
-        if p is None or p.supervisor or ("suggest", p.name) in self._busy:
+        if p is None or ("suggest", p.name) in self._busy:
             return
         last = self.suggest.get(p.name)
         if not force and last is not None and time.monotonic() - last[0] < SUGGEST_EVERY:
@@ -786,9 +776,6 @@ class Dashboard(Screen):
             return
         _g, gstyle = github_short(p)
         title.update(Text.assemble("GitHub repos  ", (clean_line(p.github), gstyle), ("   G changes them", GREY)))
-        if p.supervisor:
-            t.add_row(Text("the supervisor has no GitHub token", style=GREY), Text(""), Text(""))
-            return
         for r in p.repos:
             label, style = repo_state(r.state)
             t.add_row(text(r.repo), Text(clean_line(label), style=style), Text("origin" if r.origin else "", style=GREY))
@@ -804,9 +791,6 @@ class Dashboard(Screen):
         p = self._need_project()
         if not p:
             return
-        if p.supervisor:
-            self.notify("The supervisor has no GitHub token.", severity="warning", markup=False)
-            return
 
         def done(res):
             if not res:
@@ -816,7 +800,7 @@ class Dashboard(Screen):
                 self.start_job(["repos", p.name, "add"] + repos, project=p.name)
             elif op == "rm":
                 self._confirm("Remove %s from %s's repos?" % (", ".join(repos), p.name),
-                              "Its tokens stop covering %s at once; adding it back asks again."
+                              "Its tokens stop covering %s at the next refresh (boxen does one now)."
                               % ", ".join(repos),
                               lambda: self.start_job(["repos", p.name, "rm"] + repos, project=p.name),
                               yes="Remove")
@@ -824,9 +808,10 @@ class Dashboard(Screen):
 
     def action_repo_add_found(self):
         """a on Overview: add the found repo the Repos table's cursor is on
-        (or the only one), through boxen's approval question."""
+        (or the only one), after asking: the name comes from the project's
+        own git config, which its agent writes."""
         p = self._need_project()
-        if not p or p.supervisor:
+        if not p:
             return
         t = self.query_one("#repos", DataTable)
         found = [r for kind, r in self._repo_rows if kind == "found" and repo_arg(r)]
@@ -840,7 +825,11 @@ class Dashboard(Screen):
             self.notify("Select a found repo in the GitHub repos table (or press G)." if found
                         else "No repos found in the project folder that aren't listed.", markup=False)
             return
-        self.start_job(["repos", p.name, "add", repo_arg(pick)], project=p.name)
+        repo = repo_arg(pick)
+        self._confirm("Let %s push to %s?" % (p.name, repo),
+                      "Adds %s to the repos %s's tokens cover: its agent can push there (and use gh on it). "
+                      "It was found in the project folder's git remotes, which the agent can change." % (repo, p.name),
+                      lambda: self.start_job(["repos", p.name, "add", repo], project=p.name), warn=True, yes="Add")
 
     def _render_sidecars(self):
         p = self.current()
@@ -854,18 +843,19 @@ class Dashboard(Screen):
             return
         for sc in p.sidecars:
             live = self.live.get(sc.container)
-            if live is None:
-                status, health = ("not created", None) if self.docker_ok else ("?", None)
+            if live is not None:
+                state, health = live
+            elif not self.ls_docker:
+                state, health = "?", None
             else:
-                status, health = live
-            st = self.stats.get(sc.container, {}) if status == "running" else {}
-            cells = [Text(clean_line(sc.service), style="bold")]
+                state, health = sc.state, health_of(sc.status)
+            st = self.stats.get(sc.container, {}) if state == "running" else {}
+            cells = [Text(clean_line(sc.service), style="bold"),
+                     Text(clean_line(state), style=state_style(state, health) or GREY),
+                     Text(clean_line(health or "-"), style=HEALTH_STYLE.get(health or "", GREY)),
+                     _fmt_cpu(st.get("cpu")), _fmt_mem(st.get("mem"))]
             if not self.compact:
-                cells.append(text(sc.image))
-            cells += [Text(clean_line(status), style={"running": GREEN, "restarting": RED,
-                                                      "dead": RED}.get(status, GREY)),
-                      Text(clean_line(health or "-"), style=HEALTH_STYLE.get(health or "", GREY)),
-                      _fmt_cpu(st.get("cpu")), _fmt_mem(st.get("mem"))]
+                cells.append(Text(clean_line(sc.status), style=GREY))
             t.add_row(*cells)
 
     def _render_stats(self):
@@ -875,37 +865,14 @@ class Dashboard(Screen):
         cpu_h, mem_h = self.hist.get(p.name, ((), ()))
         self.query_one("#spark-cpu", Sparkline).data = list(cpu_h)
         self.query_one("#spark-mem", Sparkline).data = list(mem_h)
-        st = self.stats.get("boxen-%s" % p.name, {}) if p.running else {}
-        self.query_one("#cpu-now", Static).update(_fmt_cpu(st.get("cpu")) if p.running else Text("stopped", style=GREY))
+        running = self._env_running(p)
+        st = self.stats.get(p.env_container, {}) if running else {}
+        self.query_one("#cpu-now", Static).update(_fmt_cpu(st.get("cpu")) if running else Text("stopped", style=GREY))
         m, lim = st.get("mem"), st.get("limit")
         mt = _fmt_mem(m)
         if m is not None and lim:
             mt.append(" / %s" % sysinfo.human_bytes(lim), style=GREY)
-        self.query_one("#mem-now", Static).update(mt if p.running else Text("stopped", style=GREY))
-
-    def _overview_files_thread(self, name):
-        pdir = self.cfg.proj_dir(name)
-        try:
-            apply = files.tail_lines(os.path.join(pdir, "agent.log"), 20)
-            apply_t = (Text("\n".join(clean_line(x) for x in apply)) if apply
-                       else Text("nothing applied from inside the project yet", style=GREY))
-        except (files.Refused, OSError) as e:
-            apply_t = Text("agent.log: %s; not shown" % e, style=RED)
-        try:
-            st = files.read_env_file(pdir, "STATUS.md")
-            status_t = text(st.rstrip("\n")) if st else Text("not written yet (boxen writes it at each start)",
-                                                             style=GREY)
-        except files.Refused as e:
-            status_t = Text("%s; not shown" % e, style=RED)
-        except OSError as e:
-            status_t = Text("env/STATUS.md: %s" % e, style=RED)
-        self._call(self._overview_files_done, name, apply_t, status_t)
-
-    def _overview_files_done(self, name, apply_t, status_t):
-        if name != self.selected:
-            return
-        self.query_one("#ov-apply", Static).update(apply_t)
-        self.query_one("#ov-status", Static).update(status_t)
+        self.query_one("#mem-now", Static).update(mt if running else Text("stopped", style=GREY))
 
     # ------------------------------------------------------------ stats
 
@@ -914,7 +881,7 @@ class Dashboard(Screen):
             return
         known = set()
         for p in self.projects:
-            known.add("boxen-%s" % p.name)
+            known.add(p.env_container)
             known.update(sc.container for sc in p.sidecars)
         self._busy.add("stats")
         self._due["stats"] = time.monotonic()
@@ -957,7 +924,7 @@ class Dashboard(Screen):
         self.stats = stats
         now = time.monotonic()
         for p in self.projects:
-            st = stats.get("boxen-%s" % p.name) if p.running else None
+            st = stats.get(p.env_container)
             if not st:
                 continue
             self._hist_seen[p.name] = now
@@ -990,13 +957,12 @@ class Dashboard(Screen):
         if not force and self._loaded.get(tab) == p:
             return
         self._loaded[tab] = p
-        if tab == "sessions-tab":
-            self.load_sessions()
-        elif tab == "logs":
+        if tab == "logs":
             self._sync_log_sources()
             self.load_logs()
-        elif tab == "terminals":
-            self.run_worker(self._refresh_terminals(), group="terminals", exclusive=True, exit_on_error=False)
+        elif tab == "sessions-tab":
+            self._win_rows = None
+            self.run_worker(self._refresh_windows(), group="windows-tab", exclusive=True, exit_on_error=False)
         elif tab == "files-tab":
             self._render_files()
 
@@ -1009,126 +975,119 @@ class Dashboard(Screen):
                 return False
         return True
 
-    # sessions
+    # sessions: the project's tmux windows
 
-    def load_sessions(self):
-        self.run_worker(self._sessions_worker(self.selected), group="sessions", exclusive=True,
-                        exit_on_error=False)
-
-    async def _sessions_worker(self, name):
-        status = self.query_one("#sess-status", Static)
-        table = self.query_one("#sessions", DataTable)
-        keep = self._selected_session() if self._loaded.get("sessions-tab") == name else None
-        table.clear()
-        self._sessions = []
-        p = self.by_name.get(name) if name else None
-        if p is None:
-            status.update(Text("no project selected", style=GREY))
+    async def _refresh_windows(self):
+        if not in_boxen_tmux(self.env):
+            self.windows = []
+        else:
+            self.windows = await self.tmux.list_windows()
+        if self.current() is not None and self.active_tab() == "overview":
+            self._render_sessions_line()
+        if self.active_tab() != "sessions-tab":
             return
-        if not p.running:
-            status.update(Text("%s isn't running; start it with u to see its sessions." % clean_line(name)))
+        p = self.selected
+        status = self.query_one("#win-status", Static)
+        table = self.query_one("#win-list", DataTable)
+        preview = self.query_one("#win-preview", Static)
+        if not in_boxen_tmux(self.env):
+            status.update(Text("Not running inside `boxen ui`'s tmux session: windows are unavailable. "
+                               "Start the dashboard with `boxen ui`.", style=AMBER))
             return
-        status.update(Text("loading sessions…", style=GREY))
-        rc, out, err = await procs.run(["docker", "exec", "boxen-%s" % name, "boxen-carry", "list"],
-                                       env=self.jobs.env, timeout=90)
-        if name != self.selected:
+        mine = [(w, kind_of(p, w.name)) for w in self.windows] if p else []
+        mine = [(w, k) for w, k in mine if k]
+        rows = [(w.id, w.name, w.finished) for w, _k in mine]
+        if self._win_rows != rows:
+            self._win_rows = rows
+            cur = table.cursor_row
+            table.clear()
+            for w, k in mine:
+                table.add_row(text(w.name), text(window_what(k)),
+                              Text("exited" if w.finished else "running", style=GREY if w.finished else GREEN),
+                              key=w.id)
+            if mine:
+                table.move_cursor(row=min(max(cur, 0), len(mine) - 1))
+        proj = self.current()
+        if not mine:
+            msg = "No windows for this project. c starts a Claude session, s a shell in its build container, " \
+                  "v one on the VM in its folder."
+            if proj is not None and proj.sessions:
+                msg += " (%s run in the folder outside boxen's tmux.)" % _plural(proj.sessions, "Claude process", "Claude processes")
+            status.update(Text(msg, style=GREY))
+            preview.update(Text(""))
             return
-        if rc != 0:
-            msg = (err or out).strip().splitlines()
-            status.update(Text("couldn't list sessions: %s" % clean_line(msg[-1] if msg else "exit %d" % rc),
-                               style=RED))
+        status.update(Text("Enter switches to the window · x closes it · F1 (or C-b 0) comes back here", style=GREY))
+        wid = self._selected_window()
+        if wid is None:
             return
-        rows, seen = [], set()
-        for line in out.split("\n"):
-            if not line.strip():
-                continue
-            f = line.split("\t", 6)
-            if len(f) != 7 or not f[0].isdigit() or not SESSION_ID.match(f[1]):
-                continue
-            if f[1] in seen:
-                self.log.warning("boxen-carry list: session %s listed twice; keeping the first" % f[1])
-                continue
-            seen.add(f[1])
-            rows.append(f)
-        self._sessions = rows
-        self._render_sessions(keep)
-        status.update(Text("%d session%s" % (len(rows), "" if len(rows) == 1 else "s") if rows
-                           else "No earlier sessions in this project yet.", style=GREY))
+        cap = await self.tmux.capture(wid)
+        if cap is None or self.active_tab() != "sessions-tab":
+            return
+        lines = cap.rstrip("\n").split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        h = max(1, preview.size.height or 10)
+        preview.update(ansi_text("\n".join(lines[-h:])))
 
-    def _render_sessions(self, keep=None):
-        """The sessions table, its columns by priority: STATE, TITLE,
-        TURNS/PARTS, DATE (dropped first when narrow), ID (wide only)."""
-        table = self.query_one("#sessions", DataTable)
-        if keep is None:
-            keep = self._selected_session()
-        cols = [("#", "n", 3), ("STATE", "state", 7), ("TITLE", "title", 0), ("TURNS", "turns", 5),
-                ("PARTS", "parts", 5), ("DATE", "date", 10), ("ID", "id", 8)]
-        avail = (self.query_one("#right").size.width or 80) - 4
-
-        def title_width():
-            return avail - sum(w + 2 for _l, _k, w in cols if w) - 2
-        # Narrow: ID goes first, then DATE, then PARTS and TURNS; never
-        # STATE, and TITLE keeps the rest.
-        for drop in ("id", "date", "parts", "turns"):
-            if title_width() < 32:
-                cols = [c for c in cols if c[1] != drop]
-        title_w = max(12, title_width())
-        table.clear(columns=True)
-        for label, key, w in cols:
-            table.add_column(Text(label, style="bold"), key=key, width=(title_w if key == "title" else None))
-        for f in self._sessions:
-            st = clean_line(f[5])
-            cells = {"n": Text(f[0]), "state": Text(st, style=SESSION_STYLE.get(st, "")),
-                     "title": Text(_ellipsis(clean_line(f[6]), title_w)), "turns": text(f[3]),
-                     "parts": text(f[4]), "date": text(f[2]), "id": Text(f[1], style="cyan")}
-            table.add_row(*[cells[k] for _l, k, _w in cols], key=f[1])
-        ids = [f[1] for f in self._sessions]
-        if keep in ids:
-            table.move_cursor(row=ids.index(keep))
-
-    def _selected_session(self):
-        t = self.query_one("#sessions", DataTable)
-        if not self._sessions or t.row_count == 0:
+    def _selected_window(self):
+        t = self.query_one("#win-list", DataTable)
+        if t.row_count == 0:
             return None
         try:
-            key = t.coordinate_to_cell_key((t.cursor_row, 0)).row_key.value
+            return t.coordinate_to_cell_key((t.cursor_row, 0)).row_key.value
         except Exception:
             return None
-        return key if key and SESSION_ID.match(key) else None
 
-    @on(DataTable.RowSelected, "#sessions")
-    def _session_selected(self, ev):
-        sid = ev.row_key.value if ev.row_key is not None else None
-        p = self.current()
-        if not p or not sid or not SESSION_ID.match(sid):
+    @on(DataTable.RowSelected, "#win-list")
+    def _window_selected(self, ev):
+        wid = ev.row_key.value if ev.row_key is not None else None
+        if wid:
+            self.run_worker(self._select_window(wid), exit_on_error=False)
+
+    async def _select_window(self, wid):
+        ok, err = await self.tmux.select(wid)
+        if not ok:
+            self.notify("tmux: %s" % (err or "couldn't switch"), severity="error", markup=False)
+
+    def action_window_close(self):
+        p, wid = self.current(), self._selected_window()
+        if p is None or wid is None:
             return
-        self.start_job(["resume", p.name, sid], project=p.name)
+        w = next((x for x in self.windows if x.id == wid), None)
+        kind = kind_of(p.name, w.name) if w else None
+        if w is None or kind is None:
+            return
+        if kind == "claude":
+            msg = "Ends that Claude session (its conversation is kept: claude --resume in the folder picks it up)."
+        elif kind == "serve":
+            msg = ("Stops the Remote Control server until it's started again (S, or the next boot while serve "
+                   "is on). To turn serve off for good: S.")
+        else:
+            msg = "Ends what runs in it."
+        name = clean_line(w.name)
 
-    def action_session_attach(self):
-        p, sid = self.current(), self._selected_session()
-        if p and sid:
-            self.open_window(window_name(p.name, "session-" + sid),
-                             [self.cfg.boxen, "resume", p.name, sid, "--attach"])
+        async def go():
+            ok, err = await self.tmux.kill(wid)
+            if not ok:
+                self.notify("tmux: %s" % (err or "couldn't close it"), severity="error", markup=False)
+            await self._refresh_windows()
+            self.refresh_ls()
+        self._confirm("Close window %s?" % name, msg, lambda: self.run_worker(go(), exit_on_error=False),
+                      warn=kind in ("claude", "serve"), yes="Close")
 
-    def action_session_stop(self):
-        p, sid = self.current(), self._selected_session()
-        if p and sid:
-            self.start_job(["resume", p.name, sid, "--stop"], project=p.name)
-
-    # logs
+    # logs: the sidecars'
 
     def _sync_log_sources(self):
         p = self.current()
-        opts = [(Text("server"), "server")]
-        if p:
-            opts += [(Text("sidecar: %s" % clean_line(sc.service)), sc.service) for sc in p.sidecars]
+        opts = [(Text(clean_line(sc.service)), sc.service) for sc in p.sidecars] if p else []
         sel = self.query_one("#log-source", Select)
         values = [v for _l, v in opts]
         if self._log_source not in values:
-            self._log_source = "server"
+            self._log_source = values[0] if values else None
         with sel.prevent(Select.Changed):
             sel.set_options(opts)
-            sel.value = self._log_source
+            if self._log_source is not None:
+                sel.value = self._log_source
 
     @on(Select.Changed, "#log-source")
     def _log_source_changed(self, ev):
@@ -1155,17 +1114,16 @@ class Dashboard(Screen):
         if p is None:
             status.update(Text("no project selected", style=GREY))
             return
-        if source == "server":
-            argv = [self.cfg.boxen, "logs", name, "--tail", "300"]
-            what = "boxen logs %s --tail 300" % name
-        else:
-            sc = self._sidecar(p, source)
-            if sc is None:
-                return
-            argv = ["docker", "logs", "--tail", "300", sc.container]
-            what = "docker logs --tail 300 %s" % sc.container
+        if source is None or self._sidecar(p, source) is None:
+            status.update(Text("No sidecars: .boxen/services.yaml declares none. Background processes have their "
+                               "own logs: boxen run --logs NAME, in the project.", style=GREY))
+            return
+        # boxen env acts on the project of the folder it runs in, and strips
+        # control characters from the log.
+        argv = [self.cfg.boxen, "env", "logs", source, "--tail", "300"]
+        what = "boxen env logs %s --tail 300" % source
         status.update(Text("loading: %s" % clean_line(what), style=GREY))
-        rc, out, _err = await procs.run(argv, env=self.jobs.env, timeout=60, merge_stderr=True)
+        rc, out, _err = await procs.run(argv, env=self.jobs.env, timeout=60, merge_stderr=True, cwd=p.path)
         if name != self.selected or source != self._log_source:
             return
         lines = [clean_line(x) for x in out.splitlines()]
@@ -1175,87 +1133,28 @@ class Dashboard(Screen):
 
     def action_follow_logs(self):
         p = self.current()
-        if not p:
+        if not p or self._log_source is None:
             return
-        if self._log_source == "server":
-            self.open_window(window_name(p.name, "logs"), [self.cfg.boxen, "logs", p.name, "-f"])
-        else:
-            sc = self._sidecar(p, self._log_source)
-            if sc:
-                self.open_window(window_name(p.name, "logs-" + sc.service),
-                                 ["docker", "logs", "-f", "--tail", "100", sc.container])
-
-    # terminals
-
-    async def _refresh_terminals(self):
-        if not in_boxen_tmux(self.env):
-            self.windows = []
-        else:
-            self.windows = await self.tmux.list_windows()
-        if self.active_tab() != "terminals":
+        sc = self._sidecar(p, self._log_source)
+        if sc is None:
             return
-        p = self.selected
-        status = self.query_one("#term-status", Static)
-        table = self.query_one("#term-list", DataTable)
-        preview = self.query_one("#term-preview", Static)
-        if not in_boxen_tmux(self.env):
-            status.update(Text("Not running inside `boxen ui`'s tmux session: terminal windows are "
-                               "unavailable. Start the dashboard with `boxen ui`.", style=AMBER))
+        if self.cfg.docker_sock is None:
+            self.notify("Can't follow: %s" % self.cfg.docker_problem, severity="warning", markup=False)
             return
-        mine = [w for w in self.windows if p and w.name.startswith(p + "/")]
-        rows = [(w.id, w.name, w.finished) for w in mine]
-        if getattr(self, "_term_rows", None) != rows:
-            self._term_rows = rows
-            cur = table.cursor_row
-            table.clear()
-            for w in mine:
-                table.add_row(text(w.name), Text("exited" if w.finished else "running",
-                                                 style=GREY if w.finished else GREEN), key=w.id)
-            if mine:
-                table.move_cursor(row=min(cur, len(mine) - 1))
-        if not mine:
-            status.update(Text("No terminal windows for this project. s opens a shell, c Claude, "
-                               "f (Logs) follows the log.", style=GREY))
-            preview.update(Text(""))
-            return
-        status.update(Text("Enter switches to the window · F1 (or C-b 0) comes back here", style=GREY))
-        try:
-            wid = table.coordinate_to_cell_key((table.cursor_row, 0)).row_key.value
-        except Exception:
-            return
-        cap = await self.tmux.capture(wid)
-        if cap is None or self.active_tab() != "terminals":
-            return
-        lines = cap.rstrip("\n").split("\n")
-        while lines and not lines[-1].strip():
-            lines.pop()
-        h = max(1, preview.size.height or 10)
-        preview.update(ansi_text("\n".join(lines[-h:])))
-
-    @on(DataTable.RowSelected, "#term-list")
-    def _terminal_selected(self, ev):
-        wid = ev.row_key.value if ev.row_key is not None else None
-        if wid:
-            self.run_worker(self._select_window(wid), exit_on_error=False)
-
-    async def _select_window(self, wid):
-        ok, err = await self.tmux.select(wid)
-        if not ok:
-            self.notify("tmux: %s" % (err or "couldn't switch"), severity="error", markup=False)
+        self.open_window(window_name(p.name, "logs-" + sc.service),
+                         ["sh", "-c", FOLLOW_SH, "boxen-logs", "unix://" + self.cfg.docker_sock, sc.container])
 
     # files
 
     def _file_entries(self, p):
-        """(label, path, in env/)."""
+        """(label, base, path parts below base, kind): kind "env" for the
+        agent-editable build environment in the project folder, "override"
+        and "repos" for boxen's (yours) in projects/<name>."""
         pdir = self.cfg.proj_dir(p.name)
-        out = [("env/Dockerfile", os.path.join(pdir, "env", "Dockerfile"), True)]
-        if not p.supervisor:
-            out.append(("env/services.yaml", os.path.join(pdir, "env", "services.yaml"), True))
-        out.append(("compose.override.yaml", os.path.join(pdir, "compose.override.yaml"), False))
-        out.append(("project.env", os.path.join(pdir, "project.env"), False))
-        if not p.supervisor:
-            out.append(("CLAUDE.md (code)", os.path.join(self.cfg.src_root, p.name, "CLAUDE.md"), False))
-        return out
+        return [(".boxen/Dockerfile", p.path, [".boxen", "Dockerfile"], "env"),
+                (".boxen/services.yaml", p.path, [".boxen", "services.yaml"], "env"),
+                ("compose.override.yaml", pdir, ["compose.override.yaml"], "override"),
+                ("repos", pdir, ["repos"], "repos")]
 
     def _render_files(self):
         t = self.query_one("#files", DataTable)
@@ -1263,10 +1162,15 @@ class Dashboard(Screen):
         p = self.current()
         if p is None:
             return
-        for label, path, _env in self._file_entries(p):
-            exists = os.path.lexists(path)
-            t.add_row(Text(label, style="bold"), text(path),
-                      Text("" if exists else "(new)", style=GREY), key=path)
+        for label, base, rel, kind in self._file_entries(p):
+            st = files.state_under(base, rel)
+            if st == "file":
+                cell = Text("")
+            elif st == "missing":
+                cell = Text("(new, from the example)" if kind == "override" else "(new)", style=GREY)
+            else:
+                cell = Text("refused: %s" % clean_line(st), style=RED)
+            t.add_row(Text(label, style="bold"), text(os.path.join(base, *rel)), cell, key=label)
 
     def action_edit_file(self):
         p = self.current()
@@ -1274,25 +1178,32 @@ class Dashboard(Screen):
         if p is None or t.row_count == 0:
             return
         entries = self._file_entries(p)
-        label, path, env_file = entries[min(max(t.cursor_row, 0), len(entries) - 1)]
+        entry = entries[min(max(t.cursor_row, 0), len(entries) - 1)]
         if not in_boxen_tmux(self.env):
             self.notify("Editing needs the dashboard to run in `boxen ui` (tmux).", severity="warning",
                         markup=False)
             return
-        self.run_worker(self._edit(p.name, label, path, env_file), group="windows", exit_on_error=False)
+        self.run_worker(self._edit(p.name, *entry), group="windows", exit_on_error=False)
 
-    async def _edit(self, name, label, path, env_file):
-        wname = window_name(name, "edit-" + os.path.basename(path))
+    async def _edit(self, name, label, base, rel, kind):
+        wname = window_name(name, "edit-" + rel[-1])
         w = await self.tmux.find(wname)
         if w is not None and not w.finished:
             await self.tmux.select(w.id)
             return
+        template = None
+        if kind == "override":
+            try:
+                ex = files.read_under(base, ["compose.override.example.yaml"])
+            except files.Refused:
+                ex = None
+            template = ex.encode("utf-8") if ex else None
         try:
-            spec = edit.prepare(name, label, path, self.cfg.proj_dir(name), env_file, editor_argv(self.env),
-                                env=self.env)
+            spec = edit.prepare(name, label, base, rel, editor_argv(self.env), env=self.env, template=template)
         except (files.Refused, OSError) as e:
             self.notify("%s: %s; not opened" % (label, e), severity="error", markup=False)
             return
+        spec["kind"] = kind
         argv = ["env", "PYTHONPATH=" + UI_DIR, sys.executable, "-P", "-m", "boxen_ui.edit",
                 os.path.join(spec["dir"], "spec.json")]
         self.pending_edits[spec["result"]] = spec
@@ -1319,14 +1230,16 @@ class Dashboard(Screen):
     def _edit_done(self, spec, res):
         name, label, status = spec["project"], spec["label"], res.get("status")
         msg = clean_line(str(res.get("message", "")))
-        if status == "written" and label == "env/services.yaml":
-            self.notify("%s: saved %s; checking it (boxen restart %s --prepare)" % (name, label, name),
+        if status == "written" and spec.get("kind") in ("env", "override"):
+            self._confirm("Apply %s's build environment now?" % name,
+                          "Saved %s. boxen up %s checks .boxen/ and your override, builds, and recreates the "
+                          "build container and sidecars where something changed (background processes in it "
+                          "stop). Nothing changes if a check fails. Or later: u." % (label, name),
+                          lambda: self.start_job(["up", name], project=name), yes="Apply now")
+        elif status == "written" and spec.get("kind") == "repos":
+            self.notify("%s: saved repos; minting its tokens for them (boxen tokens %s)" % (name, name),
                         markup=False)
-            job = self.start_job(["restart", name, "--prepare"], project=name)
-            if job:
-                job.followup = "apply"
-        elif status == "written" and label == "env/Dockerfile":
-            self.notify("%s: saved %s; U rebuilds the image with it" % (name, label), markup=False)
+            self.start_job(["tokens", name], project=name)
         elif status == "written":
             self.notify("%s: saved %s" % (name, label), markup=False)
         elif status in ("conflict", "refused"):
@@ -1336,7 +1249,7 @@ class Dashboard(Screen):
 
     # ------------------------------------------------------------ jobs
 
-    def start_job(self, args, project=None, is_global=False):
+    def start_job(self, args, project=None, is_global=False, then=None):
         if project is not None and not valid_name(project):
             self.notify("not a valid project name", severity="error", markup=False)
             return None
@@ -1345,6 +1258,7 @@ class Dashboard(Screen):
         except Busy as e:
             self.notify(str(e), severity="warning", markup=False)
             return None
+        job.then = then
         t = self.query_one("#job-table", DataTable)
         for old in self.jobs.pruned:
             try:
@@ -1392,13 +1306,6 @@ class Dashboard(Screen):
                 self.selected_job = job.id
                 self._show_job(job)
 
-    @on(DataTable.RowSelected, "#job-table")
-    def _job_selected(self, ev):
-        key = ev.row_key.value if ev.row_key is not None else None
-        job = self._job(int(key)) if key else None
-        if job and job.status == APPROVAL:
-            self._ask(job)
-
     def _job(self, jid):
         for j in self.jobs.jobs:
             if j.id == jid:
@@ -1415,7 +1322,7 @@ class Dashboard(Screen):
             t.append(" none yet · J shows this panel", style=GREY)
         else:
             counts = collections.Counter(j.status for j in js)
-            parts = ["%d %s" % (counts[s], s) for s in (RUNNING, APPROVAL, FAILED) if counts[s]]
+            parts = ["%d %s" % (counts[s], s) for s in (RUNNING, FAILED) if counts[s]]
             t.append(" " + (" · ".join(parts) if parts else "all done"), style=GREY)
             last = js[-1]
             t.append("   ")
@@ -1444,50 +1351,18 @@ class Dashboard(Screen):
                 "[%s%s, %s]" % (job.status, "" if job.rc is None else " · exit %d" % job.rc, fmt_elapsed(job.elapsed())))
         if job.status == OK:
             self.notify("%s: done" % job.title, markup=False, timeout=4)
+            if job.then is not None:
+                job.then(job)
         elif job.status == FAILED:
             last = job.lines[-1] if job.lines else "exit %s" % job.rc
             self.notify("%s failed: %s" % (job.title, clean_line(last)[:200]), severity="error", markup=False,
                         timeout=8)
-        if job.status == APPROVAL or (job.status == FAILED and job.needs_terminal()):
-            self._ask(job)
-        if job.status == OK and getattr(job, "followup", None) == "apply" and job.project:
-            name = job.project
-            self._confirm("Apply %s's services.yaml now?" % name,
-                          "It checks out. Applying it recreates the container (boxen restart %s): the "
-                          "server restarts and app sessions reconnect." % name,
-                          lambda: self.start_job(["restart", name], project=name), yes="Apply now")
         # The state changed: look again now rather than at the next poll.
         self.call_later(self.refresh_ls)
         if job.project and job.project in self.suggest:
             del self.suggest[job.project]
             if job.project == self.selected:
                 self._load_suggest(self.current(), force=True)
-        if job.project == self.selected and job.verb == "resume" and self.active_tab() == "sessions-tab":
-            self.load_sessions()
-
-    def _ask(self, job):
-        if job.status == APPROVAL and job.approval is not None:
-            a = job.approval
-
-            def answered(yes):
-                if yes:
-                    self.start_job(a.argv[1:], project=a.name)
-            self.app.push_screen(ApprovalScreen(a, job.title), answered)
-            return
-        lines = job.lines[-20:]
-        if job.status == APPROVAL:
-            project = question_project(job.lines, job.project)
-            title = "%s needs an answer only a terminal can give" % job.title
-            argv = [self.cfg.boxen, "up", project] if project else None
-            wname = window_name(project, "up") if project else None
-        else:
-            title = "%s needs a terminal" % job.title
-            argv, wname = list(job.argv), window_name(job.project, job.verb)
-
-        def answered(choice):
-            if choice == "terminal" and argv and wname:
-                self.open_window(wname, argv)
-        self.app.push_screen(QuestionScreen(title, lines, can_open=bool(argv and wname)), answered)
 
     def _external_global(self):
         """A global command in a terminal window (self-update) is running."""
@@ -1498,17 +1373,23 @@ class Dashboard(Screen):
 
     # ------------------------------------------------------------ windows
 
-    def open_window(self, name, argv, lock=None):
-        if not in_boxen_tmux(self.env):
-            self.notify("Terminal windows need the dashboard to run in `boxen ui` (tmux). Command: %s"
-                        % " ".join(argv), severity="warning", markup=False, timeout=8)
-            return
-        self.run_worker(self._open_window(name, argv, lock), group="windows", exit_on_error=False)
+    def _tmux_ok(self, what):
+        if in_boxen_tmux(self.env):
+            return True
+        self.notify("%s needs the dashboard to run in `boxen ui` (tmux)." % what, severity="warning", markup=False,
+                    timeout=8)
+        return False
 
-    async def _open_window(self, name, argv, lock):
-        ok, how, err = await self.tmux.open(name, argv, lock=lock)
+    def open_window(self, name, argv, lock=None, cwd=None, new=False):
+        if not self._tmux_ok("A terminal window"):
+            return
+        self.run_worker(self._open_window(name, argv, lock, cwd, new), group="windows", exit_on_error=False)
+
+    async def _open_window(self, name, argv, lock, cwd, new):
+        ok, how, err = await self.tmux.open(name, argv, lock=lock, cwd=cwd, new=new)
         if not ok:
             self.notify("tmux: %s" % (err or "couldn't open a window"), severity="error", markup=False)
+        await self._refresh_windows()
 
     # ------------------------------------------------------------ actions
 
@@ -1522,6 +1403,14 @@ class Dashboard(Screen):
             return None
         return p
 
+    def _need_folder(self, p):
+        """The project's folder, where sessions and VM shells start: checked
+        to be a folder (not a link to one elsewhere)."""
+        if not os.path.isdir(p.path) or os.path.islink(p.path):
+            self.notify("%s isn't a folder; not started there" % clean_line(p.path), severity="error", markup=False)
+            return None
+        return p.path
+
     def _confirm(self, title, message, then, warn=False, yes="Yes"):
         def answered(ok):
             if ok:
@@ -1534,6 +1423,45 @@ class Dashboard(Screen):
             self.notify(why, severity="warning", markup=False)
         return why
 
+    def action_claude(self):
+        """Switch to the project's Claude session (the last one started),
+        or start one."""
+        p = self._need_project()
+        if not p or not self._tmux_ok("A Claude session") or not self._need_folder(p):
+            return
+
+        async def go():
+            w = await self.tmux.find_last(p.name)
+            if w is not None:
+                await self._select_window(w.id)
+            else:
+                await self._open_window(p.name, CLAUDE_ARGV, None, p.path, True)
+        self.run_worker(go(), group="windows", exit_on_error=False)
+
+    def action_claude_new(self):
+        p = self._need_project()
+        if p and self._tmux_ok("A Claude session") and self._need_folder(p):
+            self.open_window(p.name, CLAUDE_ARGV, cwd=p.path, new=True)
+
+    def action_serve(self):
+        p = self._need_project()
+        if not p:
+            return
+        if self._busy_check(p.name):
+            return
+        if p.serve == "on":
+            self._confirm("Turn serve off for %s?" % p.name,
+                          "Stops its Remote Control server (window %s): the Claude app can't start sessions "
+                          "here until it's on again." % serve_window(p.name),
+                          lambda: self.start_job(["serve", p.name, "--off"], project=p.name), yes="Turn off")
+            return
+
+        def started(_job):
+            self.notify("%s: serve on. The first time, it asks to trust the folder and to enable Remote Control: "
+                        "answer in its window (Sessions tab, %s)." % (p.name, serve_window(p.name)),
+                        markup=False, timeout=12)
+        self.start_job(["serve", p.name], project=p.name, then=started)
+
     def action_up(self):
         p = self._need_project()
         if p:
@@ -1542,42 +1470,30 @@ class Dashboard(Screen):
     def action_down(self):
         p = self._need_project()
         if p and not self._busy_check(p.name):
-            self._confirm("Stop %s?" % p.name, "Stops the container (and its sidecars). The code, config and "
-                          "home folder are kept; u starts it again.",
+            self._confirm("Stop %s's build container?" % p.name,
+                          "Stops the build container and its sidecars (background processes in it end). The code "
+                          "and their data are kept, and Claude sessions keep running; u (or the next boxen run) "
+                          "starts it again.",
                           lambda: self.start_job(["down", p.name], project=p.name), yes="Stop")
-
-    def action_restart(self):
-        p = self._need_project()
-        if p and not self._busy_check(p.name):
-            self._confirm("Restart %s?" % p.name, "Recreates the container, picking up env changes: its "
-                          "server restarts and app sessions reconnect.",
-                          lambda: self.start_job(["restart", p.name], project=p.name), yes="Restart")
-
-    def action_update_project(self):
-        p = self._need_project()
-        if p and not self._busy_check(p.name):
-            self._confirm("Update %s?" % p.name, "Rebuilds the project's image from env/Dockerfile and recreates "
-                          "the container: its server restarts and app sessions reconnect.",
-                          lambda: self.start_job(["update", p.name], project=p.name), yes="Rebuild")
 
     def action_shell(self):
         p = self._need_project()
         if p:
             self.open_window(window_name(p.name, "shell"), [self.cfg.boxen, "shell", p.name])
 
-    def action_claude(self):
+    def action_vm_shell(self):
+        """A shell on the VM in the project's folder, as if you'd cd'ed
+        there over SSH (outside Claude's sandbox: it's yours)."""
         p = self._need_project()
-        if p:
-            self.open_window(window_name(p.name, "claude"), [self.cfg.boxen, "claude", p.name])
+        if p and self._need_folder(p):
+            shell = self.env.get("SHELL") or "/bin/bash"
+            self.open_window(window_name(p.name, "vm-shell"), ["env", "-u", "DOCKER_HOST", shell], cwd=p.path)
 
     def action_logs_tab(self):
         self.query_one("#tabs", TabbedContent).active = "logs"
 
     def action_sessions_tab(self):
         self.query_one("#tabs", TabbedContent).active = "sessions-tab"
-
-    def action_terminals_tab(self):
-        self.query_one("#tabs", TabbedContent).active = "terminals"
 
     def action_files_tab(self):
         self.query_one("#tabs", TabbedContent).active = "files-tab"
@@ -1591,9 +1507,12 @@ class Dashboard(Screen):
 
     def action_rm(self):
         p = self._need_project()
-        if p:
-            # boxen asks (exit 3, approval needed): the answer is the approval dialog.
-            self.start_job(["rm", p.name], project=p.name)
+        if p and not self._busy_check(p.name):
+            self._confirm("Remove %s from boxen?" % p.name,
+                          "Removes its build container, image, sidecars and their data (volumes), and boxen's "
+                          "settings for it: your compose.override.yaml, its GitHub repos list and tokens, serve. "
+                          "The code in %s (with .boxen/) and its Claude history stay." % p.path,
+                          lambda: self.start_job(["rm", p.name, "--yes"], project=p.name), warn=True, yes="Remove")
 
     def action_global_menu(self):
         def chosen(key):
@@ -1603,9 +1522,9 @@ class Dashboard(Screen):
 
     def action_global_update_all(self):
         if not self._busy_check(is_global=True):
-            self._confirm("Update everything?", "Rebuilds the base image from a fresh Ubuntu with the newest "
-                          "Claude Code, then every project. Takes a while; every server restarts and app "
-                          "sessions reconnect. Project actions wait until it's done.",
+            self._confirm("Update everything?", "Rebuilds the base image from a fresh Ubuntu, then every project's "
+                          "build container (background processes in them stop). Takes a while; project actions "
+                          "wait until it's done. Claude sessions keep running.",
                           lambda: self.start_job(["update"], is_global=True), yes="Update all")
 
     def action_global_self_update(self):
@@ -1624,14 +1543,14 @@ class Dashboard(Screen):
     def action_global_github(self):
         self.open_window(window_name(None, "github"), [self.cfg.boxen, "github"])
 
-    def action_global_login(self):
-        self.open_window(window_name(None, "login"), [self.cfg.boxen, "login"])
+    def action_global_doctor(self):
+        if not self._busy_check(is_global=True):
+            self.query_one("#jobs").remove_class("collapsed")
+            self.start_job(["doctor"], is_global=True)
 
-    def action_global_import_mac(self):
-        self.open_window(window_name(None, "import-mac"), [self.cfg.boxen, "import-mac"])
-
-    def action_global_supervisor(self):
-        self.open_window(window_name(None, "supervisor"), [self.cfg.boxen, "supervisor"])
+    def action_global_migrate(self):
+        if not self._busy_check(is_global=True):
+            self.open_window(window_name(None, "migrate"), [self.cfg.boxen, "migrate"])
 
     def action_toggle_jobs(self):
         self.query_one("#jobs").toggle_class("collapsed")
@@ -1650,14 +1569,14 @@ class Dashboard(Screen):
 
     def action_quit_all(self):
         n = len(self.jobs.running())
-        msg = ("Stops boxen ui and closes every window in its tmux session (shells, Claude, logs). "
-               "Projects keep running.")
+        msg = ("Stops the dashboard. Claude sessions, serve and the other windows keep running; "
+               "`boxen ui` starts it again.")
         if n:
-            msg += " %d running job%s will be stopped." % (n, "" if n == 1 else "s")
+            msg += " %s will be stopped." % _plural(n, "running job")
 
         async def go():
-            await self.app.shutdown(kill_session=True)
-        self._confirm("Quit boxen ui?", msg, lambda: self.run_worker(go(), exit_on_error=False), warn=True,
+            await self.app.shutdown()
+        self._confirm("Quit the dashboard?", msg, lambda: self.run_worker(go(), exit_on_error=False), warn=bool(n),
                       yes="Quit")
 
     def action_restart_dashboard(self):
@@ -1674,7 +1593,7 @@ class Dashboard(Screen):
                 self.notify("couldn't restart: %s" % e, severity="error", markup=False)
         self._confirm("Restart the dashboard?",
                       "Starts this dashboard again%s; windows and projects keep running."
-                      % (" (stopping %d running job%s)" % (n, "" if n == 1 else "s") if n else ""),
+                      % (" (stopping %s)" % _plural(n, "running job") if n else ""),
                       go, yes="Restart")
 
 
@@ -1716,9 +1635,9 @@ class BoxenApp(App):
         if self.screen is self.dashboard:
             self.dashboard.action_quit_all()
 
-    async def shutdown(self, kill_session=False):
-        """Stop every job and refresh, then exit (and with kill_session,
-        end the whole boxen tmux session, this window included)."""
+    async def shutdown(self):
+        """Stop every job and refresh, then exit. Only the dashboard: the
+        other windows in boxen's tmux (Claude sessions, serve) are yours."""
         if self._shutting_down:
             return
         self._shutting_down = True
@@ -1728,12 +1647,6 @@ class BoxenApp(App):
         except Exception:
             pass
         procs.kill_all()
-        if kill_session and in_boxen_tmux(self.env):
-            try:
-                subprocess.Popen(self.dashboard.tmux.kill_session_argv(), env=self.env, stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            except OSError:
-                pass
         self.exit()
 
 

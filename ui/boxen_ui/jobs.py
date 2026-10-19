@@ -1,26 +1,21 @@
 """Jobs: boxen commands the UI runs, with their output as it comes.
 
-Every job runs `boxen ...` (argv, no shell) with BOXEN_AGENT=1, so nothing
-waits on a terminal: a question comes back as exit 3 with an "approval
-needed" block (see bin/boxen approval_needed), which parse_approval reads.
-One job per project at a time; a global job (update all, tokens) runs alone.
+Every job runs `boxen ...` (argv, no shell) with stdin from /dev/null, so
+nothing can wait on a terminal: the dashboard only runs commands that don't
+ask (rm with --yes, after its own question), and opens a tmux window for
+the ones that need a terminal. One job per project at a time; a global job
+(update, tokens, doctor) runs alone.
 """
 import asyncio
 import os
-import re
 import time
 from dataclasses import dataclass, field
 
 from . import procs
-from .config import REPO_RE, repo_arg, valid_name
 from .textutil import clean_line
 
 MAX_LINES = 5000
 SPLIT = 65536        # a line longer than this (bytes) is shown in pieces
-# In Job.raw, a piece of an over-long line starts with this: it can't be a
-# header, a question line or the run line of an approval block (a block
-# with a carriage return in it is refused outright).
-FRAGMENT = "\r"
 
 
 def utf8_cut(b, n):
@@ -32,149 +27,38 @@ def utf8_cut(b, n):
 
 
 class LineSplitter:
-    """Bytes in, lines out (emit(text, fragment)). Lines over SPLIT bytes
-    come out in pieces cut between characters, every piece (the last one
-    too) flagged as a fragment."""
+    """Bytes in, lines out (emit(text)). Lines over SPLIT bytes come out in
+    pieces cut between characters, so one huge line can't stall the log."""
 
     def __init__(self, emit):
         self.emit = emit
         self.buf = b""
-        self.long = False
 
     def feed(self, chunk):
         self.buf += chunk
         while b"\n" in self.buf:
             raw, self.buf = self.buf.split(b"\n", 1)
-            raw = self._pieces(raw)
-            self.emit(raw.decode("utf-8", "replace"), self.long)
-            self.long = False
+            self.emit(self._pieces(raw).decode("utf-8", "replace"))
         self.buf = self._pieces(self.buf)
 
     def _pieces(self, b):
-        """Emit leading SPLIT-sized pieces of b (cut between characters) as
-        fragments; return what's left."""
+        """Emit leading SPLIT-sized pieces of b (cut between characters);
+        return what's left."""
         while len(b) > SPLIT:
             cut = utf8_cut(b, SPLIT)
-            self.emit(b[:cut].decode("utf-8", "replace"), True)
+            self.emit(b[:cut].decode("utf-8", "replace"))
             b = b[cut:]
-            self.long = True
         return b
 
     def close(self):
         if self.buf:
-            self.emit(self.buf.decode("utf-8", "replace"), self.long)
+            self.emit(self.buf.decode("utf-8", "replace"))
         self.buf = b""
+
+
 MAX_FINISHED = 50
 
-RUNNING, OK, FAILED, APPROVAL, STOPPED = "running", "ok", "failed", "needs approval", "stopped"
-
-_HEAD = re.compile(r"^boxen: approval needed \(([a-z]+)\) for ([a-z0-9]+(?:[_-][a-z0-9]+)*):$")
-_RUN = re.compile(r"^boxen: to approve, run: (.+)$")
-# What each kind of question may be answered with, and which jobs can ask it.
-_ANSWERS = {"trust": ("up", ["--approve", "trust"], ("up", "restart", "new")),
-            "rm": ("rm", ["--yes"], ("rm",)),
-            "repos": ("repos", None, ("repos",))}      # its answer: see _repos_answer
-
-
-@dataclass
-class Approval:
-    kind: str
-    name: str
-    question: list       # the question's lines, as printed (each indented by 4)
-    block: list          # the whole block: header, question, run line
-    command: str         # what follows "to approve, run: "
-    argv: list           # command split; argv[0] == "boxen"
-
-
-def asked_repos(job_args, name):
-    """The repos a `boxen repos NAME add R...` job asked for, as bin/boxen
-    prints them back (each normalized to owner/repo, repeats dropped,
-    ignoring case), or None when job_args isn't exactly that."""
-    if not job_args or len(job_args) < 4 or list(job_args[:3]) != ["repos", name, "add"]:
-        return None
-    out, seen = [], set()
-    for a in job_args[3:]:
-        r = repo_arg(a)
-        if r is None:
-            return None
-        if r.lower() not in seen:
-            seen.add(r.lower())
-            out.append(r)
-    return out
-
-
-def _repos_answer(cmd, name, job_args):
-    """argv for a repos approval's run line: exactly `boxen repos NAME add
-    R1 ... Rn --yes`, every R plain owner/repo, and R1..Rn exactly the repos
-    the job asked for: nothing added, nothing else."""
-    asked = asked_repos(job_args, name)
-    parts = cmd.split(" ")
-    if asked is None or len(parts) < 6 or parts[:4] != ["boxen", "repos", name, "add"] or parts[-1] != "--yes":
-        return None
-    repos = parts[4:-1]
-    if not all(REPO_RE.match(r) and ".." not in r for r in repos) or repos != asked:
-        return None
-    return parts
-
-
-def parse_approval(raw, job_project, job_verb, job_args=None):
-    """The approval block a job (`boxen <job_verb> <job_project> ...`, all
-    of its arguments in job_args) ended with, from its raw output lines
-    (before any cleaning), or None. Taken only when it's exactly what
-    bin/boxen's approval_needed prints and nothing else could have: the run
-    line is the last line of the output; above it only lines indented by 4,
-    up to the header; no line of the block holds a carriage return or an
-    escape character (which could redraw what's shown); the header names
-    the job's own project; and the command is the one answer for that kind
-    of question (trust: boxen up NAME --approve trust, from an
-    up/restart/new job; rm: boxen rm NAME --yes, from an rm job; repos:
-    boxen repos NAME add R... --yes, from a `repos NAME add` job, with
-    exactly the repos it asked for)."""
-    lines = list(raw)
-    while lines and lines[-1] == "":
-        lines.pop()
-    if not lines:
-        return None
-    r = _RUN.match(lines[-1])
-    if not r:
-        return None
-    i = len(lines) - 2
-    while i >= 0 and lines[i].startswith("    "):
-        i -= 1
-    if i < 0:
-        return None
-    m = _HEAD.match(lines[i])
-    block = lines[i:]
-    if not m or any("\r" in x or "\x1b" in x for x in block):
-        return None
-    kind, name = m.group(1), m.group(2)
-    if name != job_project or not valid_name(name) or kind not in _ANSWERS:
-        return None
-    verb, flags, asked_by = _ANSWERS[kind]
-    if job_verb not in asked_by:
-        return None
-    cmd = r.group(1)
-    if kind == "repos":
-        argv = _repos_answer(cmd, name, job_args)
-        if argv is None:
-            return None
-        return Approval(kind, name, block[1:-1], block, cmd, argv)
-    if cmd != " ".join(["boxen", verb, name] + flags):
-        return None
-    return Approval(kind, name, block[1:-1], block, cmd, ["boxen", verb, name] + flags)
-
-
-_WAITING = re.compile(r"^(?:boxen: )?([a-z0-9_-]+)(?: is waiting at an unrecognized question|: needs an answer)")
-
-
-def question_project(lines, job_project):
-    """The project an exit-3 job without an approval line was about: only
-    ever the job's own (None if the output says otherwise)."""
-    for line in reversed(lines):
-        m = _WAITING.match(line)
-        if m:
-            return job_project if m.group(1) == job_project else None
-    return job_project
+RUNNING, OK, FAILED, STOPPED = "running", "ok", "failed", "stopped"
 
 
 @dataclass
@@ -187,13 +71,11 @@ class Job:
     status: str = RUNNING
     rc: object = None
     lines: list = field(default_factory=list)     # cleaned, for display
-    raw: list = field(default_factory=list)       # as received, for parse_approval
     started: float = field(default_factory=time.monotonic)
     ended: object = None
-    approval: object = None
     proc: object = None
     dropped: int = 0     # lines dropped from the start (MAX_LINES)
-    followup: object = None   # what the dashboard does when it succeeds ("apply")
+    then: object = None  # called with the job (on the app's loop) when it succeeds
 
     @property
     def verb(self):
@@ -207,9 +89,6 @@ class Job:
     def elapsed(self):
         end = self.ended if self.ended is not None else time.monotonic()
         return max(0.0, end - self.started)
-
-    def needs_terminal(self):
-        return self.rc == 2 and any("needs a terminal" in line for line in self.lines[-10:])
 
 
 def fmt_elapsed(s):
@@ -233,7 +112,6 @@ class JobManager:
         self.boxen = boxen
         self.listener = listener
         self.env = dict(os.environ if env is None else env)
-        self.env["BOXEN_AGENT"] = "1"
         self.jobs = []
         self._next = 1
         self.external_global = None    # callable -> reason or None (a global command in a window)
@@ -291,7 +169,7 @@ class JobManager:
             self._finish(job, 127)
             return
         self.listener.job_changed(job)
-        lines = LineSplitter(lambda text, fragment: self._line(job, text, fragment))
+        lines = LineSplitter(lambda text: self._line(job, text))
         try:
             while True:
                 chunk = await job.proc.stdout.read(4096)
@@ -307,14 +185,12 @@ class JobManager:
         procs.forget(job.proc)
         self._finish(job, rc)
 
-    def _line(self, job, raw, fragment=False):
+    def _line(self, job, raw):
         line = clean_line(raw)
-        job.raw.append(FRAGMENT + raw if fragment else raw)
         job.lines.append(line)
         if len(job.lines) > MAX_LINES:
             n = len(job.lines) - MAX_LINES
             del job.lines[:n]
-            del job.raw[:n]
             job.dropped += n
         self.listener.job_line(job, line)
 
@@ -325,9 +201,6 @@ class JobManager:
             job.status = status
         elif rc == 0:
             job.status = OK
-        elif rc == 3:
-            job.approval = parse_approval(job.raw, job.project, job.verb, job.argv[1:])
-            job.status = APPROVAL
         else:
             job.status = FAILED
         self.listener.job_changed(job)

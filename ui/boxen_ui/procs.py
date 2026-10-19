@@ -16,13 +16,13 @@ def _killpg(proc, sig):
         pass
 
 
-async def spawn(argv, env=None, merge_stderr=True):
+async def spawn(argv, env=None, merge_stderr=True, cwd=None):
     """Start argv (stdin from /dev/null, stdout piped, stderr merged or
-    piped). Tracked until reaped."""
+    piped) in cwd (default: the app's). Tracked until reaped."""
     proc = await asyncio.create_subprocess_exec(
         *argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
-        env=env, start_new_session=True)
+        env=env, cwd=cwd, start_new_session=True)
     _live.add(proc)
     return proc
 
@@ -42,12 +42,12 @@ async def stop(proc, grace=2.0):
     forget(proc)
 
 
-async def run(argv, env=None, timeout=30.0, merge_stderr=False):
+async def run(argv, env=None, timeout=30.0, merge_stderr=False, cwd=None):
     """Run argv to completion. Returns (rc, stdout, stderr) as text;
     rc 127 when it can't be started, 124 on timeout. Cancelling the caller
     kills the process."""
     try:
-        proc = await spawn(argv, env=env, merge_stderr=merge_stderr)
+        proc = await spawn(argv, env=env, merge_stderr=merge_stderr, cwd=cwd)
     except OSError as e:
         return 127, "", "%s: %s" % (argv[0], e.strerror or e)
     try:

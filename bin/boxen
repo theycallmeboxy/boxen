@@ -860,7 +860,7 @@ env_logs() {
   shift 2
   while (( $# )); do
     case $1 in
-      --tail) tail=${2:-}; shift ;;
+      --tail) tail=${2:-}; [[ -n "$tail" ]] || die "--tail needs a number of lines, 1 to 5000"; shift ;;
       --tail=*) tail=${1#--tail=} ;;
       *) die "usage: boxen env logs <sidecar|env> [--tail N]" ;;
     esac
@@ -958,7 +958,9 @@ cmd_claude() {
 # user service starts the marked ones at boot.
 serve_win() { printf '%s~serve' "$1"; }
 serve_on() { [[ -f "$(proj_dir "$1")/serve" ]]; }
-serving() { "${TMUX_CMD[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -qxF "$(serve_win "$1")"; }
+# (grep reads all of it: with -q it could exit first, and pipefail would
+# count tmux's broken pipe as "not there".)
+serving() { "${TMUX_CMD[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -xF "$(serve_win "$1")" >/dev/null; }
 
 serve_start() {
   local n=$1
@@ -1198,7 +1200,7 @@ cmd_ui() {
   fi
   if "${t[@]}" has-session -t boxen 2>/dev/null; then
     "${t[@]}" source-file "$TMUX_CONF" 2>/dev/null || true
-    "${t[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -qx dashboard \
+    "${t[@]}" list-windows -t boxen: -F '#{window_name}' 2>/dev/null | grep -x dashboard >/dev/null \
       || "${t[@]}" new-window -d -c "$HOME" -t boxen: -n dashboard "${UI_DASH[@]}"
     exec env -u TMUX "${t[@]}" attach-session -t boxen \; select-window -t boxen:=dashboard
   fi

@@ -1,7 +1,7 @@
 """A stand-in for bin/boxen in boxen ui's tests.
 
-Records each call (argv after "boxen", and BOXEN_AGENT) as a JSON line in
-$FAKE_DIR/boxen.jsonl, then answers from $FAKE_DIR/boxen.json:
+Records each call (argv after "boxen", and the folder it ran in) as a JSON
+line in $FAKE_DIR/boxen.jsonl, then answers from $FAKE_DIR/boxen.json:
 
     {"rules": [{"args": ["up", "caulker"], "out": ["line", ...], "delay": 0.1, "rc": 3}, ...]}
 
@@ -19,7 +19,8 @@ import time
 d = os.environ["FAKE_DIR"]
 args = sys.argv[1:]
 with open(os.path.join(d, "boxen.jsonl"), "a") as f:
-    f.write(json.dumps({"args": args, "agent": os.environ.get("BOXEN_AGENT"), "pid": os.getpid()}) + "\n")
+    f.write(json.dumps({"args": args, "cwd": os.getcwd(), "pid": os.getpid(),
+                        "docker_host": os.environ.get("DOCKER_HOST")}) + "\n")
 
 rules_path = os.path.join(d, "boxen.json")
 rules = []

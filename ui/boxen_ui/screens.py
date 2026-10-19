@@ -1,7 +1,5 @@
 """Modal dialogs. Text from outside (boxen's output, questions) is shown as
 Text objects, never markup."""
-import textwrap
-
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -17,8 +15,7 @@ from .textutil import clean_line, text
 
 class _Dialog(ModalScreen):
     DEFAULT_CSS = """
-    _Dialog, ConfirmScreen, ApprovalScreen, QuestionScreen, NewProjectScreen, GlobalMenuScreen, HelpScreen,
-    ReposScreen {
+    _Dialog, ConfirmScreen, NewProjectScreen, GlobalMenuScreen, HelpScreen, ReposScreen {
         align: center middle;
         background: $background 60%;
     }
@@ -77,83 +74,6 @@ class ConfirmScreen(_Dialog):
         self.dismiss(False)
 
 
-def wrap_question(lines, width=72):
-    """The question's lines (as printed, indented by 4) without that
-    indent, wrapped at word boundaries; a wrapped line's continuation is
-    indented 4 more than the line itself."""
-    out = []
-    for line in lines:
-        line = clean_line(line[4:] if line.startswith("    ") else line).rstrip()
-        lead = line[:len(line) - len(line.lstrip())]
-        out.extend(textwrap.wrap(line.lstrip(), width=width, initial_indent=lead, subsequent_indent=lead + "    ",
-                                 break_on_hyphens=False) or [""])
-    return "\n".join(out)
-
-
-class ApprovalScreen(_Dialog):
-    """The question from an "approval needed" block (boxen's own words,
-    wrapped) and the exact command Yes runs. No has the focus. Yes
-    dismisses True: the caller runs exactly that command."""
-    DEFAULT_CSS = """
-    ApprovalScreen #yes { background: $surface; color: $warning; border: tall $warning; }
-    ApprovalScreen #yes:focus { background: $warning; color: $background; text-style: bold; }
-    ApprovalScreen #no:focus { background: $accent; color: $background; text-style: bold reverse; border: tall $accent; }
-    """
-    BINDINGS = [Binding("n,escape", "no", "No")]
-
-    def __init__(self, approval, job_title):
-        super().__init__()
-        self.approval = approval
-        self.job_title = job_title
-
-    def compose(self) -> ComposeResult:
-        a = self.approval
-        with Vertical(classes="dialog warn"):
-            yield Static(Text("%s needs your approval" % clean_line(a.name)), classes="title")
-            yield Static(Text("%s stopped to ask (%s):" % (clean_line(self.job_title), a.kind), style="dim"))
-            with VerticalScroll(classes="body"):
-                yield Static(Text(wrap_question(a.question), no_wrap=True, overflow="ellipsis"),
-                             classes="block", id="approval-block")
-            yield Static(Text.assemble(("Yes runs: ", "bold"), clean_line(a.command)), classes="cmd", id="approval-cmd")
-            with Horizontal(classes="buttons"):
-                yield Button("Yes, approve", id="yes")
-                yield Button("No", id="no", variant="primary")
-
-    def on_mount(self):
-        self.query_one("#no", Button).focus()
-
-    def on_button_pressed(self, ev):
-        self.dismiss(ev.button.id == "yes")
-
-    def action_no(self):
-        self.dismiss(False)
-
-
-class QuestionScreen(_Dialog):
-    """A job stopped at something only a terminal can answer. Dismisses
-    "terminal" or None."""
-
-    def __init__(self, title, lines, can_open=True, button="Open a terminal for it"):
-        super().__init__()
-        self._title, self._lines, self._can_open, self._button = title, lines, can_open, button
-
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog warn"):
-            yield Static(Text(self._title), classes="title")
-            with VerticalScroll(classes="body"):
-                yield Static(Text("\n".join(clean_line(x) for x in self._lines)), classes="block", id="question-text")
-            with Horizontal(classes="buttons"):
-                if self._can_open:
-                    yield Button(self._button, id="terminal", variant="primary")
-                yield Button("Close", id="close")
-
-    def on_mount(self):
-        self.query_one("#terminal" if self._can_open else "#close", Button).focus()
-
-    def on_button_pressed(self, ev):
-        self.dismiss("terminal" if ev.button.id == "terminal" else None)
-
-
 class NewProjectScreen(_Dialog):
     """Name and optional GitHub URL, checked like bin/boxen does. Dismisses
     (name, url) or None."""
@@ -161,7 +81,7 @@ class NewProjectScreen(_Dialog):
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
             yield Static(Text("New project"), classes="title")
-            yield Label(Text("Name (becomes ~/src/<name> and the name in the Claude app)"))
+            yield Label(Text("Name (becomes ~/src/<name>)"))
             yield Input(placeholder="myproject", id="name", max_length=40)
             yield Label(Text("GitHub URL to clone (optional, https://github.com/owner/repo)"))
             yield Input(placeholder="https://github.com/you/myproject", id="url")
@@ -223,7 +143,7 @@ class ReposScreen(_Dialog):
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
             yield Static(Text("GitHub repos for %s" % clean_line(self.project)), classes="title")
-            yield Static(Text("Its tokens cover only these. Adding asks you to approve it; "
+            yield Static(Text("Its tokens cover only these: the agent can push to every one. "
                               "x removes the selected one; Enter on a found one puts it below.", style="dim"))
             yield DataTable(id="repo-list", cursor_type="row")
             yield Label(Text("Add (owner/repo or https://github.com/owner/repo; several: spaces between)"))
@@ -300,13 +220,12 @@ class ReposScreen(_Dialog):
 
 
 GLOBAL_ACTIONS = [
-    ("update_all", "Update everything", "rebuild the base image (fresh Ubuntu, newest Claude Code) and every project"),
+    ("update_all", "Update everything", "rebuild the base image (fresh Ubuntu) and every project's build container"),
     ("self_update", "Self-update boxen", "pull the latest boxen and apply it (in a terminal: may ask for sudo)"),
     ("tokens", "Refresh GitHub tokens", "mint fresh tokens for every project now"),
     ("github", "Connect GitHub", "set up your GitHub App and commit identity (in a terminal)"),
-    ("login", "Sign in to Claude", "sign in again, shared by every project (in a terminal)"),
-    ("import_mac", "Moving from a Mac", "how to bring your Claude Code work over (in a terminal)"),
-    ("supervisor", "Set up the supervisor", "create or start the supervisor project (in a terminal)"),
+    ("doctor", "Check this VM", "boxen doctor: rootless Docker, the sandbox and isolation"),
+    ("migrate", "Move from boxen v1", "boxen migrate: bring v1 projects (agent in a container) over (in a terminal)"),
 ]
 
 
@@ -330,33 +249,34 @@ HELP = [
     ("Projects", [
         ("↑ ↓  j k", "move in the project list"),
         ("Tab", "next pane"),
-        ("u", "up: start, or apply env changes"),
-        ("d", "down: stop (asks first)"),
-        ("r", "restart: recreate the container (asks first)"),
-        ("U", "update: rebuild the image (asks first)"),
-        ("s", "shell in the container (terminal window)"),
-        ("c", "Claude in the container (terminal window)"),
+        ("c", "Claude: switch to the project's session, or start one (terminal window)"),
+        ("C", "a new Claude session in the project, beside any running"),
+        ("S", "serve: keep a Remote Control server up, to start sessions from the app (on / off)"),
+        ("u", "up: build and start the build container and sidecars, applying .boxen/ changes"),
+        ("d", "down: stop them (asks first)"),
+        ("s", "root shell in the build container (terminal window)"),
+        ("v", "shell on the VM in the project folder (terminal window)"),
         ("n", "new project"),
-        ("G", "GitHub repos the project can push to: add (asks), remove"),
-        ("X", "remove the project (asks first; keeps the code)"),
+        ("G", "GitHub repos the project can push to: add, remove"),
+        ("X", "remove the build container, image and data (asks first; keeps the code)"),
     ]),
     ("Tabs", [
         ("l", "Logs tab"),
-        ("ctrl+r  F5", "refresh (the list, and the Sessions / Logs tab)"),
-        ("f", "Logs: follow in a terminal window"),
-        ("Enter", "Sessions: continue in the Claude app · Terminals: switch to it"),
-        ("a", "Overview: add the selected found repo (asks) · Sessions: open in a terminal"),
-        ("x", "Sessions: close one boxen resumed"),
+        ("ctrl+r  F5", "refresh (the list, and the tab shown)"),
+        ("Enter", "Sessions: switch to the window"),
+        ("x", "Sessions: close the window (asks first)"),
+        ("f", "Logs: follow a sidecar's log in a terminal window"),
+        ("a", "Overview: add the selected found repo (asks)"),
         ("e", "Files: edit a copy in vim; saved back when you quit vim"),
     ]),
     ("Everything", [
-        ("g", "global menu: update all, self-update, tokens, GitHub, login…"),
+        ("g", "global menu: update all, self-update, tokens, GitHub, doctor, migrate"),
         ("J", "show / hide the jobs panel"),
         ("ctrl+p", "command palette: every action"),
         ("F1  C-b 0", "back to this dashboard (from any window)"),
         ("F2 F3", "previous / next window (or C-b p / C-b n)"),
         ("q", "detach: everything keeps running; `boxen ui` comes back"),
-        ("Q  ctrl+q", "quit: stop jobs and close every boxen ui window (asks)"),
+        ("Q  ctrl+q", "quit the dashboard (asks); sessions and other windows keep running"),
         ("?", "this help"),
     ]),
 ]
@@ -373,7 +293,7 @@ class HelpScreen(_Dialog):
                 t.append("  %-12s" % k, style="bold cyan")
                 t.append(desc + "\n")
             t.append("\n")
-        t.append("Terminal windows (shell, claude, logs, sessions) run in tmux: switch with the tabs at the "
+        t.append("Claude sessions and other windows run in boxen's tmux: switch with the tabs at the "
                  "bottom, F1 (or C-b 0, when a program in the window wants the F-keys) comes back here. "
                  "Everything keeps running if SSH drops.", style="dim")
         with Vertical(classes="dialog"):

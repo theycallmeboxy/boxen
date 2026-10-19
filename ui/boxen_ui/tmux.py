@@ -1,9 +1,12 @@
 """The `boxen` tmux server (tmux -L boxen): the dashboard's own session and
-the windows it opens. Windows are named "<project>/<kind>" ("+global/<kind>"
-for the rest): "/" and "+" can't be in a project name, so no project can
-pass for another or for the dashboard. They're found by name but always
-addressed by id (@N). Every window starts in your home folder (-c), never in
-a project's, whose files the container can write."""
+the windows in it. bin/boxen names a project's Claude sessions "<project>"
+(boxen claude; the dashboard's c too) and its Remote Control server
+"<project>~serve"; the dashboard's other windows are "<project>/<kind>"
+("+global/<kind>" for the rest). "~", "/" and "+" can't be in a project
+name, so no project can pass for another or for the dashboard. Windows are
+found by name but always addressed by id (@N). They start in your home
+folder (-c) unless they're meant to work in the project's folder (Claude,
+a VM shell there)."""
 import os
 import shlex
 from dataclasses import dataclass
@@ -36,6 +39,23 @@ class Window:
 
 def window_name(project, kind):
     return "%s/%s" % (project or GLOBAL, kind)
+
+
+def serve_window(project):
+    return "%s~serve" % project
+
+
+def kind_of(project, name):
+    """What a window is to project: "claude" (a session, named like the
+    project), "serve", the dashboard's kind ("shell", "edit-Dockerfile"...),
+    or None when it isn't the project's."""
+    if name == project:
+        return "claude"
+    if name == serve_window(project):
+        return "serve"
+    if name.startswith(project + "/"):
+        return name[len(project) + 1:]
+    return None
 
 
 def hold_script(argv, lock=None):
@@ -102,20 +122,35 @@ class Tmux:
         rc, _out, err = await self.run("select-window", "-t", win_id)
         return rc == 0, err.strip()
 
-    async def open(self, name, argv, lock=None):
+    async def find_last(self, name):
+        """The last window called name whose command still runs, or None."""
+        found = None
+        for w in await self.list_windows():
+            if w.name == name and not w.finished:
+                found = w
+        return found
+
+    async def open(self, name, argv, lock=None, cwd=None, new=False):
         """Select the window called name if its command still runs, else
-        (closing a finished one) start one running argv, held open after it
-        exits. Returns (ok, "selected"|"opened", error)."""
-        w = await self.find(name)
-        if w is not None and not w.finished:
-            ok, err = await self.select(w.id)
-            return ok, "selected", err
-        if w is not None:
-            await self.run("kill-window", "-t", w.id)
+        (closing a finished one) start one running argv in cwd (default:
+        home), held open after it exits. With new, always start another one
+        (Claude sessions: a project can have several). Returns (ok,
+        "selected"|"opened", error)."""
+        if not new:
+            w = await self.find(name)
+            if w is not None and not w.finished:
+                ok, err = await self.select(w.id)
+                return ok, "selected", err
+            if w is not None:
+                await self.run("kill-window", "-t", w.id)
         rc, _out, err = await self.run(
-            "new-window", "-t", self.session + ":", "-c", self.home, "-n", name,
+            "new-window", "-t", self.session + ":", "-c", cwd or self.home, "-n", name,
             "sh", "-c", hold_script(argv, lock=lock))
         return rc == 0, "opened", err.strip()
+
+    async def kill(self, win_id):
+        rc, _out, err = await self.run("kill-window", "-t", win_id)
+        return rc == 0, err.strip()
 
     async def capture(self, win_id):
         rc, out, _err = await self.run("capture-pane", "-p", "-e", "-t", win_id)
@@ -130,6 +165,3 @@ class Tmux:
         else:
             rc, _out, err = await self.run("detach-client")
         return rc == 0, err.strip()
-
-    def kill_session_argv(self):
-        return self.argv("kill-session", "-t", self.session)
