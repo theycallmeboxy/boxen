@@ -188,10 +188,17 @@ if a[:1] == ["exec"]:
         else:
             i += 1
     if os.path.exists(os.path.join(d, "exec-local")):
-        import subprocess
+        # boxen-exec is the image's (image/boxen-exec, under /bin/sh), its
+        # run ids kept in $FAKE_DIR/exec
         with open(os.path.join(d, "docker.jsonl"), "a") as f:
             f.write(json.dumps(log) + "\n")
-        sys.exit(subprocess.run(a[i + 1:], cwd=wd, env=dict(os.environ, **envs)).returncode)
+        cmd = a[i + 1:]
+        if cmd[:1] == ["boxen-exec"]:
+            cmd = ["/bin/sh", "REPODIR/image/boxen-exec"] + cmd[1:]
+            envs["BOXEN_EXEC_DIR"] = os.path.join(d, "exec")
+        if wd:
+            os.chdir(wd)
+        os.execvpe(cmd[0], cmd, dict(os.environ, **envs))
     done(0)
 if a[:1] == ["run"]:
     if "/compose" in a:
@@ -370,7 +377,8 @@ def write_exe(path, content):
 
 
 def py_exe(path, src):
-    write_exe(str(path), src.replace("#!PYTHON", "#!" + sys.executable, 1).replace("REALGIT", REAL_GIT))
+    write_exe(str(path), src.replace("#!PYTHON", "#!" + sys.executable, 1).replace("REALGIT", REAL_GIT)
+              .replace("REPODIR", REPO))
 
 
 # ----------------------------------------------------------- the real ~
@@ -573,3 +581,19 @@ def unix_socket(path):
     s.bind(str(path))
     s.listen(1)
     return s
+
+
+def group_members(pgid):
+    """Live (not zombie) processes in process group pgid."""
+    out = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            stat = open("/proc/%s/stat" % p).read()
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        if int(fields[2]) == pgid and fields[0] != "Z":
+            out.append(int(p))
+    return out

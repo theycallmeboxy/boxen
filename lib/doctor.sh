@@ -144,7 +144,7 @@ doctor_github() {
   d_head "GitHub"
   if app_configured; then d_ok "GitHub App: $(app_conf APP_SLUG)"
   else d_warn "GitHub isn't connected (boxen github): agents can't push"; fi
-  local t helpers
+  local t helpers want
   if git config --global --get-all "includeIf.gitdir:$SRC_ROOT/.path" 2>/dev/null | grep -xF "$GITCONFIG" >/dev/null; then
     d_ok "git in $SRC_ROOT uses boxen's tokens and identity ($GITCONFIG)"
   else
@@ -153,14 +153,19 @@ doctor_github() {
   # What git really asks, in a repo under ~/src: boxen's helper must be the
   # last one after the last reset (gh auth setup-git, for one, adds a reset
   # and its own helper after boxen's include).
-  t=$(mktemp -d -p "$SRC_ROOT" .boxen-doctor.XXXXXX)
-  git init -q "$t" 2>/dev/null
-  helpers=$(git -C "$t" config --get-all credential.https://github.com.helper 2>/dev/null | awk 'NF == 0 { n = 0; next } { h[n++] = $0 } END { for (i = 0; i < n; i++) print h[i] }')
-  rm -rf "$t"
-  if [[ "$helpers" == "!"*" git-credential" && "$helpers" != *$'\n'* ]]; then
-    d_ok "in $SRC_ROOT, git asks only boxen for GitHub credentials"
+  if ! t=$(mktemp -d -p "$SRC_ROOT" .boxen-doctor.XXXXXX 2>/dev/null); then
+    d_fail "can't check git's credential helpers: no $SRC_ROOT (re-run install.sh)"
   else
-    d_fail "in $SRC_ROOT, git asks other credential helpers too (${helpers//$'\n'/; }): re-run install.sh (moves boxen's include last), and don't run 'gh auth setup-git' on the VM"
+    git init -q "$t" 2>/dev/null || true
+    helpers=$(git -C "$t" config --get-all credential.https://github.com.helper 2>/dev/null | awk 'NF == 0 { n = 0; next } { h[n++] = $0 } END { for (i = 0; i < n; i++) print h[i] }')
+    rm -rf "$t"
+    # (exactly boxen's: gh's own helper ends in " git-credential" too)
+    printf -v want '!%q git-credential' "$BOXEN_BIN"
+    if [[ "$helpers" == "$want" ]]; then
+      d_ok "in $SRC_ROOT, git asks only boxen for GitHub credentials"
+    else
+      d_fail "in $SRC_ROOT, git asks other credential helpers too (${helpers//$'\n'/; }): re-run install.sh (moves boxen's include last), and don't run 'gh auth setup-git' on the VM"
+    fi
   fi
   if systemctl --user is-active --quiet boxen-tokens.timer 2>/dev/null; then
     d_ok "the boxen-tokens timer refreshes tokens every 30 minutes"

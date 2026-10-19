@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from conftest import REPO, write_exe, wait_for
+from conftest import REPO, group_members, write_exe, wait_for
 
 # ------------------------------------------------------------------ boxen-gh
 
@@ -99,6 +99,7 @@ def test_gh_without_real_gh(vm):
 # ----------------------------------------------------------------- boxen-bg
 
 BG = os.path.join(REPO, "image", "boxen-bg")
+EXEC = os.path.join(REPO, "image", "boxen-exec")
 
 REAPER = r'''
 """A stand-in for the container's init: a child subreaper (so the
@@ -181,22 +182,6 @@ def bg(tmp_path):
     r.close()
 
 
-def group_members(pgid):
-    """Live (not zombie) processes in process group pgid."""
-    out = []
-    for p in os.listdir("/proc"):
-        if not p.isdigit():
-            continue
-        try:
-            stat = open("/proc/%s/stat" % p).read()
-        except OSError:
-            continue
-        fields = stat.rsplit(")", 1)[1].split()
-        if int(fields[2]) == pgid and fields[0] != "Z":
-            out.append(int(p))
-    return out
-
-
 def test_bg_start_ps_logs_stop(bg):
     r = bg.bg("start", "web", "sh", "-c", "echo started; sleep 60 & sleep 60; wait")
     assert r["rc"] == 0, r["err"]
@@ -262,10 +247,115 @@ def test_bg_ps_empty(bg):
     assert bg.bg("ps")["out"] == "no background processes (start one: boxen run -d NAME cmd...)\n"
 
 
-def test_image_installs_boxen_bg():
+def test_image_installs_boxen_exec_and_bg():
     text = open(os.path.join(REPO, "image", "Dockerfile")).read()
-    assert "COPY boxen-bg /usr/local/bin/boxen-bg" in text
-    assert open(BG).readline() == "#!/bin/sh\n"
+    assert "COPY boxen-exec boxen-bg /usr/local/bin/" in text
+    assert "RUN chmod 0755 /usr/local/bin/boxen-exec /usr/local/bin/boxen-bg" in text
+    # caches on the cache volume, toolchains in the image
+    assert "XDG_CACHE_HOME=/root/.cache" in text and "CARGO_HOME=/opt/cargo" in text
+    assert "RUSTUP_HOME=/opt/rustup" in text and "PATH=/opt/cargo/bin:" in text
+    for f in (BG, EXEC):
+        assert open(f).readline() == "#!/bin/sh\n"
+
+
+# --------------------------------------------------------------- boxen-exec
+
+RID = "0123456789abcdef01234567"
+
+
+@pytest.fixture
+def bx(tmp_path):
+    """Run image/boxen-exec under /bin/sh (dash, as in the container)."""
+    d = tmp_path / "exec"
+    env = dict(os.environ, BOXEN_EXEC_DIR=str(d))
+
+    def run(*args, **kw):
+        return subprocess.run(["/bin/sh", EXEC] + list(args), env=env, capture_output=True, text=True,
+                              timeout=30, **kw)
+
+    def start(*args):
+        return subprocess.Popen(["/bin/sh", EXEC] + list(args), env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    run.start = start
+    run.dir = d
+    yield run
+    for f in d.glob("*") if d.exists() else []:
+        try:
+            os.killpg(int(f.read_text()), 9)
+        except (OSError, ValueError):
+            pass
+
+
+def test_exec_runs_the_command(bx):
+    r = bx(RID, "tr", "a-z", "A-Z", input="hello\nthere\n")             # stdin reaches it
+    assert r.returncode == 0 and r.stdout == "HELLO\nTHERE\n" and r.stderr == ""
+    r = bx(RID, "sh", "-c", "echo out; echo err >&2; exit 9")
+    assert (r.returncode, r.stdout, r.stderr) == (9, "out\n", "err\n")
+    r = bx(RID, "printf", "[%s]", "a b", "$HOME", "*", "")
+    assert r.stdout == "[a b][$HOME][*][]"
+    assert os.listdir(bx.dir) == []                                       # the id's file goes with it
+    # in a session (and process group) of its own, recorded under its id
+    r = bx(RID, "sh", "-c", 'cat "$0"; ps -o pid=,pgid=,sid= -p $$', str(bx.dir / RID))
+    pid, pgid, sid = r.stdout.split("\n", 1)[1].split()
+    assert r.stdout.split("\n")[0] == pid == pgid == sid
+
+
+def test_exec_kill_ends_the_group(bx):
+    p = bx.start(RID, "sh", "-c", "sleep 60 & sleep 60; wait")
+    try:
+        assert wait_for(lambda: (bx.dir / RID).exists() and (bx.dir / RID).read_text().strip())
+        pgid = int((bx.dir / RID).read_text())
+        assert wait_for(lambda: len(group_members(pgid)) >= 3)
+        t = time.monotonic()
+        r = bx("--kill", RID)
+        assert r.returncode == 0 and r.stdout == "" and r.stderr == ""
+        assert group_members(pgid) == []
+        p.wait(10)
+        assert p.returncode == 143                                         # the command's TERM
+        assert time.monotonic() - t < 5
+        assert not (bx.dir / RID).exists()
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+
+def test_exec_kill_escalates(bx):
+    """A command that ignores TERM gets KILL after 5 seconds."""
+    p = bx.start(RID, "sh", "-c", "trap '' TERM; sleep 60 & wait; wait")
+    try:
+        assert wait_for(lambda: (bx.dir / RID).exists() and (bx.dir / RID).read_text().strip())
+        pgid = int((bx.dir / RID).read_text())
+        assert wait_for(lambda: len(group_members(pgid)) >= 2)
+        t = time.monotonic()
+        assert bx("--kill", RID).returncode == 0
+        assert 4 < time.monotonic() - t < 15
+        assert group_members(pgid) == []
+        p.wait(10)
+    finally:
+        if p.poll() is None:
+            p.kill()
+
+
+def test_exec_ids_and_usage(bx):
+    for bad in ("short", "a/b/../../etc", "x" * 65, "0123456789\n../../x", "abc-defgh", "", "../passwd0"):
+        r = bx(bad, "true")
+        assert r.returncode == 125 and r.stderr == "boxen run: bad run id\n", bad
+        r = bx("--kill", bad)
+        assert r.returncode == 125 and r.stderr == "boxen run: bad run id\n", bad
+    assert not bx.dir.exists() or os.listdir(bx.dir) == []
+    for args in ([RID], [], ["--kill"], ["--kill", RID, "x"]):
+        r = bx(*args)
+        assert r.returncode == 125 and "usage: boxen-exec" in r.stderr, args
+    # nothing (or garbage) recorded under an id: --kill does nothing, quietly
+    assert bx("--kill", RID).returncode == 0
+    bx.dir.mkdir(exist_ok=True)
+    for junk in ("", "abc", "-1", "1 2", "12\n-1"):
+        (bx.dir / RID).write_text(junk)
+        r = bx("--kill", RID)
+        assert r.returncode == 0 and r.stderr == "", junk
+    # a command that can't be run: its exit code
+    r = bx(RID, "/nonexistent/cmd")
+    assert r.returncode == 127
 
 
 # ----------------------------------------------------------- boxen-services
@@ -304,6 +394,16 @@ def test_services_ok():
     assert out["volumes"] == {"boxen.alpha.pgdata": {"name": "boxen.alpha.pgdata"}}
     assert out["services"]["cache"]["tmpfs"] == ["/tmp"]
     assert out["services"]["cache"]["depends_on"] == {"postgres": {"condition": "service_started", "required": True}}
+    # a $$ (compose's way to write one literal $, uninterpolated here) stays one $
+    rc, out, err = services({"services": {"db": svc(environment={"A": "a$$b", "B": "$$$$", "C": "$x$$y",
+                                                                 "D": "$$$z"},
+                                                    command="sh -c 'echo $$HOME'",
+                                                    labels={"app": "x$$", "boxen-ish": "com.docker.compose.y"})}})
+    assert rc == 0, err
+    db = out["services"]["db"]
+    assert db["environment"] == {"A": "a$$b", "B": "$$$$", "C": "$$x$$y", "D": "$$$$z"}
+    assert db["command"] == "sh -c 'echo $$HOME'"
+    assert db["labels"] == {"app": "x$$", "boxen-ish": "com.docker.compose.y"}
     # nothing at all
     assert services({"services": None})[:2] == (0, {"services": {}, "volumes": {}})
 
@@ -314,7 +414,12 @@ def test_services_ok():
     ("boxen-x", svc(), "names starting with 'boxen' are reserved"),
     ("Bad", svc(), "name must match"),
     ("db", svc(volumes=[{"type": "volume", "source": "home", "target": "/x"}]),
-     "'home' is the build container's own volume"),
+     "'home' is reserved for the build container"),
+    ("db", svc(volumes=[{"type": "volume", "source": "cache", "target": "/x"}]),
+     "'cache' is reserved for the build container"),
+    ("db", svc(labels={"com.docker.compose.project": "boxen-other"}), "labels starting with com.docker.compose."),
+    ("db", svc(labels=["boxen.project=other"]), "labels starting with com.docker.compose. or boxen. are reserved"),
+    ("db", svc(labels={"boxen.x": None}), "are reserved"),
     ("db", svc(volumes=[{"type": "bind", "source": "/etc", "target": "/x"}]), "/etc is a host path"),
     ("db", svc(volumes=[{"type": "bind", "source": "/run/user/1000/docker.sock", "target": "/s"}]),
      "the Docker socket can't be mounted"),
@@ -365,7 +470,7 @@ def test_services_document_level():
 # ------------------------------------------------------------ static checks
 
 SHELL = ["bin/boxen", "lib/github.sh", "lib/doctor.sh", "lib/migrate.sh", "tools/mac-to-boxen", "bin/boxen-gh",
-         "image/boxen-bg", "install.sh"]
+         "image/boxen-bg", "image/boxen-exec", "install.sh"]
 
 
 @pytest.mark.skipif(shutil.which("shellcheck") is None, reason="shellcheck isn't installed")
@@ -392,5 +497,5 @@ def test_syntax():
 
 def test_scripts_are_executable():
     for f in ("bin/boxen", "bin/boxen-gh", "bin/boxen-services", "bin/boxen-gitscan", "bin/boxen-carry",
-              "image/boxen-bg", "install.sh"):
+              "image/boxen-bg", "image/boxen-exec", "install.sh"):
         assert os.access(os.path.join(REPO, f), os.X_OK), f

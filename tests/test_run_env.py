@@ -2,11 +2,15 @@
 project of the folder they're run in."""
 import json
 import os
+import re
+import signal
 import shlex
 import subprocess
 import time
 
-from conftest import BOXEN, hold_lock, wait_for
+import pytest
+
+from conftest import BOXEN, group_members, hold_lock, wait_for
 
 EXEC_PREFIX = ["bash", "-lc", 'exec "$@"', "boxen-run"]
 
@@ -26,18 +30,29 @@ def test_run_refuses_outside_a_project(vm):
     assert execs(vm) == []
 
 
+def supervised(call):
+    """(argv without the run id, the id) of a `boxen run` exec without a
+    terminal: docker exec ... CONTAINER boxen-exec ID bash -lc ..."""
+    i = call.index("boxen-exec")
+    return call[:i + 1] + call[i + 2:], call[i + 1]
+
+
 def test_run_maps_the_folder(vm):
     sub = vm.src / "alpha" / "sub dir"
     sub.mkdir()
     r = vm.ok("run", "make", "-j4", cwd=sub)
     assert r.stdout == ""
-    assert execs(vm) == [["exec", "-i", "-w", str(sub), "-e", "TERM=xterm-test", "boxen.alpha.env"]
-                         + EXEC_PREFIX + ["make", "-j4"]]
-    # through a symlink: the physical path
+    (call,) = execs(vm)
+    argv, rid = supervised(call)
+    assert argv == ["exec", "-i", "-w", str(sub), "-e", "TERM=xterm-test", "boxen.alpha.env", "boxen-exec"] \
+        + EXEC_PREFIX + ["make", "-j4"]
+    assert re.fullmatch("[0-9a-f]{24}", rid)
+    # through a symlink: the physical path; a new id each time
     os.symlink(sub, vm.tmp / "link")
     vm.clear_logs()
     vm.ok("run", "true", cwd=vm.tmp / "link")
     assert execs(vm)[0][3] == str(sub)
+    assert supervised(execs(vm)[0])[1] != rid
     # no TERM: dumb
     vm.clear_logs()
     env = dict(vm.env)
@@ -47,19 +62,79 @@ def test_run_maps_the_folder(vm):
 
 
 def test_run_arguments_survive(vm):
-    """The exec argv, run for real by the fake (bash -lc 'exec "$@"'):
-    spaces, quotes, $ and globs reach the command as they were."""
+    """The exec argv, run for real by the fake (through image/boxen-exec and
+    bash -lc 'exec "$@"'): spaces, quotes, $ and globs reach the command as
+    they were, and so do stdin, the exit code and the folder."""
     (vm.fake / "exec-local").write_text("")
     args = ["a b", "it's", 'say "hi"', "$HOME", "*", "", "-x", "back\\slash", "new\nline"]
     r = vm.boxen("run", "printf", "[%s]", *args, cwd=vm.src / "alpha")
     assert r.returncode == 0, r.stderr
     assert r.stdout == "".join("[%s]" % a for a in args)
-    # the exit code comes back
     r = vm.boxen("run", "sh", "-c", "exit 7", cwd=vm.src / "alpha")
     assert r.returncode == 7
-    # and the folder
     r = vm.boxen("run", "pwd", cwd=vm.src / "alpha")
     assert r.stdout == str(vm.src / "alpha") + "\n"
+    # stdin reaches the command, though docker exec runs as a background job
+    r = vm.boxen("run", "sh", "-c", "tr a-z A-Z; echo rc=$?", cwd=vm.src / "alpha", input="hello\nthere\n")
+    assert r.returncode == 0 and r.stdout == "HELLO\nTHERE\nrc=0\n", r.stderr
+    # each run's id file is gone after it exits
+    assert os.listdir(vm.fake / "exec") == []
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+def test_run_interrupted_kills_the_command(vm, sig):
+    """Claude interrupts `boxen run` with a signal: the client calls
+    boxen-exec --kill with its run id, and the command's whole process group
+    in the container ends; the client exits 130."""
+    (vm.fake / "exec-local").write_text("")
+    p = subprocess.Popen([BOXEN, "run", "sh", "-c", "sleep 60 & sleep 60; wait"], env=vm.env,
+                         cwd=vm.src / "alpha", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    d = vm.fake / "exec"
+
+    def pid_file():
+        try:
+            return [f for f in os.listdir(d) if (d / f).read_text().strip()]
+        except OSError:
+            return []
+    try:
+        assert wait_for(pid_file)
+        (rid,) = os.listdir(d)
+        pgid = int((d / rid).read_text())
+        assert wait_for(lambda: len(group_members(pgid)) >= 3)        # sh, two sleeps
+        p.send_signal(sig)
+        out, err = p.communicate(timeout=20)
+        assert p.returncode == 130, err
+        assert ["exec", "boxen.alpha.env", "boxen-exec", "--kill", rid] in execs(vm)
+        assert wait_for(lambda: group_members(pgid) == [])
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+        for f in pid_file():
+            try:
+                os.killpg(int((d / f).read_text()), 9)
+            except (OSError, ValueError):
+                pass
+
+
+def test_run_interrupted_while_docker_waits(vm):
+    """docker exec still waiting (nothing runs: the fake sleeps): the --kill
+    call goes out with the id that run used."""
+    from conftest import write_exe
+    real = vm.bin / "docker"
+    os.rename(real, vm.bin / "docker.real")
+    write_exe(str(real), '#!/bin/sh\n"$(dirname "$0")/docker.real" "$@"\n'
+                         'case "$1 $8" in "exec boxen-exec") exec sleep 30 ;; esac\n')
+    p = subprocess.Popen([BOXEN, "run", "make"], env=vm.env, cwd=vm.src / "alpha", stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert wait_for(lambda: len(execs(vm)) == 1)
+    time.sleep(0.3)
+    p.terminate()
+    p.communicate(timeout=20)
+    assert p.returncode == 130
+    first, kill = execs(vm)
+    assert kill == ["exec", "boxen.alpha.env", "boxen-exec", "--kill", supervised(first)[1]]
 
 
 def test_run_dash_c(vm):
@@ -101,6 +176,12 @@ def test_run_usage(vm):
     assert r.returncode == 1 and "usage: boxen run --stop NAME" in r.stderr
     r = vm.boxen("run", "--ps", "x", cwd=a)
     assert r.returncode == 1 and "usage: boxen run --ps" in r.stderr
+    # usage errors come before anything starts: beta isn't running
+    vm.clear_logs()
+    for args in ([], ["-d", "web"], ["--stop", "web", "x"], ["--ps", "x"]):
+        r = vm.boxen("run", *args, cwd=vm.src / "beta")
+        assert r.returncode == 1 and "usage: boxen run" in r.stderr, args
+    assert vm.docker_calls() == []
 
 
 def test_run_background_commands(vm):
@@ -139,7 +220,7 @@ def test_run_starts_the_container(vm):
     assert r.returncode == 0, r.stderr
     assert r.stdout == "out\n"
     assert "boxen: starting beta's build container..." in r.stderr and "beta: build container up" in r.stderr
-    assert [x["args"] for x in vm.compose_calls()] == [["build"], ["up", "-d", "--remove-orphans"]]
+    assert [x["args"] for x in vm.compose_calls()] == [["build", "env"], ["up", "-d", "--remove-orphans"]]
     calls = vm.docker_calls()
     assert calls.index(["inspect", "-f", "{{.State.Running}}", "boxen.beta.env"]) < \
         [i for i, c in enumerate(calls) if c[0] == "compose"][0]
@@ -162,7 +243,7 @@ def test_run_waits_for_the_lock(vm):
         f.close()
     out, err = p.communicate(timeout=30)
     assert p.returncode == 0, err
-    assert [x["args"][0] for x in vm.compose_calls()] == ["build", "up"]
+    assert [x["args"] for x in vm.compose_calls()] == [["build", "env"], ["up", "-d", "--remove-orphans"]]
 
 
 def test_run_start_failure(vm):
@@ -197,7 +278,7 @@ def test_env_apply(vm):
     a = vm.src / "alpha"
     r = vm.ok("env", "apply", cwd=a / ".boxen")
     assert r.stdout.endswith("alpha: environment applied\n")
-    assert [x["args"] for x in vm.compose_calls()] == [["build"], ["up", "-d", "--remove-orphans"]]
+    assert [x["args"] for x in vm.compose_calls()] == [["build", "env"], ["up", "-d", "--remove-orphans"]]
     assert not (vm.pdir("alpha") / "compose.services.yaml").exists()      # nothing declared now
     r = vm.boxen("env", "apply", "now", cwd=a)
     assert r.returncode == 1 and "usage: boxen env apply" in r.stderr
@@ -236,6 +317,54 @@ def test_env_apply_with_sidecars(vm):
     vm.ok("env", "apply", cwd=a)
     assert not (pdir / "compose.services.yaml").exists()
     assert not any(c[0] == "run" for c in vm.docker_calls())
+
+
+def test_failed_build_keeps_the_sidecars(vm):
+    """The new sidecars are staged (compose.services.yaml.new) and put in
+    place only once the build worked: a failed build leaves the running
+    definition as it was, and so does one that would remove every sidecar."""
+    a = vm.src / "alpha"
+    pdir = vm.pdir("alpha")
+    before = (pdir / "compose.services.yaml").read_text()           # db
+    (a / ".boxen" / "services.yaml").write_text(PG_YAML)
+    vm.set_docker(compose_config=PG_CONFIG, fail=["build"])
+    r = vm.boxen("env", "apply", cwd=a)
+    assert r.returncode == 1 and "building alpha's build container (.boxen/Dockerfile) failed" in r.stderr
+    assert (pdir / "compose.services.yaml").read_text() == before
+    assert [x["args"] for x in vm.compose_calls()] == [["build", "env"]]          # no up
+    # no sidecars any more, and the build fails: still the old file
+    vm.clear_logs()
+    (a / ".boxen" / "services.yaml").write_text("# none\n")
+    r = vm.boxen("env", "apply", cwd=a)
+    assert r.returncode == 1 and (pdir / "compose.services.yaml").read_text() == before
+    # the build works: now it goes, and nothing is left staged
+    vm.set_docker(fail=[])
+    vm.ok("env", "apply", cwd=a)
+    assert not (pdir / "compose.services.yaml").exists()
+    assert sorted(f for f in os.listdir(pdir) if f.startswith("compose.services")) == []
+    # and with sidecars: in place before up, which uses them
+    vm.clear_logs()
+    (a / ".boxen" / "services.yaml").write_text(PG_YAML)
+    vm.set_docker(compose_config=PG_CONFIG)
+    vm.ok("env", "apply", cwd=a)
+    build, up = vm.compose_calls()
+    assert build["files"] == [str(pdir / "compose.yaml")]
+    assert up["files"] == [str(pdir / "compose.yaml"), str(pdir / "compose.services.yaml")]
+    assert "postgres" in json.loads((pdir / "compose.services.yaml").read_text())["services"]
+    assert not (pdir / "compose.services.yaml.new").exists()
+
+
+def test_rejected_services_leave_nothing_staged(vm):
+    a = vm.src / "alpha"
+    pdir = vm.pdir("alpha")
+    (pdir / "compose.services.yaml.new").write_text("stale\n")            # from an earlier failure
+    (a / ".boxen" / "services.yaml").write_text(PG_YAML)
+    bad = json.loads(json.dumps(PG_CONFIG))
+    bad["services"]["postgres"]["privileged"] = True
+    vm.set_docker(compose_config=bad)
+    r = vm.boxen("env", "apply", cwd=a)
+    assert r.returncode == 1 and "privileged isn't allowed" in r.stderr
+    assert not (pdir / "compose.services.yaml.new").exists()
 
 
 def test_env_apply_rejects_bad_services(vm):

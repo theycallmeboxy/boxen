@@ -97,10 +97,25 @@ def test_seed_lazily_from_origin_then_origin_is_ignored(gh):
 
 
 def test_tokens_for_every_project(gh):
+    """Every v2 project, and the v1 ones until they're migrated (their
+    containers read the same token files), but not v1's supervisor."""
+    subprocess.run(["git", "-C", str(gh.src / "old"), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(gh.src / "old"), "remote", "add", "origin",
+                    "https://github.com/myorg/old.git"], check=True)
+    sup = gh.pdir("supervisor")
+    sup.mkdir()
+    (sup / "compose.yaml").write_text("name: boxen-supervisor\n")
     r = gh.ok("tokens")
     assert listed(gh) == ["theycallmeboxy/alpha"]
     assert listed(gh, "beta") == []                     # no origin: an empty list
-    assert not (gh.pdir("old") / "repos").exists()        # v1 projects are left alone
+    assert listed(gh, "old") == ["myorg/old"]
+    assert tokens(gh, "old") == {"gh-token": "tok-myorg-old", "gh-token.myorg": "tok-myorg-old"}
+    assert not (sup / "repos").exists() and not (sup / "token").exists()
+    assert "old" in r.stdout and "supervisor" not in r.stdout
+    # the timer's run covers them too
+    (gh.pdir("old") / "token" / "gh-token").unlink()
+    gh.ok("tokens", "--quiet")
+    assert (gh.pdir("old") / "token" / "gh-token").exists()
     assert "beta" in r.stdout and "no GitHub repos listed" in r.stdout
     # a list that exists is never reseeded
     (gh.pdir("alpha") / "repos").write_text("myorg/x\n")
@@ -321,3 +336,11 @@ def test_github_repo_parsing(gh):
     for url, want in cases.items():
         r = gh.fn("github_repo '%s' || echo NONE" % url)
         assert r.stdout == (want or "NONE") + "\n", url
+
+
+def test_app_manifest_permissions():
+    """The GitHub App's pre-filled permissions (cmd_github's URL)."""
+    text = open(os.path.join(REPO, "lib", "github.sh")).read()
+    for perm in ("contents=write", "pull_requests=write", "issues=write", "workflows=write", "actions=read",
+                 "checks=read", "statuses=read", "metadata=read"):
+        assert "&" + perm in text, perm

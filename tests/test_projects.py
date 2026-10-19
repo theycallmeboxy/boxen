@@ -110,14 +110,37 @@ def test_docker_unreachable(vm):
     vm.set_docker(down=True)
     r = vm.boxen("up", "alpha")
     assert r.returncode == 1 and "can't reach rootless Docker at %s" % DOCKER_HOST in r.stderr
-    # with the socket there but unreachable: the sandbox hint
+    assert "sandbox" not in r.stderr
+    # the socket there but not answering
     from conftest import unix_socket
     s = unix_socket(vm.run_dir / "docker.sock")
     try:
         r = vm.boxen("up", "alpha", env={"BOXEN_DOCKER_HOST": ""})
-        assert r.returncode == 1 and "make 'boxen run ...' the whole command line" in r.stderr
+        assert r.returncode == 1
+        assert r.stderr == "boxen: can't reach rootless Docker at unix://%s/docker.sock (systemctl --user status " \
+                           "docker)\n" % vm.run_dir
     finally:
         s.close()
+
+
+SANDBOX_HINT = ("boxen: this ran inside Claude Code's sandbox, which blocks Docker: make 'boxen run ...' (or "
+                "'boxen env ...') the whole command line, with no 'cd ... &&', pipes, redirects or $(...) around it\n")
+
+
+def test_docker_blocked_by_the_sandbox(vm):
+    """Inside Claude Code's sandbox (SANDBOX_RUNTIME set, or the socket
+    replaced by /dev/null): the hint to make boxen run the whole command."""
+    vm.set_docker(down=True)
+    r = vm.boxen("run", "make", cwd=vm.src / "beta", env={"SANDBOX_RUNTIME": "1"})
+    assert r.returncode == 1 and r.stderr == SANDBOX_HINT
+    r = vm.boxen("env", "apply", cwd=vm.src / "alpha", env={"SANDBOX_RUNTIME": "1"})
+    assert r.returncode == 1 and r.stderr == SANDBOX_HINT
+    os.symlink("/dev/null", vm.run_dir / "docker.sock")          # a character device where the socket was
+    r = vm.boxen("up", "alpha")
+    assert r.returncode == 1 and r.stderr == SANDBOX_HINT
+    # docker reachable: SANDBOX_RUNTIME alone changes nothing
+    vm.set_docker(down=False)
+    vm.ok("up", "alpha", env={"SANDBOX_RUNTIME": "1"})
 
 
 def test_docker_host_is_always_boxens(vm):
@@ -156,7 +179,7 @@ def test_new_creates_everything(vm):
     s = str(src)
     for want in ("name: boxen-gamma", "      context: %s/.boxen" % s, "    image: boxen-env-gamma:latest",
                  "    container_name: boxen.gamma.env", "    working_dir: %s" % s, "      TZ: Europe/Berlin",
-                 "      BOXEN_PROJECT: gamma", "      - %s:%s" % (s, s), "    name: boxen.gamma.home",
+                 "      BOXEN_PROJECT: gamma", "      - %s:%s" % (s, s), "    name: boxen.gamma.cache", "      - cache:/root/.cache",
                  "    hostname: gamma"):
         assert want in c.splitlines(), want
     assert "`boxen up gamma`" in (pdir / "compose.override.example.yaml").read_text()
@@ -166,11 +189,14 @@ def test_new_creates_everything(vm):
     assert "boxen repos gamma add|rm" in repos and [x for x in repos.splitlines() if not x.startswith("#")] == []
     # build, then up, with only the generated compose.yaml (services.yaml is all comments)
     cc = vm.compose_calls()
-    assert [x["args"] for x in cc] == [["build"], ["up", "-d", "--remove-orphans"]]
+    assert [x["args"] for x in cc] == [["build", "env"], ["up", "-d", "--remove-orphans"]]
     assert all(x["files"] == [str(pdir / "compose.yaml")] for x in cc)
     calls = vm.docker_calls()
     assert calls[0][:2] == ["info", "-f"]
-    assert ["compose", "--project-directory", str(pdir), "-f", str(pdir / "compose.yaml"), "build"] in calls
+    assert ["compose", "--project-directory", str(pdir), "-f", str(pdir / "compose.yaml"), "build", "env"] in calls
+    assert "home:" not in c and "/root\n" not in c
+    # the template it came from is kept, for telling hand edits later
+    assert (pdir / ".compose.template").read_text() == open(os.path.join(REPO, "templates", "compose.yaml")).read()
     assert not any(c[0] == "run" for c in calls)          # no compose config: nothing declared
     assert "gamma: build container up\n" in r.stdout
     assert "boxen claude gamma" in r.stdout
@@ -302,8 +328,9 @@ def test_up_down(vm):
     files = [str(pdir / "compose.yaml")]
     # services.yaml declares nothing now: the rendered sidecars go
     assert not (pdir / "compose.services.yaml").exists()
+    # (built with the sidecars it had; they go only once the build worked)
     assert [(x["args"], x["files"]) for x in vm.compose_calls()] == [
-        (["build"], files), (["up", "-d", "--remove-orphans"], files)]
+        (["build", "env"], files + [str(pdir / "compose.services.yaml")]), (["up", "-d", "--remove-orphans"], files)]
     vm.clear_logs()
     (pdir / "compose.override.yaml").write_text("services: {}\n")
     r = vm.ok("down", "alpha")
@@ -342,7 +369,7 @@ def test_update(vm):
     calls = vm.docker_calls()
     assert ["build", "--pull", "--no-cache", "-t", "boxen-env:core", os.path.join(REPO, "image")] in calls
     # alpha has a container: rebuilt; beta has none: its image is dropped
-    assert [x["project"] for x in vm.compose_calls() if x["args"] == ["build"]] == ["alpha"]
+    assert [x["project"] for x in vm.compose_calls() if x["args"] == ["build", "env"]] == ["alpha"]
     assert ["image", "rm", "boxen-env-beta:latest"] in calls
     assert vm.boxen("update", "alpha").returncode == 1
 
@@ -363,28 +390,78 @@ def test_needs_a_terminal(vm, cmd):
 # ------------------------------------------------- compose.yaml, self-update
 
 def test_write_compose_keeps_hand_edits(vm):
+    """The template a compose.yaml came from is kept in .compose.template:
+    a template change replaces an unedited compose.yaml quietly, and one
+    edited by hand is kept as compose.yaml.old."""
     pdir = vm.pdir("beta")
+    tmpl = os.path.join(REPO, "templates", "compose.yaml")
     (pdir / "compose.yaml").unlink()
     r = vm.fn("write_compose beta")
     assert r.returncode == 0 and r.stdout == "", r.stderr
     fresh = (pdir / "compose.yaml").read_text()
     assert fresh.startswith(FORMAT_MARK + "\n") and not (pdir / "compose.yaml.old").exists()
+    assert (pdir / ".compose.template").read_text() == open(tmpl).read()
     # unchanged: nothing kept
     vm.fn("write_compose beta")
     assert not (pdir / "compose.yaml.old").exists()
     # a template change, compose.yaml as boxen wrote it from the old template: replaced quietly
-    old_t = vm.tmp / "old-template.yaml"
-    old_t.write_text(open(os.path.join(REPO, "templates", "compose.yaml")).read() + "# old line for __NAME__\n")
-    r = vm.fn("render %s beta > %s; write_compose beta %s" % (old_t, pdir / "compose.yaml", old_t))
-    assert r.stdout == "" and (pdir / "compose.yaml").read_text() == fresh
-    assert not (pdir / "compose.yaml.old").exists()
-    # edited by hand: kept as compose.yaml.old
-    (pdir / "compose.yaml").write_text(fresh + "# my edit\n")
-    r = vm.fn("write_compose beta %s" % old_t)
-    assert "beta: compose.yaml had your edits; kept as compose.yaml.old" in r.stdout
-    assert (pdir / "compose.yaml.old").read_text() == fresh + "# my edit\n"
+    old_t = open(tmpl).read() + "# old line for __NAME__\n"
+    (pdir / ".compose.template").write_text(old_t)
+    r = vm.fn("render %s beta > %s; write_compose beta" % (pdir / ".compose.template", pdir / "compose.yaml"))
+    assert r.returncode == 0 and r.stdout == "", r.stderr
     assert (pdir / "compose.yaml").read_text() == fresh
-    assert not [f for f in os.listdir(pdir) if f.startswith(".compose")]
+    assert not (pdir / "compose.yaml.old").exists()
+    assert (pdir / ".compose.template").read_text() == open(tmpl).read()
+    # edited by hand (with or without a template change): kept as compose.yaml.old
+    for template in (old_t, None):
+        (pdir / "compose.yaml.old").unlink(missing_ok=True)
+        if template:
+            (pdir / ".compose.template").write_text(template)
+        (pdir / "compose.yaml").write_text(fresh + "# my edit\n")
+        r = vm.fn("write_compose beta")
+        assert "beta: compose.yaml had your edits; kept as compose.yaml.old" in r.stdout
+        assert (pdir / "compose.yaml.old").read_text() == fresh + "# my edit\n"
+        assert (pdir / "compose.yaml").read_text() == fresh
+    # no template kept (a project from before): any difference counts as an edit
+    (pdir / ".compose.template").unlink()
+    (pdir / "compose.yaml.old").unlink()
+    (pdir / "compose.yaml").write_text(fresh + "# x\n")
+    assert "had your edits" in vm.fn("write_compose beta").stdout
+    assert not [f for f in os.listdir(pdir) if f.startswith(".compose.") and f != ".compose.template"]   # no temp files
+    # a template it can't render leaves everything as it was
+    bad = vm.tmp / "repo"
+    (bad / "templates").mkdir(parents=True)
+    (bad / "templates" / "compose.yaml").write_text("x: __NOPE__\n")
+    r = vm.fn("BOXEN_REPO=%s; write_compose beta || echo failed" % bad)
+    assert "failed" in r.stdout and (pdir / "compose.yaml").read_text() == fresh
+    assert not [f for f in os.listdir(pdir) if f.startswith(".compose.") and f != ".compose.template"]
+    # a kept template this boxen can't render (a placeholder it doesn't know
+    # any more): its compose.yaml counts as edited, nothing breaks
+    (pdir / ".compose.template").write_text("x: __GONE__\n")
+    (pdir / "compose.yaml").write_text("x: something\n")
+    r = vm.fn("write_compose beta && echo ok")
+    assert r.stdout.endswith("ok\n") and "had your edits" in r.stdout
+    assert (pdir / "compose.yaml").read_text() == fresh
+
+
+def test_setup_rewrites_every_compose_yaml(vm):
+    """boxen setup (which install.sh and self-update run) rewrites every v2
+    project's compose.yaml; a busy one is skipped with a warning."""
+    for n in ("alpha", "beta"):
+        (vm.pdir(n) / "compose.yaml").unlink()
+        assert vm.fn("write_compose %s" % n).returncode == 0
+    (vm.pdir("beta") / "compose.yaml").write_text(FORMAT_MARK + "\n# mine\n")
+    r = vm.ok("setup")
+    assert "beta: compose.yaml had your edits; kept as compose.yaml.old" in r.stdout
+    assert (vm.pdir("beta") / "compose.yaml.old").read_text() == FORMAT_MARK + "\n# mine\n"
+    assert not (vm.pdir("alpha") / "compose.yaml.old").exists()
+    assert "container_name: boxen.beta.env" in (vm.pdir("beta") / "compose.yaml").read_text()
+    assert (vm.pdir("old") / "compose.yaml").read_text().startswith("name: boxen-old")      # v1: untouched
+    (vm.pdir("beta") / "compose.yaml").write_text(FORMAT_MARK + "\n# mine again\n")
+    with hold_lock(vm.pdir("beta") / ".lock"):
+        r = vm.ok("setup")
+    assert "beta: couldn't update its compose.yaml (busy?)" in r.stderr
+    assert (vm.pdir("beta") / "compose.yaml").read_text() == FORMAT_MARK + "\n# mine again\n"
 
 
 def test_render_refuses_unknown_placeholders(vm):
@@ -417,8 +494,9 @@ def lock_holders(path):
 
 def test_self_update_leaves_no_lock_behind(vm):
     """self-update runs the new install.sh, which may leave a daemon
-    running: it must not inherit the global lock. Projects get their
-    compose.yaml rewritten (and rebuilt, if templates/compose.yaml changed)."""
+    running: it must not inherit the global lock. The new installer's setup
+    rewrites every compose.yaml; the ones with a container are rebuilt,
+    since templates/compose.yaml changed."""
     import shutil
     import subprocess
     work = vm.tmp / "work"
@@ -436,7 +514,9 @@ def test_self_update_leaves_no_lock_behind(vm):
     other = vm.tmp / "other"
     subprocess.run(["git", "clone", "-q", str(up), str(other)], check=True)
     pidfile = vm.fake / "daemon.pid"
-    (other / "install.sh").write_text("#!/bin/bash\nnohup sleep 60 >/dev/null 2>&1 &\necho $! > %s\ndisown\n" % pidfile)
+    # like the real one: boxen setup, and (the case at hand) something left running
+    (other / "install.sh").write_text('#!/bin/bash\nset -e\n"$(dirname "$0")/bin/boxen" setup\n'
+                                      "nohup sleep 60 >/dev/null 2>&1 &\necho $! > %s\ndisown\n" % pidfile)
     with open(other / "templates" / "compose.yaml", "a") as f:
         f.write("# a new line for __NAME__\n")
     go = ["git", "-C", str(other), "-c", "user.email=t@t", "-c", "user.name=t"]
@@ -462,7 +542,7 @@ def test_self_update_leaves_no_lock_behind(vm):
         assert (vm.pdir("beta") / "compose.yaml.old").read_text() == FORMAT_MARK + "\n# mine\n"
         assert not (vm.pdir("alpha") / "compose.yaml.old").exists()
         # the template changed: alpha (which has a container) is rebuilt, beta isn't
-        assert [x["project"] for x in vm.compose_calls() if x["args"] == ["build"]] == ["alpha"]
+        assert [x["project"] for x in vm.compose_calls() if x["args"] == ["build", "env"]] == ["alpha"]
         r = vm.boxen("self-update")         # (this checkout isn't a clone with upstream: fails, not busy)
         assert "busy" not in r.stderr
     finally:

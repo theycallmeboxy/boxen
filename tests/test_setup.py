@@ -1,5 +1,6 @@
-"""`boxen setup`: the base image, Claude Code's settings (the sandbox),
-boxen.md, and git settings for ~/src. All in a temp HOME."""
+"""`boxen setup`: the base image, Claude Code's settings (and the managed
+settings with the sandbox), boxen.md, and git settings for ~/src. All in a
+temp HOME."""
 import json
 import os
 import stat
@@ -15,37 +16,25 @@ def settings(vm):
 
 
 def test_setup_fresh(vm):
-    r = vm.ok("setup")
+    vm.ok("setup")
     calls = vm.docker_calls()
     assert ["compose", "version"] in calls
     assert ["build", "-t", "boxen-env:core", os.path.join(REPO, "image")] in calls
     assert ["tag", "boxen-env:core", "boxen-env:latest"] in calls
-    s = settings(vm)
-    assert s["sandbox"]["enabled"] is True
-    assert s["sandbox"]["failIfUnavailable"] is True
-    assert s["sandbox"]["allowUnsandboxedCommands"] is False
-    assert s["sandbox"]["excludedCommands"] == ["boxen run *", "boxen env *"]
-    assert s["sandbox"]["network"]["allowedDomains"] == ["github.com", "api.github.com", "*.githubusercontent.com"]
-    assert s["sandbox"]["filesystem"]["denyRead"] == [str(vm.run_dir / "docker.sock")]
-    assert s["sandbox"]["credentials"]["files"] == [
-        {"path": "~/.ssh", "mode": "deny"}, {"path": "~/.config/gh", "mode": "deny"},
-        {"path": str(vm.bhome / "github"), "mode": "deny"}]
-    assert s["permissions"]["allow"] == ["Bash(boxen run *)", "Bash(boxen env *)"]
-    assert s["remoteControlAtStartup"] is True and s["cleanupPeriodDays"] == 365
+    # your settings get two defaults, nothing of the sandbox (that's managed)
+    assert settings(vm) == {"cleanupPeriodDays": 365, "remoteControlAtStartup": True}
     c = vm.home / ".claude"
     assert (c / "CLAUDE.md").read_text() == "@boxen.md\n"
     assert (c / "boxen.md").read_text() == open(BOXEN_MD).read()
     assert (c / "skills" / "carry" / "SKILL.md").read_text() == open(os.path.join(REPO, "skills", "carry",
                                                                                   "SKILL.md")).read()
-    assert "Claude settings: sandbox on" in r.stdout
     # no systemd user session here: cron refreshes tokens
     cron = (vm.fake / "crontab").read_text()
     assert cron.count("# boxen-tokens") == 2 and "tokens --quiet" in cron
     # boxen setup again changes nothing
     before = (c / "settings.json").read_text()
-    r = vm.ok("setup")
+    vm.ok("setup")
     assert (c / "settings.json").read_text() == before
-    assert "Claude settings" not in r.stdout
     assert (vm.fake / "crontab").read_text().count("# boxen-tokens") == 2
 
 
@@ -56,38 +45,27 @@ def test_setup_refuses_a_daemon_that_isnt_rootless(vm):
     assert not (vm.home / ".claude").exists()
 
 
-def test_settings_merge_keeps_yours(vm):
+def test_settings_keeps_yours(vm):
+    """Only cleanupPeriodDays and remoteControlAtStartup, and only when
+    unset; everything else in your settings.json is left as it is."""
     c = vm.home / ".claude"
     c.mkdir()
-    mine = {
-        "model": "opus", "env": {"FOO": "1"},
-        "sandbox": {"enabled": False, "allowUnsandboxedCommands": True, "excludedCommands": ["make *", "boxen run *"],
-                    "network": {"allowedDomains": ["pypi.org", "github.com"], "allowUnixSockets": ["/x"]},
-                    "filesystem": {"denyRead": ["~/secret"]}, "autoAllowBashIfSandboxed": True},
-        "permissions": {"allow": ["Bash(ls)"], "deny": ["Read(~/.aws)"]},
-        "remoteControlAtStartup": False, "cleanupPeriodDays": 30,
-    }
+    mine = {"model": "opus", "sandbox": {"enabled": False, "excludedCommands": ["make *"]},
+            "permissions": {"allow": ["Bash(ls)"]}, "remoteControlAtStartup": False, "cleanupPeriodDays": 30}
     (c / "settings.json").write_text(json.dumps(mine))
     os.chmod(c / "settings.json", 0o640)
     vm.ok("setup")
-    s = settings(vm)
-    assert s["model"] == "opus" and s["env"] == {"FOO": "1"}
-    assert s["remoteControlAtStartup"] is False and s["cleanupPeriodDays"] == 30
-    sb = s["sandbox"]
-    assert (sb["enabled"], sb["failIfUnavailable"], sb["allowUnsandboxedCommands"]) == (True, True, False)
-    assert sb["autoAllowBashIfSandboxed"] is True
-    assert sb["excludedCommands"] == ["make *", "boxen run *", "boxen env *"]
-    assert sb["network"] == {"allowedDomains": ["pypi.org", "github.com", "api.github.com",
-                                                "*.githubusercontent.com"], "allowUnixSockets": ["/x"]}
-    assert sb["filesystem"]["denyRead"] == ["~/secret", str(vm.run_dir / "docker.sock")]
-    assert s["permissions"] == {"allow": ["Bash(ls)", "Bash(boxen run *)", "Bash(boxen env *)"],
-                                "deny": ["Read(~/.aws)"]}
+    assert settings(vm) == mine                                          # nothing to add
+    mine2 = {"model": "opus", "cleanupPeriodDays": 0, "permissions": {"deny": ["Read(~/.aws)"]}}
+    (c / "settings.json").write_text(json.dumps(mine2))
+    vm.ok("setup")
+    assert settings(vm) == dict(mine2, remoteControlAtStartup=True)     # 0 is a value: kept
     assert stat.S_IMODE((c / "settings.json").stat().st_mode) == 0o640
     assert not [f for f in os.listdir(c) if f.startswith(".settings")]
-    # again: no duplicates, nothing changed
-    before = (c / "settings.json").read_text()
-    vm.ok("setup")
-    assert (c / "settings.json").read_text() == before
+    # CLAUDE_CONFIG_DIR is honored
+    other = vm.tmp / "cc"
+    vm.ok("setup", env={"CLAUDE_CONFIG_DIR": str(other)})
+    assert json.loads((other / "settings.json").read_text())["cleanupPeriodDays"] == 365
 
 
 def test_settings_refuses_non_object(vm):
@@ -96,27 +74,53 @@ def test_settings_refuses_non_object(vm):
     for text in ("[1, 2]\n", "\"x\"\n", "{not json\n", "null\n"):
         (c / "settings.json").write_text(text)
         r = vm.ok("setup")
-        assert "isn't a JSON object, so boxen's sandbox settings are NOT applied" in r.stderr, text
+        assert "settings.json isn't a JSON object; leaving it alone" in r.stderr, text
         assert (c / "settings.json").read_text() == text
     # an empty file is a fresh start
     (c / "settings.json").write_text("")
     vm.ok("setup")
-    assert settings(vm)["sandbox"]["enabled"] is True
+    assert settings(vm)["cleanupPeriodDays"] == 365
 
 
-def test_settings_include_system_docker_sockets(vm):
-    """Every Docker socket on the VM is denied: the rootless one, and the
-    system one where it exists (checked with the function: this VM has none)."""
-    r = vm.fn("claude_settings && cat \"$CLAUDE_DIR/settings.json\"")
-    assert r.returncode == 0, r.stderr
-    deny = json.loads(r.stdout[r.stdout.index("{"):])["sandbox"]["filesystem"]["denyRead"]
-    want = [str(vm.run_dir / "docker.sock")] + [p for p in ("/var/run/docker.sock", "/run/docker.sock")
-                                                if os.path.exists(p)]
-    assert deny == want
-    # CLAUDE_CONFIG_DIR is honored
-    other = vm.tmp / "cc"
-    vm.ok("setup", env={"CLAUDE_CONFIG_DIR": str(other)})
-    assert json.loads((other / "settings.json").read_text())["sandbox"]["enabled"] is True
+def test_managed_settings(vm):
+    r = vm.ok("managed-settings")
+    m = json.loads(r.stdout)
+    uid = os.getuid()
+    assert m == {
+        "sandbox": {
+            "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+            "excludedCommands": ["boxen run *", "boxen env *"],
+            "network": {"allowedDomains": ["github.com", "api.github.com", "*.githubusercontent.com"]},
+            "filesystem": {"denyRead": [str(vm.run_dir), "/tmp/tmux-%d" % uid, "/var/run/docker.sock",
+                                        "/run/docker.sock"]},
+            "credentials": {
+                "files": [{"path": "~/.ssh", "mode": "deny"}, {"path": "~/.config/gh", "mode": "deny"},
+                          {"path": str(vm.bhome / "github"), "mode": "deny"}],
+                "envVars": [{"name": n, "mode": "deny"} for n in
+                            ("GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")]}},
+        "permissions": {"allow": ["Bash(boxen run *)", "Bash(boxen env *)"],
+                        "disableBypassPermissionsMode": "disable"}}
+    # the runtime folder covers rootless Docker's socket
+    assert (vm.run_dir / "docker.sock").parent == vm.run_dir
+    # no XDG_RUNTIME_DIR: /run/user/<uid>
+    env = dict(vm.env)
+    del env["XDG_RUNTIME_DIR"]
+    r = subprocess.run([BOXEN, "managed-settings"], env=env, capture_output=True, text=True, check=True)
+    assert json.loads(r.stdout)["sandbox"]["filesystem"]["denyRead"][0] == "/run/user/%d" % uid
+    # needs nothing else: no Docker, no project
+    vm.set_docker(down=True)
+    assert json.loads(vm.ok("managed-settings", cwd=vm.tmp).stdout) == m
+
+
+def test_install_sh_installs_managed_settings():
+    text = open(os.path.join(REPO, "install.sh")).read()
+    assert '"$REPO_DIR/bin/boxen" managed-settings > "$tmp"' in text
+    assert 'managed=/etc/claude-code/managed-settings.d/boxen.json' in text
+    assert 'sudo install -D -m 0644 "$tmp" "$managed"' in text
+    # after setup (which needs nothing of it), before the ui
+    assert text.index('"$REPO_DIR/bin/boxen" setup') < text.index("managed-settings > ") < \
+        text.index('"$REPO_DIR/ui/install-venv.sh"')
+    assert 'MANAGED="/etc/claude-code/managed-settings.d/boxen.json"' in open(BOXEN).read()
 
 
 def test_claude_config(vm):
@@ -229,3 +233,39 @@ def test_setup_with_systemd_user_services(vm):
     m = (u / "boxen-tokens.service").stat().st_mtime_ns
     vm.ok("setup")
     assert (u / "boxen-tokens.service").stat().st_mtime_ns == m
+
+
+def test_gitconfig_include_stays_last(vm):
+    """Credential helpers added to ~/.gitconfig after boxen's include (yours,
+    or gh auth setup-git's) would come after boxen's: setup moves the
+    include back to the end, and in a project git asks only boxen."""
+    vm.ok("setup")
+    gcfg = vm.home / ".gitconfig"
+    inc = "includeIf.gitdir:%s/.path" % vm.src
+    with open(gcfg, "a") as f:
+        f.write('[credential]\n\thelper = "!echo password=USERS; true"\n'
+                '[credential "https://github.com"]\n\thelper =\n\thelper = "!echo password=GH; true"\n')
+
+    def helpers(cwd):
+        return subprocess.run(["git", "config", "--get-all", "credential.https://github.com.helper"], cwd=cwd,
+                              env=vm.env, capture_output=True, text=True).stdout.splitlines()
+    a = vm.src / "beta"
+    subprocess.run(["git", "init", "-q", str(a)], check=True)
+    assert helpers(a)[-1] == "!echo password=GH; true"                  # gh's wins: the problem
+    r = vm.ok("setup")
+    assert "repos under %s use boxen's git settings" % vm.src in r.stdout
+    text = gcfg.read_text()
+    assert text.rstrip().endswith("path = %s" % (vm.bhome / "gitconfig"))
+    assert git_global(vm, "--get-all", inc) == str(vm.bhome / "gitconfig") + "\n"     # once
+    assert helpers(a)[-2:] == ["", "!%s git-credential" % BOXEN]
+    # beta has no token: boxen says quit, so git asks nobody else (not your login)
+    fill = subprocess.run(["git", "credential", "fill"], cwd=a, env=dict(vm.env, GIT_TERMINAL_PROMPT="0"),
+                          input="url=https://github.com/a/b\n\n", capture_output=True, text=True)
+    assert fill.returncode != 0 and "USERS" not in fill.stdout and "GH" not in fill.stdout
+    # last already (git reports it in lower case): left alone
+    r = vm.ok("setup")
+    assert "use boxen's git settings" not in r.stdout and gcfg.read_text() == text
+    # outside ~/src your helpers are yours
+    out = vm.tmp / "elsewhere"
+    subprocess.run(["git", "init", "-q", str(out)], check=True)
+    assert helpers(out)[-1] == "!echo password=GH; true"

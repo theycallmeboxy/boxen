@@ -2,11 +2,12 @@
 system Docker daemon) to v2, with a fake v1 daemon behind `docker -H`."""
 import json
 import os
+import re
 import subprocess
 
 import pytest
 
-from conftest import FORMAT_MARK, REPO, unix_socket
+from conftest import BOXEN, FORMAT_MARK, REPO, unix_socket
 
 MIGRATE = os.path.join(REPO, "lib", "migrate.sh")
 
@@ -87,8 +88,10 @@ def v1(vm):
         "images": ["boxen-base:latest"],
         "volumes": {
             "claude-config": {
-                "settings.json": json.dumps({"model": "opus", "permissions": {"allow": ["Bash(npm *)"]},
-                                             "theme": "v1"}),
+                "settings.json": json.dumps({
+                    "model": "opus", "theme": "v1", "env": {"A": "1"},
+                    "permissions": {"allow": ["Bash(*)", "Edit"], "defaultMode": "bypassPermissions"},
+                    "sandbox": {"enabled": False}, "skipDangerousModePermissionPrompt": True}),
                 ".claude.json": json.dumps({"oauthAccount": "v1", "projects": {"/home/claude/old": {"t": 1}}}),
                 "CLAUDE.md": "# v1 notes\n",
                 "boxen.md": "v1's boxen.md\n",
@@ -159,10 +162,14 @@ def test_migrate(v1):
     # Claude's config came across
     c = vm.home / ".claude"
     s = json.loads((c / "settings.json").read_text())
-    assert s["model"] == "opus" and s["theme"] == "vm"                  # v1's keys, the VM's values win
-    assert s["permissions"]["allow"][:2] == ["Bash(npm *)", "Bash(boxen run *)"]
-    assert s["sandbox"]["enabled"] is True                              # and boxen's settings on top
-    assert json.loads((c / "settings.json.v1").read_text())["theme"] == "v1"
+    # v1's keys, the VM's values win; v1's permission and sandbox settings (for
+    # a container) don't come across; boxen's two defaults on top
+    assert s == {"model": "opus", "theme": "vm", "env": {"A": "1"},
+                 "permissions": {"allow": ["Bash(boxen run *)"]},
+                 "cleanupPeriodDays": 365, "remoteControlAtStartup": True}
+    assert "v1's permission and sandbox settings were for a container and aren't carried over" in r.stdout
+    v1s = json.loads((c / "settings.json.v1").read_text())
+    assert v1s["theme"] == "v1" and v1s["permissions"]["defaultMode"] == "bypassPermissions"   # all of it
     assert json.loads((vm.home / ".claude.json").read_text())["oauthAccount"] == "v1"
     assert (c / "CLAUDE.md").read_text() == "# v1 notes\n\n@boxen.md\n"
     assert (c / "boxen.md").read_text() == open(os.path.join(REPO, "templates", "boxen.md")).read()
@@ -176,6 +183,28 @@ def test_migrate(v1):
     assert r.returncode == 0, r.stderr
     assert "Claude config: moved already" in r.stdout
     assert vm.compose_calls() == []
+
+
+def test_migrate_settings_without_vm_settings(v1):
+    """No settings.json on the VM yet: v1's, minus its permissions."""
+    (v1.home / ".claude" / "settings.json").unlink()
+    r = migrate(v1)
+    assert r.returncode == 0, r.stderr
+    s = json.loads((v1.home / ".claude" / "settings.json").read_text())
+    assert s == {"model": "opus", "theme": "v1", "env": {"A": "1"}, "cleanupPeriodDays": 365,
+                 "remoteControlAtStartup": True}
+
+
+def test_migrate_settings_plain_v1(v1):
+    """v1 settings with nothing to drop: merged, no notice."""
+    st = v1.load_docker()
+    st["v1"]["volumes"]["claude-config"]["settings.json"] = json.dumps({"model": "opus", "permissions": {}})
+    v1.save_docker()
+    r = migrate(v1)
+    assert r.returncode == 0, r.stderr
+    assert "aren't carried over" not in r.stdout
+    s = json.loads((v1.home / ".claude" / "settings.json").read_text())
+    assert s["model"] == "opus" and s["permissions"] == {"allow": ["Bash(boxen run *)"]}
 
 
 def test_migrate_keeps_an_existing_boxen_dir_and_vm_claude_md(v1):
@@ -216,21 +245,101 @@ def test_migrate_needs_the_system_daemon(vm):
     assert r.returncode == 1 and "these v1 projects haven't moved yet: old" in r.stderr
 
 
+def doctor(vm, managed, *args):
+    """boxen doctor, with the managed settings file at MANAGED."""
+    r = vm.fn('source "$BOXEN_REPO/lib/doctor.sh"\nMANAGED=%s\ndoctor_main %s || echo "rc=$?"\n'
+              % (managed, " ".join(args)))
+    r.stdout = re.sub("\x1b\\[[0-9;]*m", "", r.stdout)
+    return r
+
+
 def test_doctor_runs(vm):
     """doctor runs every check with fakes and reports (some fail here: the
-    fake Docker writes no files, there's no Claude Code login)."""
+    fake Docker writes no files, there's no lingering)."""
     vm.ok("setup")
-    r = vm.boxen("doctor")
-    assert r.returncode in (0, 1), r.stderr
+    managed = vm.tmp / "managed.json"
+    managed.write_text(vm.ok("managed-settings").stdout)
+    r = doctor(vm, managed)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
     for head in ("Rootless Docker (build containers)", "Claude Code and its sandbox (agents)", "GitHub", "Projects"):
-        assert head in r.stdout
-    assert "the daemon at %s is rootless" % vm.env["BOXEN_DOCKER_HOST"] in r.stdout
-    assert "settings: sandbox on and required" in r.stdout
-    assert "settings: boxen run and boxen env are the sandbox's only exceptions" in r.stdout
-    assert "settings: sandboxed commands can't open the Docker socket" in r.stdout
-    assert "agents get boxen's instructions" in r.stdout
-    assert "git in %s uses boxen's tokens and identity" % vm.src in r.stdout
-    assert "boxen v1 projects to move: old" in r.stdout
-    assert "2 v2 project(s)" in r.stdout
+        assert head in out
+    assert "the daemon at %s is rootless" % vm.env["BOXEN_DOCKER_HOST"] in out
+    assert "ok    managed settings: sandbox on and required" in out and str(managed) in out
+    assert "takes more commands out of the sandbox" not in out and "allows without asking" not in out
+    assert "agents get boxen's instructions" in out
+    assert "git in %s uses boxen's tokens and identity" % vm.src in out
+    assert "ok    in %s, git asks only boxen for GitHub credentials" % vm.src in out
+    assert "boxen v1 projects to move: old" in out
+    assert "2 v2 project(s)" in out
+    assert not [f for f in os.listdir(vm.src) if f.startswith(".boxen-doctor")]      # its test repo is gone
     r = vm.boxen("doctor", "--frob")
     assert r.returncode == 1 and "usage: boxen doctor" in r.stderr
+
+
+def test_doctor_managed_settings(vm):
+    vm.ok("setup")
+    managed = vm.tmp / "managed.json"
+    r = doctor(vm, managed)
+    assert "FAIL  boxen's sandbox settings aren't installed (%s missing): re-run install.sh" % managed in r.stdout
+    assert "rc=1" in r.stdout
+    # the same JSON, laid out differently: fine
+    managed.write_text(json.dumps(json.loads(vm.ok("managed-settings").stdout)))
+    assert "ok    managed settings" in doctor(vm, managed).stdout
+    # changed (an older boxen's, or edited)
+    m = json.loads(managed.read_text())
+    m["sandbox"]["excludedCommands"].append("docker *")
+    managed.write_text(json.dumps(m))
+    r = doctor(vm, managed)
+    assert "FAIL  %s differs from what this boxen writes: re-run install.sh" % managed in r.stdout
+    managed.write_text("not json")
+    assert "differs from what this boxen writes" in doctor(vm, managed).stdout
+
+
+def test_doctor_warns_about_your_settings(vm):
+    vm.ok("setup")
+    managed = vm.tmp / "managed.json"
+    managed.write_text(vm.ok("managed-settings").stdout)
+    c = vm.home / ".claude"
+    (c / "settings.json").write_text(json.dumps({
+        "sandbox": {"excludedCommands": ["boxen run *", "docker *", "make *"]},
+        "permissions": {"allow": ["Edit", "Write(/**)", "Bash(npm test)", "Read", "Edit(src/**)"],
+                        "defaultMode": "bypassPermissions"}}))
+    (c / "settings.local.json").write_text(json.dumps({"permissions": {"allow": ["Bash", "Bash(*)"]}}))
+    out = doctor(vm, managed).stdout
+    s, local = c / "settings.json", c / "settings.local.json"
+    assert "warn  %s takes more commands out of the sandbox: docker *, make *" % s in out
+    assert "warn  %s allows without asking: Edit, Write(/**)" % s in out
+    assert "warn  %s asks for bypassPermissions mode by default" % s in out
+    assert "warn  %s allows without asking: Bash, Bash(*)" % local in out
+    assert "%s takes more" % local not in out
+
+
+def test_doctor_credential_helpers(vm):
+    """What git really asks in a repo under ~/src: after boxen's include, a
+    reset and another helper (gh auth setup-git's) is a failure."""
+    vm.ok("setup")
+    managed = vm.tmp / "managed.json"
+    managed.write_text(vm.ok("managed-settings").stdout)
+    with open(vm.home / ".gitconfig", "a") as f:
+        f.write('[credential "https://github.com"]\n\thelper =\n\thelper = !/usr/bin/gh auth git-credential\n')
+    out = doctor(vm, managed).stdout
+    assert ("FAIL  in %s, git asks other credential helpers too (!/usr/bin/gh auth git-credential): re-run "
+            "install.sh" % vm.src) in out
+    # a helper added without a reset: asked after boxen's
+    (vm.home / ".gitconfig").write_text("")
+    vm.ok("setup")
+    with open(vm.home / ".gitconfig", "a") as f:
+        f.write('[credential "https://github.com"]\n\thelper = store\n')
+    out = doctor(vm, managed).stdout
+    assert "git asks other credential helpers too (!%s git-credential; store)" % BOXEN in out
+    # setup puts boxen's include last again
+    vm.ok("setup")
+    assert "ok    in %s, git asks only boxen" % vm.src in doctor(vm, managed).stdout
+    assert not [f for f in os.listdir(vm.src) if f.startswith(".boxen-doctor")]
+    # no ~/src at all: says so, and the rest of doctor still runs
+    import shutil
+    shutil.rmtree(vm.src)
+    out = doctor(vm, managed).stdout
+    assert "FAIL  can't check git's credential helpers: no %s (re-run install.sh)" % vm.src in out
+    assert "\nProjects\n" in out and "rc=1" in out

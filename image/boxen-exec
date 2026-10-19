@@ -18,6 +18,9 @@ valid() { printf '%s' "$1" | grep -Ezqx '[A-Za-z0-9]{8,64}' || die "bad run id";
 if [ "${1:-}" = --kill ]; then
   [ $# -eq 2 ] || die "usage: boxen-exec --kill ID"
   valid "$2"
+  # A run interrupted as it starts may not have written its pid yet.
+  i=0
+  while [ ! -s "$dir/$2" ] && [ $i -lt 20 ]; do sleep 0.05; i=$((i + 1)); done
   p=$(cat "$dir/$2" 2>/dev/null) || exit 0
   printf '%s' "$p" | grep -Ezqx '[0-9]+' || exit 0
   kill -s TERM -- "-$p" 2>/dev/null || exit 0

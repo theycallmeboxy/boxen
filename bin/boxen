@@ -333,10 +333,11 @@ write_compose() {
   pdir=$(proj_dir "$n")
   mkdir -p "$pdir"
   new=$(mktemp -p "$pdir" .compose.XXXXXX)
-  render "$BOXEN_REPO/templates/compose.yaml" "$n" > "$new" || { rm -f "$new"; return 1; }
+  # (in a subshell: render dies on a bad template, and the temp file must go)
+  ( render "$BOXEN_REPO/templates/compose.yaml" "$n" ) > "$new" || { rm -f "$new"; return 1; }
   if [[ -f "$pdir/compose.yaml" ]] && ! cmp -s "$pdir/compose.yaml" "$new"; then
     prev=$(mktemp)
-    if [[ -f "$pdir/.compose.template" ]]; then render "$pdir/.compose.template" "$n" > "$prev" 2>/dev/null || true; fi
+    if [[ -f "$pdir/.compose.template" ]]; then ( render "$pdir/.compose.template" "$n" ) > "$prev" 2>/dev/null || true; fi
     if ! cmp -s "$pdir/compose.yaml" "$prev"; then
       cp -f "$pdir/compose.yaml" "$pdir/compose.yaml.old"
       echo "$n: compose.yaml had your edits; kept as compose.yaml.old (they belong in compose.override.yaml)"
@@ -692,6 +693,8 @@ claude_settings() {
     warn "$s isn't a JSON object; leaving it alone"
     return 1
   fi
+  # Both set already: the file is left exactly as it is (layout included).
+  jq -e 'has("cleanupPeriodDays") and has("remoteControlAtStartup")' "$s" >/dev/null 2>&1 && return 0
   tmp=$(mktemp -p "$CLAUDE_DIR" .settings.XXXXXX)
   jq '.cleanupPeriodDays //= 365
       | if has("remoteControlAtStartup") then . else .remoteControlAtStartup = true end' "$s" > "$tmp" \
@@ -891,7 +894,7 @@ run_supervised() {
   pid=$!
   exec {in}<&-
   # shellcheck disable=SC2064  # c, id and pid are fixed now, on purpose
-  trap "docker exec '$c' boxen-exec --kill '$id' >/dev/null 2>&1; kill '$pid' 2>/dev/null; exit 130" INT TERM HUP
+  trap "docker exec '$c' boxen-exec --kill '$id' >/dev/null 2>&1 || true; kill '$pid' 2>/dev/null || true; exit 130" INT TERM HUP
   wait "$pid" || rc=$?
   trap - INT TERM HUP
   exit "$rc"
