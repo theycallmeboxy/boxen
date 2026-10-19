@@ -17,6 +17,7 @@ Nothing else reaches the VM.
 
 ```
 boxen ls
+boxen show <name>
 boxen up <name|all> [--approve trust]
 boxen restart <name|all> [--approve trust]
 boxen down <name|all>
@@ -49,6 +50,9 @@ there is no code to work on here.
 - After any change (up, down, restart, new, rm, update), run `boxen ls`
   again and report the line(s) that changed.
 - To diagnose a project that isn't connected: `boxen logs <name> --tail 60`.
+- `boxen show <name>` prints a project's environment: its sidecars (from
+  the last start), its `env/Dockerfile` and `env/services.yaml`, and
+  whether the user has a `compose.override.yaml` for it.
 - `boxen up <name>` fixes most "not connected" states: it starts a stopped
   container, applies env/compose changes, and answers what can be answered.
   "not signed in" needs `boxen login` from a terminal on the VM, which you
@@ -114,6 +118,19 @@ approval while others succeed; ask about that one project alone.
   that was resumed this way.
 - Carrying what an old conversation learned into a project's memory is done
   inside that project, with `/carry` in one of its sessions. Not from here.
+
+## Project environments
+
+Each project owns its environment: `env/Dockerfile` (its image) and
+`env/services.yaml` (sidecar services: databases, caches), which its own
+Claude sees at `/boxen` and can edit and apply itself (`boxen update` and
+`boxen restart` inside that project, scoped to it). From here, `boxen
+restart <name>` applies a project's pending services.yaml and `boxen update
+<name>` its pending Dockerfile too; boxen checks services.yaml first and
+refuses anything that could reach the VM (ports, host paths, privileges),
+printing the errors and leaving the project running. Ports or host mounts
+a project asks for are the user's call, in that project's
+`compose.override.yaml` on the VM (which you can't edit).
 
 ## Updates
 

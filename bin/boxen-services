@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""boxen-services: turn a project's env/services.yaml into sidecars it may run.
+
+    docker compose -f services.yaml config --format json --no-interpolate \\
+      | boxen-services <project> > compose.services.yaml
+
+Reads compose's normalized JSON of the file on stdin, checks every service
+against the allowlist below, and prints the sanitized compose document
+({"services": ..., "volumes": ...}) as JSON (valid YAML; compose reads it as
+a second -f file). Problems go to stderr, one per line, as
+"services.yaml: <service>: <problem>", with exit 2. Nothing from the input
+reaches the output unchecked: only allowed keys are copied, volumes are
+rewritten to this project's own named volumes, and every string has its $
+doubled so compose interpolates nothing from the VM's environment when it
+reads the output. Containers and volumes are named boxen.<project>.<name>:
+the dot can't appear in a project, service or volume name, so two projects
+can never produce the same name (and nothing can spell a project's own
+container, boxen-<project>, or its home volume, boxen-home-<project>).
+
+bin/boxen runs `docker compose config` in a throwaway container that sees
+only the file, so `include:` and `extends: {file: ...}` can't read other
+files on the VM; anything of the kind that survives into the JSON is
+refused here too.
+
+The file is written by the project's own Claude, from inside its container,
+so this is the boundary: a sidecar may use the network, CPU, memory and its
+own named volumes, and nothing of the VM (no host paths, no published
+ports, no privileges, no Docker socket).
+
+What `docker compose config` emits (compose spec, checked against Compose
+v5.5): top-level "name" (from the project directory), "networks" with a
+"default" entry, and "services"; per service it adds "networks": {"default":
+null}, turns short-form volumes into {"type", "source", "target",
+"read_only", "volume"} objects, relative and ~ bind sources into absolute
+paths, depends_on lists into {name: {"condition", "required"}} objects, and
+keeps the rest as written (environment as a list or a map). Top-level keys
+other than "services" and "volumes" are ignored; the user's top-level
+"volumes" entries are replaced by the ones generated here (a declaration
+with driver_opts could otherwise mount a host path). A minimal file,
+
+    services:
+      postgres:
+        image: postgres:16
+        volumes: [pgdata:/var/lib/postgresql/data]
+    volumes: {pgdata: {}}
+
+comes back from compose as
+
+    {"name": "p", "networks": {"default": {"name": "p_default"}},
+     "services": {"postgres": {"image": "postgres:16", "networks": {"default": null},
+       "volumes": [{"source": "pgdata", "target": "/var/lib/postgresql/data",
+                    "type": "volume", "volume": {}}]}},
+     "volumes": {"pgdata": {"name": "p_pgdata"}}}
+"""
+import json
+import re
+import sys
+
+MAX_SERVICES = 8
+SERVICE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,30}$")
+VOLUME_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+RESTART = re.compile(r"^(no|always|unless-stopped|on-failure(:[0-9]+)?)$")
+
+# Copied through as they are (after the checks in check_service).
+ALLOWED = (
+    "image", "command", "entrypoint", "environment", "working_dir", "user",
+    "volumes", "tmpfs", "healthcheck", "depends_on", "restart", "mem_limit",
+    "cpus", "stop_grace_period", "labels", "init", "read_only", "cap_drop",
+)
+# Named so the error says why, instead of "unknown key".
+FORBIDDEN = (
+    "privileged", "cap_add", "devices", "pid", "ipc", "network_mode",
+    "security_opt", "ports", "expose", "sysctls", "ulimits", "cgroup_parent",
+    "userns_mode", "extra_hosts", "dns", "build", "links", "volumes_from",
+    "runtime", "env_file", "secrets", "configs", "extends",
+)
+HEALTHCHECK_KEYS = ("test", "interval", "timeout", "retries", "start_period",
+                    "start_interval", "disable")
+VOLUME_KEYS = ("type", "source", "target", "read_only", "volume")
+DEPENDS_KEYS = ("condition", "required", "restart")
+
+
+def is_str(v):
+    return isinstance(v, str)
+
+
+def is_strs(v):
+    return isinstance(v, list) and all(is_str(x) for x in v)
+
+
+def escape(v):
+    """$ -> $$ in every string value, recursively: compose interpolates
+    ${VAR} from the environment of the `docker compose` that reads the
+    output (boxen's, on the VM); doubled, it stays a literal $."""
+    if is_str(v):
+        return v.replace("$", "$$")
+    if isinstance(v, list):
+        return [escape(x) for x in v]
+    if isinstance(v, dict):
+        return dict((k, escape(x)) for k, x in v.items())
+    return v
+
+
+def check_volume(v, project, problems):
+    """One entry of a service's volumes, as compose normalized it. Returns
+    the sanitized entry (source rewritten) or None after adding a problem."""
+    if not isinstance(v, dict):
+        problems.append("volumes: entry %r isn't recognized" % (v,))
+        return None
+    src = v.get("source")
+    tgt = v.get("target")
+    if "docker.sock" in str(src) or "docker.sock" in str(tgt):
+        problems.append("volumes: the Docker socket can't be mounted")
+        return None
+    if v.get("type") != "volume":
+        problems.append("volumes: %s is a host path; only named volumes are allowed (<name>:<path>[:ro])"
+                        % (src if src else v.get("type", "?")))
+        return None
+    for k in v:
+        if k not in VOLUME_KEYS:
+            problems.append("volumes: %s: option %s isn't allowed" % (src, k))
+            return None
+    if not is_str(src) or not VOLUME_NAME.match(src):
+        problems.append("volumes: volume name %r must match %s" % (src, VOLUME_NAME.pattern))
+        return None
+    if not is_str(tgt) or not tgt.startswith("/"):
+        problems.append("volumes: mount path %r must be absolute" % (tgt,))
+        return None
+    opts = v.get("volume") or {}
+    if not isinstance(opts, dict) or any(k not in ("nocopy", "subpath") for k in opts):
+        problems.append("volumes: %s: volume options other than nocopy aren't allowed" % src)
+        return None
+    out = {"type": "volume", "source": "boxen.%s.%s" % (project, src), "target": tgt}
+    if v.get("read_only") is True:
+        out["read_only"] = True
+    if opts:
+        out["volume"] = opts
+    return out
+
+
+def check_environment(env, problems):
+    """A list of KEY=VALUE or a map; a key without a value would be filled
+    in from the VM's environment at `up`, so it's refused."""
+    if isinstance(env, list):
+        for e in env:
+            if not is_str(e) or "=" not in e:
+                problems.append("environment: %r has no value (nothing is taken from the VM)" % (e,))
+            elif "$" in e.split("=", 1)[0]:
+                problems.append("environment: variable name %r isn't allowed" % e.split("=", 1)[0])
+        return env
+    if isinstance(env, dict):
+        for k, val in env.items():
+            if val is None:
+                problems.append("environment: %s has no value (nothing is taken from the VM)" % k)
+            elif "$" in k:
+                problems.append("environment: variable name %r isn't allowed" % k)
+            elif not isinstance(val, (str, int, float, bool)):
+                problems.append("environment: %s must be a string" % k)
+        return env
+    problems.append("environment must be a list or a map")
+    return None
+
+
+def check_service(name, svc, names, project, problems):
+    """Returns the sanitized service, adding to problems (prefixed with the
+    service name by the caller) for every key that isn't allowed."""
+    if not isinstance(svc, dict):
+        problems.append("must be a map")
+        return None
+    out = {}
+    for k, v in svc.items():
+        if k == "networks":
+            # compose adds {"default": null}; anything else is a network choice.
+            if (isinstance(v, dict) and set(v) <= {"default"}) or v in ([], None, ["default"]):
+                continue
+            problems.append("networks isn't allowed (sidecars share this project's default network)")
+        elif k in FORBIDDEN:
+            if v in (None, False, [], {}, ""):
+                continue
+            problems.append("%s isn't allowed in a sidecar (the user can add it in compose.override.yaml)" % k)
+        elif k not in ALLOWED:
+            if v in (None, False, [], {}, ""):
+                continue
+            problems.append("%s isn't an allowed key (allowed: %s)" % (k, ", ".join(ALLOWED)))
+        else:
+            out[k] = v
+    if not is_str(out.get("image")) or not out.get("image"):
+        problems.append("image is required")
+    elif out["image"].lower().startswith("boxen"):
+        problems.append("image names starting with 'boxen' are boxen's own")
+    if "volumes" in out:
+        vols = out["volumes"]
+        if not isinstance(vols, list):
+            problems.append("volumes must be a list")
+        else:
+            vols = [check_volume(v, project, problems) for v in vols]
+            out["volumes"] = [v for v in vols if v is not None]
+    if "tmpfs" in out:
+        t = out["tmpfs"]
+        t = [t] if is_str(t) else t
+        if not is_strs(t) or not all(x.startswith("/") for x in t):
+            problems.append("tmpfs: paths must be absolute")
+        out["tmpfs"] = t
+    if "environment" in out:
+        out["environment"] = check_environment(out["environment"], problems)
+    if "healthcheck" in out:
+        h = out["healthcheck"]
+        if not isinstance(h, dict) or any(k not in HEALTHCHECK_KEYS for k in h):
+            problems.append("healthcheck: only %s are allowed" % ", ".join(HEALTHCHECK_KEYS))
+    if "depends_on" in out:
+        d = out["depends_on"]
+        if isinstance(d, list):
+            d = dict((x, {"condition": "service_started", "required": True}) for x in d if is_str(x))
+        if not isinstance(d, dict):
+            problems.append("depends_on must be a list of sidecar names")
+        else:
+            for dep, spec in d.items():
+                if dep == name or dep not in names:
+                    problems.append("depends_on: %r isn't another sidecar in services.yaml" % dep)
+                elif not isinstance(spec, dict) or any(k not in DEPENDS_KEYS for k in spec):
+                    problems.append("depends_on: %s: unexpected options" % dep)
+        out["depends_on"] = d
+    r = out.get("restart", "unless-stopped")
+    if not is_str(r) or not RESTART.match(r):
+        problems.append("restart must be no, always, on-failure or unless-stopped")
+    out["restart"] = r
+    for k in ("working_dir", "user", "stop_grace_period"):
+        if k in out and not is_str(out[k]):
+            problems.append("%s must be a string" % k)
+    if "working_dir" in out and is_str(out["working_dir"]) and not out["working_dir"].startswith("/"):
+        problems.append("working_dir must be absolute")
+    if "mem_limit" in out and not isinstance(out["mem_limit"], (str, int)):
+        problems.append("mem_limit must be like 512m or 2g")
+    if "cpus" in out and not isinstance(out["cpus"], (int, float, str)):
+        problems.append("cpus must be a number")
+    for k in ("init", "read_only"):
+        if k in out and not isinstance(out[k], bool):
+            problems.append("%s must be true or false" % k)
+    if "cap_drop" in out and not is_strs(out["cap_drop"]):
+        problems.append("cap_drop must be a list of capability names")
+    for k in ("command", "entrypoint"):
+        if k in out and not (is_str(out[k]) or is_strs(out[k]) or out[k] is None):
+            problems.append("%s must be a string or a list of strings" % k)
+    if "labels" in out:
+        lab = out["labels"]
+        if isinstance(lab, dict):
+            if not all(is_str(k) and "$" not in k and (is_str(v) or v is None) for k, v in lab.items()):
+                problems.append("labels must map names to strings")
+        elif not is_strs(lab):
+            problems.append("labels must map names to strings")
+    # Fixed, and not overridable from the file (the keys are refused above).
+    out["container_name"] = "boxen.%s.%s" % (project, name)
+    out["security_opt"] = ["no-new-privileges:true"]
+    out["pids_limit"] = 2048
+    return out
+
+
+def sanitize(doc, project):
+    """(output document, problems) for compose's normalized JSON."""
+    problems = []
+    if not isinstance(doc, dict):
+        return None, ["services.yaml: not a compose document"]
+    if doc.get("include"):
+        return None, ["services.yaml: include isn't allowed"]
+    services = doc.get("services")
+    if services is None:
+        services = {}
+    if not isinstance(services, dict):
+        return None, ["services.yaml: services must be a map"]
+    if len(services) > MAX_SERVICES:
+        return None, ["services.yaml: at most %d services (found %d)" % (MAX_SERVICES, len(services))]
+    names = set(services)
+    out_services = {}
+    volumes = {}
+    for name in sorted(services):
+        local = []
+        if not SERVICE_NAME.match(name):
+            local.append("name must match %s" % SERVICE_NAME.pattern)
+        elif name == "claude":
+            local.append("'claude' is this project's own container")
+        elif name.startswith("boxen"):
+            local.append("names starting with 'boxen' are reserved")
+        svc = check_service(name, services[name], names, project, local) if not local else None
+        if local:
+            problems.extend("services.yaml: %s: %s" % (name, p) for p in local)
+            continue
+        for v in svc.get("volumes", []):
+            volumes[v["source"]] = {"name": v["source"]}
+        out_services[name] = svc
+    if problems:
+        return None, problems
+    return {"services": escape(out_services), "volumes": volumes}, []
+
+
+def main(argv):
+    if len(argv) != 1:
+        sys.stderr.write("usage: boxen-services <project> < compose-config.json\n")
+        return 2
+    project = argv[0]
+    try:
+        doc = json.load(sys.stdin)
+    except ValueError as e:
+        sys.stderr.write("services.yaml: compose's output isn't JSON (%s)\n" % e)
+        return 2
+    out, problems = sanitize(doc, project)
+    if problems:
+        for p in problems:
+            sys.stderr.write(p + "\n")
+        return 2
+    json.dump(out, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

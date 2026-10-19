@@ -5,8 +5,10 @@
 #   <clone>/                          this repo: script, base image, templates
 #   ~/.config/boxen/boxen.env         shared env for all containers (BOXEN_HOME)
 #   ~/.config/boxen/base.local.Dockerfile   optional: your additions to the base image
-#   ~/.config/boxen/projects/<name>/  compose.yaml, Dockerfile, optional project.env
-#                                     and compose.override.yaml
+#   ~/.config/boxen/projects/<name>/  compose.yaml, env/ (Dockerfile, services.yaml,
+#                                     STATUS.md: the project's own environment, /boxen inside),
+#                                     compose.services.yaml (rendered from it),
+#                                     optional project.env and compose.override.yaml
 #   ~/src/<name>/                     the project's code (BOXEN_SRC); same path inside
 #   docker volume claude-config       shared ~/.claude for every container
 set -euo pipefail
@@ -83,10 +85,11 @@ Usage: boxen <command> [args]
   down <name|all>                                 Stop
   restart <name|all>                              Recreate the container (picks up env changes)
   logs <name> [-f] [--tail N]                     The Remote Control server's output
+  show <name>                                     The project's environment: sidecars, Dockerfile, services.yaml
   shell <name>                                    Bash inside the container
   claude <name> [args]                            Terminal Claude session inside the container
   resume <name> [N|ID] [--stop|--attach|--force]  Continue an earlier session in the Claude app
-  rm <name> [--yes]                               Remove container, image and config (keeps the code)
+  rm <name> [--yes]                               Remove container, image, config, tool installs and sidecar data (keeps the code)
   github [--reset] [--key f.pem]                  Connect GitHub: your app, per-project tokens, commit identity
   login                                           Sign in to Claude again (shared by every project)
   update [name|all]                               Rebuild images: fresh base and every project, or one project
@@ -115,12 +118,15 @@ require_setup() {
 }
 
 # docker compose scoped to one project's directory. compose.yaml is generated;
-# the project's own settings go in compose.override.yaml, merged on top (with
-# an explicit -f, compose doesn't pick the override up by itself).
+# compose.services.yaml (the sidecars boxen rendered from env/services.yaml,
+# see render_services) comes next; the project's own settings go in
+# compose.override.yaml, merged last (with an explicit -f, compose doesn't
+# pick the override up by itself).
 dc() {
   local name=$1; shift
   local dir; dir=$(proj_dir "$name")
   local files=(-f "$dir/compose.yaml")
+  [[ -f "$dir/compose.services.yaml" ]] && files+=(-f "$dir/compose.services.yaml")
   [[ -f "$dir/compose.override.yaml" ]] && files+=(-f "$dir/compose.override.yaml")
   docker compose --project-directory "$dir" "${files[@]}" "$@"
 }
@@ -232,24 +238,51 @@ cmd_setup() {
     chown "$USER_UID:$USER_GID" /v
 
   install_shared_config
+
+  # Projects from before env/ existed: move their Dockerfile there now, so
+  # the compose template that expects it works. Done here (and not only in
+  # self-update) because a self-update started by the previous boxen runs
+  # the new installer, and so this, before it re-renders every project.
+  local n
+  while read -r n; do
+    [[ -f "$(proj_dir "$n")/compose.yaml" ]] && migrate_env "$n"
+  done < <(projects)
+  return 0
 }
 
 # The /carry skill goes into the shared config (every project sees it), and
 # transcripts are kept a year instead of Claude Code's 30 days, so there's
 # something to carry. Only boxen's own copy of the skill is replaced; a
-# cleanupPeriodDays you set yourself is left alone.
+# cleanupPeriodDays you set yourself is left alone. boxen.md (how a project's
+# Claude changes its own environment: /boxen, sidecars, `boxen restart`) is
+# installed next to the shared CLAUDE.md and imported from it with a
+# `@boxen.md` line; the rest of CLAUDE.md is yours and never touched.
 install_shared_config() {
   local args line out rc=0
   mapfile -t args < <(base_args)
   out=$(mktemp)
   # shellcheck disable=SC2016  # expanded inside the container
-  run_base "${args[@]}" -v "$BOXEN_REPO/skills:/boxen-skills:ro" "$BASE_IMAGE" bash -c '
+  run_base "${args[@]}" -v "$BOXEN_REPO/skills:/boxen-skills:ro" \
+    -v "$BOXEN_REPO/templates:/boxen-templates:ro" "$BASE_IMAGE" bash -c '
     set -e
     d=$CLAUDE_CONFIG_DIR/skills/carry
     if [ ! -f "$d/SKILL.md" ]; then
       mkdir -p "$d" && cp /boxen-skills/carry/SKILL.md "$d/SKILL.md" && echo "installed /carry skill"
     elif head -5 "$d/SKILL.md" | grep -q boxen-managed; then
       cp /boxen-skills/carry/SKILL.md "$d/SKILL.md"
+    fi
+    b=$CLAUDE_CONFIG_DIR/boxen.md
+    if [ ! -f "$b" ]; then
+      cp /boxen-templates/boxen.md "$b" && echo "installed boxen.md instructions"
+    elif head -1 "$b" | grep -q boxen-managed; then
+      cp /boxen-templates/boxen.md "$b"
+    fi
+    c=$CLAUDE_CONFIG_DIR/CLAUDE.md
+    if [ ! -f "$c" ]; then
+      printf "@boxen.md\n" > "$c"
+    elif ! grep -qx "@boxen.md" "$c"; then
+      [ ! -s "$c" ] || [ -z "$(tail -c 1 "$c")" ] || printf "\n" >> "$c"
+      printf "\n@boxen.md\n" >> "$c"
     fi
     s=$CLAUDE_CONFIG_DIR/settings.json
     if [ ! -f "$s" ]; then
@@ -450,14 +483,18 @@ mint_token() {
 # Refresh one project's token. A no-op when GitHub isn't set up; removes the
 # token when the project has no GitHub remote (yet). Quiet except for
 # failures, unless `boxen tokens` asked for the per-project report
-# (TOKENS_VERBOSE).
+# (TOKENS_VERBOSE). Leaves what it found in REPO_STATE for write_status:
+# unconfigured, none, yours, not-yours or failed.
+REPO_STATE=""
 refresh_project() {
   local n=$1 dir repo exp
+  REPO_STATE=unconfigured
   app_configured || return 0
   dir=$(token_dir "$n")
   mkdir_private "$dir"
   if ! repo=$(project_repo "$n"); then
     rm -f "$dir/gh-token"
+    REPO_STATE=none
     [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s no GitHub remote; no token\n' "$n"
     return 0
   fi
@@ -465,10 +502,12 @@ refresh_project() {
   exp=$(mint_token "$repo" "$dir") || rc=$?
   if (( rc == 2 )); then
     rm -f "$dir/gh-token"
+    REPO_STATE=not-yours
     [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s %-36s not your repo: pulls work (public), no token to push\n' "$n" "$repo"
     return 0
   fi
-  (( rc == 0 )) || return 1
+  (( rc == 0 )) || { REPO_STATE=failed; return 1; }
+  REPO_STATE=yours
   [[ -z "${TOKENS_VERBOSE:-}" ]] || printf '  %-24s %-36s token valid until %s\n' "$n" "$repo" "$exp"
 }
 
@@ -689,6 +728,7 @@ EOF
     done < <(projects)
     if (( ${#running[@]} )); then
       for n in "${running[@]}"; do
+        render_services "$n" || continue
         run_quiet "restarting $n" dc "$n" up -d --force-recreate || true
       done
       info "restarted ${#running[@]} running project(s) so they pick up the git identity"
@@ -764,6 +804,8 @@ render() {
   # $1 template, $2 name, $3 source dir
   sed -e "s|__NAME__|$(sed_esc "$2")|g" \
       -e "s|__USER__|$(sed_esc "$USER_NAME")|g" \
+      -e "s|__UID__|$USER_UID|g" \
+      -e "s|__GID__|$USER_GID|g" \
       -e "s|__CHOME__|$(sed_esc "$CHOME")|g" \
       -e "s|__BOXEN_HOME__|$(sed_esc "$BOXEN_HOME")|g" \
       -e "s|__SRC__|$(sed_esc "$3")|g" "$1"
@@ -974,13 +1016,18 @@ wait_server() {
   esac
 }
 
-# start_project NAME [compose up args]: refresh the GitHub token, bring the
+# start_project NAME [compose up args]: render the sidecars (a rejected
+# services.yaml stops here, exit 2), refresh the GitHub token, bring the
 # container up (output hidden unless it fails), then wait_server.
 start_project() {
-  local n=$1
+  local n=$1 sc
   shift
+  render_services "$n" || return $?
   refresh_project "$n" || true
+  write_status "$n" || return $?
   run_quiet "starting $n" dc "$n" up -d "$@" || return 1
+  sc=$(sidecar_names "$n")
+  [[ -z "$sc" ]] || echo "$n: sidecars: $sc"
   wait_server "$n"
 }
 
@@ -992,6 +1039,257 @@ write_override_example() {
   [[ -e "$pdir/compose.override.yaml" ]] && return 0
   render "$BOXEN_REPO/templates/compose.override.example.yaml" "$1" "$SRC_ROOT/$1" \
     > "$pdir/compose.override.example.yaml"
+}
+
+# ------------------------------------------------- project environment
+#
+# A project's own environment lives in <pdir>/env: Dockerfile (its image),
+# services.yaml (sidecars) and STATUS.md (facts boxen writes at each start,
+# see write_status). The container sees that folder at /boxen,
+# read-write, so the project's Claude can change its environment itself and
+# apply it through its own agent socket (`boxen update` / `boxen restart`
+# from inside; see boxen-agentd). The Dockerfile builds whatever it likes
+# into the image (no sudo at run time, same as before); services.yaml is
+# checked by bin/boxen-services before anything starts, so a sidecar can't
+# reach the VM (no host paths, ports, privileges). The supervisor has an
+# env/Dockerfile too, but no services.yaml and no /boxen mount.
+
+env_dir() { printf '%s/env' "$(proj_dir "$1")"; }
+
+# env_path NAME FILE: the path of env/FILE, after checking that neither
+# env/ nor the file is a symlink (or anything but a plain file) and that it
+# resolves inside env/. The container can write env/ as it likes, so a
+# link planted there must never make boxen read or write a VM file. Every
+# read of an env file goes through this; writes then go to a temp file in
+# the project dir and are moved onto the target (mv replaces a link rather
+# than following it). Prints the refusal and returns 1.
+env_path() {
+  local n=$1 f=$2 d p
+  d=$(env_dir "$n")
+  p="$d/$f"
+  if [[ -L "$d" ]] || { [[ -e "$d" && ! -d "$d" ]]; }; then
+    printf 'boxen: %s: env is a symlink; refusing\n' "$n" >&2
+    return 1
+  fi
+  if [[ -L "$p" ]] || { [[ -e "$p" && ! -f "$p" ]]; } \
+     || [[ "$(realpath -m "$p")" != "$(realpath -m "$d")/$f" ]]; then
+    printf 'boxen: %s: env/%s is a symlink; refusing\n' "$n" "$f" >&2
+    return 1
+  fi
+  printf '%s\n' "$p"
+}
+
+# env_read NAME FILE: the contents of env/FILE on stdout. The path check
+# (env_path) can be raced by the container swapping the file for a link
+# between the check and the read, so the file is opened first and the open
+# descriptor is checked: what it really points at (readlink of the fd) must
+# be the regular file <project dir>/env/FILE, resolved from the project dir
+# (boxen's, not the container's). The contents come from that descriptor,
+# never from the path again. Returns 1 when the file doesn't exist, 2 when
+# it's refused (message printed).
+env_read() {
+  local n=$1 f=$2 p fd real want
+  p="$(env_dir "$n")/$f"
+  env_path "$n" "$f" >/dev/null || return 2
+  [[ -e "$p" ]] || return 1
+  # (the redirection on the group is temporary; the one in exec stays)
+  { exec {fd}<"$p"; } 2>/dev/null || return 1
+  real=$(readlink "/proc/$BASHPID/fd/$fd" 2>/dev/null || true)
+  want="$(realpath -m "$(proj_dir "$n")")/env/$f"
+  if [[ ! -f "/proc/$BASHPID/fd/$fd" || "$real" != "$want" ]]; then
+    exec {fd}<&-
+    printf 'boxen: %s: env/%s is a symlink; refusing\n' "$n" "$f" >&2
+    return 2
+  fi
+  cat <&"$fd"
+  exec {fd}<&-
+}
+
+# write_env NAME FILE < content: replace env/FILE through a temp file in
+# the project dir (see env_path). mv -T replaces a link planted meanwhile
+# rather than following it, and fails on a directory.
+write_env() {
+  local n=$1 f=$2 p tmp
+  p=$(env_path "$n" "$f") || return 1
+  tmp=$(mktemp -p "$(proj_dir "$n")") || return 1
+  cat > "$tmp"
+  chmod 0644 "$tmp"
+  mv -fT "$tmp" "$p" || { rm -f "$tmp"; return 1; }
+}
+
+write_services_template() {
+  local p
+  [[ "$1" != supervisor ]] || return 0
+  p=$(env_path "$1" services.yaml) || return 1
+  [[ ! -e "$p" ]] || return 0
+  render "$BOXEN_REPO/templates/services.yaml" "$1" "$SRC_ROOT/$1" | write_env "$1" services.yaml
+}
+
+# migrate_env NAME: a project from before env/ had its Dockerfile in the
+# project dir; move it, add services.yaml, and make sure the agent socket's
+# folder exists (the container mounts it, so it must be there before `up`).
+migrate_env() {
+  local n=$1 pdir p
+  pdir=$(proj_dir "$n")
+  if [[ -L "$pdir/env" ]]; then
+    printf 'boxen: %s: env is a symlink; refusing\n' "$n" >&2
+    return 1
+  fi
+  if [[ -f "$pdir/Dockerfile" && ! -L "$pdir/Dockerfile" && ! -e "$pdir/env" ]]; then
+    mkdir "$pdir/env"
+    p=$(env_path "$n" Dockerfile) || return 1
+    mv "$pdir/Dockerfile" "$p"
+    echo "$n: moved Dockerfile to env/Dockerfile (the container sees it as /boxen/Dockerfile)"
+  fi
+  mkdir -p "$pdir/env"
+  write_services_template "$n" || return 1
+  [[ "$n" == supervisor ]] || mkdir_private "$pdir/agent"
+}
+
+# services_declared < content: true when services.yaml says anything
+# beyond comments and bare `services:` / `volumes:` headings. The template
+# is all comments, and `docker compose config` refuses an empty file, so
+# this is checked first; a file with content goes through compose and the
+# validator.
+services_declared() {
+  grep -vE '^[[:space:]]*(#|$)' | grep -qvE '^(services|volumes):[[:space:]]*(\{\}[[:space:]]*)?$'
+}
+
+# The compose plugin's binary: run on its own (it's a standalone program
+# too) inside a throwaway container, so parsing a project's services.yaml
+# can't read anything else on the VM. Where the docker CLI says it is,
+# else the usual places.
+compose_plugin() {
+  local p
+  p=$(docker info --format '{{range .ClientInfo.Plugins}}{{if eq .Name "compose"}}{{.Path}}{{end}}{{end}}' 2>/dev/null || true)
+  for p in "$p" /usr/libexec/docker/cli-plugins/docker-compose "$HOME/.docker/cli-plugins/docker-compose"; do
+    if [[ -n "$p" && -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  done
+  warn "can't find the docker compose plugin binary"
+  return 1
+}
+
+# render_services NAME: env/services.yaml -> compose.services.yaml, the
+# sidecars compose will run next to the project (dc adds the file when it
+# exists). Run before every `up`. The file is normalized by `docker compose
+# config` (in a container with no network that sees only a copy of the
+# file: `include:` and `extends:` can't pull in other files) and checked
+# by boxen-services, which rewrites volumes to this project's own and
+# refuses anything that could reach the VM. On a problem the errors are
+# printed and this returns 2; the container is left as it is. No services:
+# the rendered file is removed. The supervisor has none.
+render_services() {
+  local n=$1 pdir sf json out err rc=0 tmpd plugin
+  [[ "$n" != supervisor ]] || return 0
+  pdir=$(proj_dir "$n")
+  # Read once, through the checked descriptor; that copy is what compose
+  # sees and what the emptiness check looks at.
+  tmpd=$(mktemp -d)
+  sf="$tmpd/services.yaml"
+  env_read "$n" services.yaml > "$sf" || rc=$?
+  if (( rc == 2 )); then rm -rf "$tmpd"; return 2; fi
+  if (( rc == 1 )) || ! services_declared < "$sf"; then
+    rm -rf "$tmpd"
+    rm -f "$pdir/compose.services.yaml"
+    return 0
+  fi
+  rc=0
+  plugin=$(compose_plugin) || { rm -rf "$tmpd"; return 1; }
+  json=$(mktemp); out=$(mktemp); err=$(mktemp)
+  if ! run_base --network none -v "$tmpd:/w:ro" -w /w -v "$plugin:/compose:ro" "$BASE_IMAGE" \
+         /compose -f services.yaml config --format json --no-interpolate >"$json" 2>"$err"; then
+    sed 's/^/services.yaml: /' "$err" >&2
+    rc=2
+  elif ! "$BOXEN_REPO/bin/boxen-services" "$n" <"$json" >"$out" 2>"$err"; then
+    cat "$err" >&2
+    rc=2
+  fi
+  if (( rc )); then
+    printf 'boxen: %s: services.yaml rejected; nothing restarted\n' "$n" >&2
+  elif [[ "$(jq -r '.services | length' "$out")" == 0 ]]; then
+    rm -f "$pdir/compose.services.yaml"
+  else
+    mv -f "$out" "$pdir/compose.services.yaml"
+    chmod 0644 "$pdir/compose.services.yaml"
+  fi
+  rm -rf "$json" "$out" "$err" "$tmpd"
+  return "$rc"
+}
+
+# check_image_user NAME: after a build, warn when the image's last USER
+# isn't you (a `USER root` in env/Dockerfile without the switch back). The
+# container runs as your uid regardless: compose.yaml pins `user`.
+check_image_user() {
+  local n=$1 u
+  u=$(docker image inspect -f '{{.Config.User}}' "boxen-proj-$n:latest" 2>/dev/null || true)
+  case $u in
+    "$USER_NAME"|"$USER_UID"|"$USER_UID:$USER_GID"|"$USER_NAME:$USER_GID") ;;
+    *) warn "$n: the image ends as user '${u:-root}' (env/Dockerfile doesn't switch back with USER $USER_NAME); the container still runs as $USER_NAME, but builds on top of it will run as '${u:-root}'" ;;
+  esac
+}
+
+# sidecar_names NAME: the sidecars in the last rendered compose.services.yaml.
+sidecar_names() {
+  local f
+  f="$(proj_dir "$1")/compose.services.yaml"
+  [[ -f "$f" ]] || return 0
+  jq -r '.services | keys | join(", ")' "$f" 2>/dev/null || true
+}
+
+# write_status NAME: env/STATUS.md, the project's live facts for the Claude
+# inside it (/boxen/STATUS.md): code path, GitHub repo and whether pushes
+# work (from the token refresh just done, REPO_STATE), sidecars, timezone,
+# boxen version. Rewritten at every start.
+write_status() {
+  local n=$1 pdir repo push ver tz
+  pdir=$(proj_dir "$n")
+  [[ -d "$pdir/env" || -L "$pdir/env" ]] || mkdir "$pdir/env"
+  env_path "$n" STATUS.md >/dev/null || return 2
+  ver=$(git -C "$BOXEN_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  if [[ "$n" == supervisor ]]; then
+    {
+      echo "# supervisor"
+      echo
+      echo "This is the boxen supervisor project: it runs boxen for the user from the app (see CLAUDE.md)."
+      echo "boxen version: $ver"
+      echo
+      echo "generated $(date -Is) by boxen; do not edit"
+    } | write_env "$n" STATUS.md
+    return
+  fi
+  repo=$(project_repo "$n" 2>/dev/null || true)
+  case $REPO_STATE in
+    yours)        push="yours (token ok)" ;;
+    not-yours)    push="not your repo: pull works if public, push won't — fork to push" ;;
+    failed)       push="yours, but no token right now (see 'boxen ls' on the VM); push may fail" ;;
+    unconfigured) [[ -n "$repo" ]] && push="GitHub isn't connected on the VM yet ('boxen github'); push needs that" || push="no GitHub remote" ;;
+    *)            push="no GitHub remote" ;;
+  esac
+  [[ -n "$repo" ]] || push="no GitHub remote"
+  tz=$(env_get TZ)
+  {
+    echo "# $n"
+    echo
+    echo "- Project: $n"
+    echo "- Code: $SRC_ROOT/$n (same path on the VM)"
+    echo "- GitHub repo: ${repo:-none}"
+    echo "- Push status: $push"
+    echo "- Sidecars (hostname = name, on this project's network):"
+    if [[ -f "$pdir/compose.services.yaml" ]]; then
+      jq -r '.services | to_entries[] | "    - \(.key) — \(.value.image) — reachable as hostname \(.key)"' "$pdir/compose.services.yaml" 2>/dev/null || echo "    (unreadable)"
+    else
+      echo "    none"
+    fi
+    if [[ -f "$pdir/compose.override.yaml" ]]; then
+      echo "- compose.override.yaml: present (user-managed on the VM, not visible here)"
+    else
+      echo "- compose.override.yaml: none (the user can add ports or host mounts there)"
+    fi
+    echo "- Timezone: ${tz:-UTC}"
+    echo "- boxen version: $ver"
+    echo
+    echo "generated $(date -Is) by boxen; do not edit"
+  } | write_env "$n" STATUS.md
 }
 
 # rerender_compose NAME [OLD_TEMPLATE]: replace the project's compose.yaml
@@ -1018,22 +1316,27 @@ rerender_compose() {
   rm -f "$old"
 }
 
-# create_project NAME: write the project's compose.yaml and Dockerfile and
-# build its image. Its code folder (~/src/NAME) must already exist.
+# create_project NAME: write the project's compose.yaml, env/Dockerfile and
+# env/services.yaml and build its image. Its code folder (~/src/NAME) must
+# already exist.
 create_project() {
   local name=$1 pdir src errf rc=0
   pdir=$(proj_dir "$name")
   src="$SRC_ROOT/$name"
-  # Create the token dir yourself so Docker doesn't create it root-owned.
-  mkdir -p "$pdir"
+  # Create the mounted dirs (token, env, agent) yourself so Docker doesn't
+  # create them root-owned; agent/ before compose.yaml, so boxen-agentd's
+  # socket is there by the time the container starts.
+  mkdir -p "$pdir/env"
   mkdir_private "$(token_dir "$name")"
+  [[ "$name" == supervisor ]] || mkdir_private "$pdir/agent"
+  render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" | write_env "$name" Dockerfile || return 1
+  write_services_template "$name" || return 1
   render "$(compose_template "$name")" "$name" "$src" > "$pdir/compose.yaml"
-  render "$BOXEN_REPO/templates/Dockerfile"   "$name" "$src" > "$pdir/Dockerfile"
   write_override_example "$name"
   printf '\033[1;34m==>\033[0m building image for %s...' "$name"
   errf=$(mktemp)
   run_quiet "building image for $name" dc "$name" build 2>"$errf" || rc=$?
-  if (( rc )); then echo; cat "$errf" >&2; else echo " done"; fi
+  if (( rc )); then echo; cat "$errf" >&2; else echo " done"; check_image_user "$name"; fi
   rm -f "$errf"
   return "$rc"
 }
@@ -1045,7 +1348,7 @@ new_cleanup() {
   [[ -n "$NEW_PDIR" ]] || return 0
   warn "'new $NEW_NAME' didn't finish (exit $rc); cleaning up so you can retry"
   if [[ -f "$NEW_PDIR/compose.yaml" ]]; then
-    dc "$NEW_NAME" down --rmi all >/dev/null 2>&1 || true
+    dc "$NEW_NAME" down --rmi all -v >/dev/null 2>&1 || true
   fi
   rm -rf "$NEW_PDIR"
   # Only remove the code dir if this run created it (e.g. a half-finished clone).
@@ -1152,6 +1455,7 @@ cmd_supervisor() {
   write_supervisor_claude_md
   ensure_login
   if [[ -f "$pdir/compose.yaml" ]]; then
+    migrate_env "$name"
     rerender_compose "$name"
     write_override_example "$name"
   else
@@ -1276,7 +1580,7 @@ cmd_rm() {
     esac
     shift
   done
-  q="Remove container, image and config for '$name'? Code in $SRC_ROOT/$name is kept."
+  q="Remove container, image and config for '$name'? Its tool installs (home volume) and sidecar data are removed too; code in $SRC_ROOT/$name is kept."
   if (( ! yes )); then
     if agent_mode; then
       approval_needed rm "$name" "boxen rm $name --yes" <<<"$q" || return $?
@@ -1284,9 +1588,54 @@ cmd_rm() {
     read -rp "$q [y/N] " ans
     [[ "$ans" == [yY] ]] || { echo "aborted"; return; }
   fi
-  run_quiet "removing $name" dc "$name" down --rmi all || return 1
+  run_quiet "removing $name" dc "$name" down --rmi all -v || return 1
+  # Sidecar volumes from earlier renders (boxen.<name>.<vol>) that the
+  # current compose.services.yaml no longer declares.
+  docker volume ls -q --filter "name=^boxen\\.$name\\." 2>/dev/null | xargs -r docker volume rm >/dev/null 2>&1 || true
   rm -rf "$(proj_dir "$name")"
   info "removed '$name'. Code in $SRC_ROOT/$name and its Claude history in the shared config are kept."
+}
+
+# show NAME: the project's environment as it stands: the sidecars from the
+# last render (what's running, or will be after the next start), the
+# Dockerfile and services.yaml, and whether there's a compose.override.yaml.
+cmd_show() {
+  require_project "${1:-}"
+  (( $# == 1 )) || die "usage: boxen show <name>"
+  local n=$1 pdir f
+  pdir=$(proj_dir "$n")
+  # Refuse up front, before printing anything, if an env file is a link
+  # (env_read checks again, on the open file, when it comes to reading).
+  for f in Dockerfile services.yaml; do
+    [[ "$n" == supervisor && "$f" == services.yaml ]] && continue
+    env_path "$n" "$f" >/dev/null || return 2
+  done
+  f="$pdir/compose.services.yaml"
+  echo "$n: sidecars (from the last start):"
+  if [[ -f "$f" ]]; then
+    jq -r '.services | to_entries[] | "    \(.key)  \(.value.image)"' "$f" 2>/dev/null || echo "    (unreadable: $f)"
+  else
+    echo "    none"
+  fi
+  if [[ -f "$pdir/compose.override.yaml" ]]; then
+    echo "$n: compose.override.yaml: present ($pdir/compose.override.yaml)"
+  else
+    echo "$n: compose.override.yaml: none"
+  fi
+  if [[ -f "$pdir/agent.log" ]]; then
+    echo "$n: last apply (restart/update run from inside the project; $pdir/agent.log):"
+    tail -n 20 "$pdir/agent.log" | sed 's/^/    /'
+  fi
+  local rc
+  for f in Dockerfile services.yaml; do
+    [[ "$n" == supervisor && "$f" == services.yaml ]] && continue
+    echo
+    echo "--- env/$f (/boxen/$f inside the container)"
+    rc=0
+    env_read "$n" "$f" || rc=$?
+    (( rc != 2 )) || return 2
+    (( rc != 1 )) || echo "(missing)"
+  done
 }
 
 # ------------------------------------------------------------- maintenance
@@ -1294,10 +1643,15 @@ cmd_rm() {
 # update_one NAME: rebuild the project's image (cached), recreate its
 # container and wait for the server. One line of output.
 update_one() {
-  local n=$1
+  local n=$1 sc
+  render_services "$n" || return $?
   run_quiet "building image for $n" dc "$n" build || return 1
+  check_image_user "$n"
   refresh_project "$n" || true
+  write_status "$n" || return $?
   run_quiet "starting $n" dc "$n" up -d --force-recreate || return 1
+  sc=$(sidecar_names "$n")
+  [[ -z "$sc" ]] || echo "$n: sidecars: $sc"
   wait_server "$n" "rebuilt, "
 }
 
@@ -1326,6 +1680,7 @@ cmd_update() {
 # the project; `rebuild` is `update`. Remove next release.
 cmd_regen() {
   require_project "${1:-}"
+  migrate_env "$1"
   rerender_compose "$1"
   write_override_example "$1"
   mkdir_private "$(token_dir "$1")"
@@ -1358,9 +1713,11 @@ cmd_self_update() {
   fi
 
   # Every project's compose.yaml comes from the template (settings of your
-  # own belong in compose.override.yaml). Hand edits are kept as .old.
+  # own belong in compose.override.yaml). Hand edits are kept as .old. A
+  # project from before env/ gets its Dockerfile moved there first.
   oldt=$(mktemp)
   for n in "${list[@]}"; do
+    migrate_env "$n"
     git -C "$BOXEN_REPO" show "$old:templates/$(basename "$(compose_template "$n")")" > "$oldt" 2>/dev/null || true
     rerender_compose "$n" "$oldt"
     write_override_example "$n"
@@ -1403,6 +1760,7 @@ case "$cmd" in
   down)     each cmd_down "$@" ;;
   restart)  no_approve_all "$@"; each cmd_restart "$@" ;;
   logs)     cmd_logs "$@" ;;
+  show)     cmd_show "$@" ;;
   shell)    cmd_shell "$@" ;;
   claude)   cmd_claude "$@" ;;
   resume)   cmd_resume "$@" ;;

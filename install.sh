@@ -172,7 +172,7 @@ fi
 
 # 3. Put the boxen command on your PATH.
 mkdir -p "$BIN_DIR"
-chmod +x "$REPO_DIR/bin/boxen"
+chmod +x "$REPO_DIR/bin/boxen" "$REPO_DIR/bin/boxen-services"
 ln -sfn "$REPO_DIR/bin/boxen" "$BIN_DIR/boxen"
 info "linked $BIN_DIR/boxen -> $REPO_DIR/bin/boxen"
 

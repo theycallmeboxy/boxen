@@ -9,7 +9,7 @@ name: boxen-__NAME__
 
 services:
   claude:
-    build: .
+    build: ./env
     image: boxen-proj-__NAME__:latest
     container_name: boxen-__NAME__
     hostname: __NAME__
@@ -17,6 +17,9 @@ services:
     restart: unless-stopped
     tty: true
     stdin_open: true
+    # Pinned: a `USER root` left on in env/Dockerfile doesn't make the
+    # container run as root.
+    user: "__UID__:__GID__"
     working_dir: __SRC__
     # Shows up in the Claude app's Code tab as "boxen supervisor".
     command: ["claude", "remote-control", "--name", "boxen supervisor", "--spawn=same-dir"]
@@ -30,8 +33,13 @@ services:
       BOXEN_PROJECT: __NAME__
       # boxen-entry links ~/.local/bin/boxen to the client when this is set.
       BOXEN_SUPERVISOR: "1"
-      PATH: __CHOME__/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # ~/.local/bin last: the boxen client link lives there, nothing else
+      # provides `boxen`, and a volume-resident PATH entry shouldn't shadow
+      # the system.
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:__CHOME__/.local/bin
     volumes:
+      # The home folder, kept per project: tool installs survive rebuilds.
+      - home:__CHOME__
       - __SRC__:__SRC__
       # Shared Claude login, settings, CLAUDE.md, skills and memory.
       - claude-config:__CHOME__/.claude
@@ -52,3 +60,5 @@ services:
 volumes:
   claude-config:
     external: true
+  home:
+    name: boxen-home-__NAME__

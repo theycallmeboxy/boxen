@@ -79,10 +79,14 @@ appears in the app's Code tab.
 - `boxen down <name|all>` — stop.
 - `boxen restart <name|all>` — recreate the container (picks up env changes).
 - `boxen logs <name> [-f] [--tail N]` — the server's output, as plain text.
+- `boxen show <name>` — the project's environment: sidecars, the log of the
+  last apply run from inside it, `env/Dockerfile`, `env/services.yaml`,
+  whether it has a `compose.override.yaml`.
 - `boxen shell <name>` — bash inside the container.
 - `boxen claude <name> [args]` — a terminal Claude session inside it.
-- `boxen rm <name> [--yes]` — remove container, image and config; keeps
-  `~/src/<name>` and its Claude history.
+- `boxen rm <name> [--yes]` — remove container, image, config, the project's
+  home volume (tool installs: the next `boxen new` starts from a fresh home)
+  and sidecar data; keeps `~/src/<name>` and its Claude history.
 
 `boxen update` rebuilds the base image from a fresh Ubuntu with the newest
 stable Claude Code and then every project; `boxen update <name>` rebuilds one
@@ -119,9 +123,12 @@ running, start or stop a project, a server's log, a new project from a
 GitHub URL, resume an old conversation, update. Inside it, `boxen` is a
 client of a small listener on the VM (`boxen-agentd`: a systemd user service
 set up by `install.sh`, with a cron `@reboot` fallback) that runs the real
-boxen only for `ls`, `up`, `restart`, `down`, `logs --tail`, `update`,
-`self-update`, `new`, `resume`, `rm` and `tokens`, arguments checked first;
-no shell, no Docker socket, nothing that needs a terminal. When an action
+boxen only for `ls`, `show`, `up`, `restart`, `down`, `logs --tail`,
+`update`, `self-update`, `new`, `resume`, `rm` and `tokens`, arguments
+checked first; no shell, no Docker socket, nothing that needs a terminal.
+Every other project gets a socket of its own, scoped to itself: inside it,
+`boxen` runs only `ls`, `show`, `logs`, `restart` and `update` for that
+project (see Customizing). When an action
 needs a decision (trusting a new folder, `rm`), boxen prints the exact
 question instead of answering, the supervisor shows it to you in the app,
 and only your yes re-runs it with `--approve trust` or `--yes`.
@@ -160,22 +167,47 @@ Scopes: `code` (project folders, and a boxen project for each), `memory`
 
 ## Customizing
 
+A project's environment is its own: `~/.config/boxen/projects/<name>/env/`
+holds its `Dockerfile` and `services.yaml`, mounted at `/boxen` inside the
+container, so the project's Claude can set up its toolchain and sidecars
+itself and apply them with `boxen update` / `boxen restart` from inside (a
+shared `boxen.md` in `~/.claude` tells it how, and `env/STATUS.md`, written
+at every start, tells it the project's repo, push status, sidecars and
+timezone). Tools installed under the home folder (conda, cargo, go, npm,
+SDKs) live in a volume per project and survive rebuilds.
+
 | To change | Edit | Then |
 |---|---|---|
+| Packages for one project | `/boxen/Dockerfile` from inside the project (or `~/.config/boxen/projects/<name>/env/Dockerfile`) | `boxen update <name>` (or `boxen update` inside) |
+| Sidecar services (a database, a cache) for one project | `/boxen/services.yaml` (or `.../projects/<name>/env/services.yaml`): image, environment, named volumes, healthcheck, depends_on, limits; no ports, host paths or privileges | `boxen restart <name>` (or `boxen restart` inside) |
+| Everything else: ports, host mounts, limits on the `claude` service, `--spawn=worktree` | `~/.config/boxen/projects/<name>/compose.override.yaml` (see the `.example`) | `boxen restart <name>` |
 | Tools for every project | `~/.config/boxen/base.local.Dockerfile` (starts with `FROM boxen-base:core`) | `boxen update` |
-| Tools for one project | `~/.config/boxen/projects/<name>/Dockerfile` | `boxen update <name>` |
 | Env for every project | `~/.config/boxen/boxen.env` | `boxen restart all` |
 | Env for one project | `~/.config/boxen/projects/<name>/project.env` | `boxen restart <name>` |
-| Container settings (limits, `--spawn=worktree`) | `~/.config/boxen/projects/<name>/compose.override.yaml` (see the `.example`) | `boxen up <name>` |
 
 Containers have no sudo, so Dockerfiles install as `root` and switch back to
-your user. Don't edit files in this repo or a project's `compose.yaml`
-(`self-update` rewrites it); `compose.override.yaml` is never touched.
+your user (the container runs as your user regardless: compose pins it).
+Install outside the home folder in a Dockerfile; the home folder is a
+volume that masks the image's copy. A `services.yaml` is parsed in a
+container that sees only that file, then checked before anything starts; a
+rejected one is printed and the project is left as it was. Don't edit files in this
+repo or a project's `compose.yaml` (`self-update` rewrites it);
+`compose.override.yaml` is never touched.
 
 ## Security
 
 - Containers run as your UID with no sudo and `no-new-privileges`; no Docker
   socket.
+- Sidecars from a project's `services.yaml` are restricted to an image,
+  named volumes of that project (`boxen.<project>.<name>`) and the project's
+  network: no host paths, published ports, privileges, capabilities, devices
+  or the Docker socket, and `no-new-privileges` plus a pids limit are added.
+  Files under `env/` are never followed through symlinks.
+- A project's own `boxen` socket is scoped to that project by which socket
+  it is (never by what the request says): `ls`, `show`, `logs`, `restart`,
+  `update` for itself, nothing for any other project.
+- Tool installs under a container's home folder persist per project in its
+  own volume, removed with `boxen rm`.
 - The shared `claude-config` volume isn't isolated between projects: any
   container can read the login and every transcript. Untrusted code belongs
   on another VM.

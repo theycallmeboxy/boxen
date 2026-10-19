@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""boxen-client: the `boxen` command inside the supervisor container.
+"""boxen-client: the `boxen` command inside a boxen container.
 
-Sends the arguments to boxen-agentd on the VM over /run/boxen/agent.sock
-(one JSON request per connection) and prints the lines it streams back,
-then exits with the command's exit code. The agent decides what may run;
-this end does nothing but relay.
+Sends the arguments to boxen-agentd on the VM over a unix socket
+($BOXEN_AGENT_SOCK, else /run/boxen/agent.sock: the supervisor's; a project
+has its own, scoped to itself) as one JSON request per connection, prints
+the lines it streams back, then exits with the command's exit code. The
+agent decides what may run; this end does nothing but relay.
 """
 import json
+import os
 import socket
 import sys
 
-SOCK = "/run/boxen/agent.sock"
-USAGE = """Usage: boxen <command> [args]   (the supervisor's restricted boxen)
+SOCK = os.environ.get("BOXEN_AGENT_SOCK") or "/run/boxen/agent.sock"
+SUPERVISOR = os.environ.get("BOXEN_SUPERVISOR") == "1"
+USAGE = """Usage: boxen <command> [args]   (the restricted boxen inside a container)
+
+From the supervisor project (%s):
 
   ls                                        List projects, servers, GitHub tokens
+  show <name>                               A project's environment: sidecars, Dockerfile, services.yaml
   up <name|all> [--approve trust]           Start, or apply env/compose changes
-  restart <name|all> [--approve trust]      Recreate the container
+  restart <name|all> [--approve trust]      Recreate the container (applies its services.yaml)
   down <name|all>                           Stop
   logs <name> [--tail N]                    The server's output (default: last 100 lines)
-  update [name|all]                         Rebuild images (slow)
+  update [name|all]                         Rebuild images (slow; applies a project's Dockerfile)
   self-update                               Update boxen itself and apply it
   new <name> [https-github-url] [--approve trust]
                                             Create a project and start it
@@ -26,9 +32,20 @@ USAGE = """Usage: boxen <command> [args]   (the supervisor's restricted boxen)
   rm <name> [--yes]                         Remove a project (keeps its code)
   tokens [name|all]                         Refresh GitHub tokens
 
-When boxen prints "approval needed", ask the user before running the
-command it names. Anything not listed here needs a terminal on the VM.
-"""
+From a project's own container (%s), for this project only:
+
+  ls                                        List projects (read only)
+  show                                      This project's sidecars, Dockerfile, services.yaml
+  logs [--tail N]                           This project's server output
+  restart                                   Apply /boxen/services.yaml: recreate this container
+  update                                    Apply /boxen/Dockerfile: rebuild the image, recreate this container
+
+restart and update from a project recreate the container you're in: the
+reply comes at once, the work continues on the VM, and the session
+reconnects in about 30 seconds. When boxen prints "approval needed", ask
+the user before running the command it names. Anything not listed here
+needs a terminal on the VM.
+""" % (("this container", "not this one") if SUPERVISOR else ("not this one", "this container"))
 
 
 def fail(msg, code=1):

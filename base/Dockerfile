@@ -75,14 +75,9 @@ WORKDIR /home/$USERNAME
 # volume mounted here. CLAUDE_CONFIG_DIR keeps .claude.json (the login) inside it.
 ENV CLAUDE_CONFIG_DIR=/home/$USERNAME/.claude
 
-# For github.com, git asks git-credential-boxen (and only it) for credentials.
-# SSH-style GitHub remotes (common in repos brought over from a Mac) are
-# rewritten to HTTPS, since containers authenticate with tokens, not SSH keys.
-RUN git config --global init.defaultBranch main \
- && git config --global credential.https://github.com.helper '' \
- && git config --global --add credential.https://github.com.helper boxen \
- && git config --global url.https://github.com/.insteadOf git@github.com: \
- && git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
+# The git configuration (credential helper, SSH-to-HTTPS rewrite) is set by
+# boxen-entry at every start: the home folder is a per-project volume, so
+# anything written to it here would only reach projects created later.
 
 ENTRYPOINT ["/usr/local/bin/boxen-entry"]
 CMD ["bash"]

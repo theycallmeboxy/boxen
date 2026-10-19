@@ -15,9 +15,23 @@ if [ -t 0 ]; then
     i=$((i + 1))
   done
 fi
-# In the supervisor project, `boxen` is the client of the boxen agent on the
-# VM. Linked from a dir of the user's own, first on PATH (set by compose).
-if [ "${BOXEN_SUPERVISOR:-}" = 1 ]; then
+# git: for github.com, ask git-credential-boxen (and only it) for
+# credentials; rewrite SSH-style GitHub remotes (common in repos brought
+# over from a Mac) to HTTPS, since containers authenticate with tokens,
+# not SSH keys. Set at every start (idempotent) because the home folder is
+# a volume that outlives the image.
+if command -v git >/dev/null 2>&1; then
+  git config --global init.defaultBranch main
+  git config --global --replace-all credential.https://github.com.helper ''
+  git config --global --add credential.https://github.com.helper boxen
+  git config --global --replace-all url.https://github.com/.insteadOf git@github.com:
+  git config --global --add url.https://github.com/.insteadOf ssh://git@github.com/
+fi 2>/dev/null
+# Where a boxen agent socket is mounted (every project has one of its own,
+# scoped to itself; the supervisor's reaches everything), `boxen` is the
+# client of the boxen agent on the VM. Linked from a dir of the user's own,
+# first on PATH (set by compose).
+if [ "${BOXEN_SUPERVISOR:-}" = 1 ] || [ -n "${BOXEN_AGENT_SOCK:-}" ]; then
   mkdir -p "$HOME/.local/bin" && ln -sfn /usr/local/bin/boxen-client "$HOME/.local/bin/boxen"
 fi
 exec "$@"

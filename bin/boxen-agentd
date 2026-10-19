@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""boxen-agentd: runs an allowlisted subset of boxen for the supervisor project.
+"""boxen-agentd: runs an allowlisted subset of boxen for the containers.
 
-Listens on a unix socket ($BOXEN_HOME/agent/agent.sock, mode 0600). The
-supervisor container has that folder mounted and its `boxen` command
+Listens on a unix socket ($BOXEN_HOME/agent/agent.sock, mode 0600) for the
+supervisor project, and on one per project
+($BOXEN_HOME/projects/<name>/agent/agent.sock) for that project's own
+container. Each container has its folder mounted and its `boxen` command
 (base/boxen-client) sends one request per connection:
 
     {"argv": ["up", "caulker"]}          (without the leading "boxen")
@@ -14,10 +16,23 @@ and gets JSON lines back as the command prints:
 
 The request is checked against the allowlist below (verbs, argument shapes)
 before anything runs; what passes is run as [bin/boxen, *argv] with
-BOXEN_AGENT=1, no shell, stdin from /dev/null, in $HOME. One command at a
-time (a second request gets "busy"), 30 minutes each. Every request is
-logged to $BOXEN_HOME/agent.log. No Claude runs on the VM: this is a dumb
-relay, and the policy is here, not in the container.
+BOXEN_AGENT=1, no shell, stdin from /dev/null, in $HOME, 30 minutes each.
+One command per project at a time, and one at a time for the commands that
+touch everything (all, update, self-update, new, rm): a request that would
+overlap gets "busy". Every request is logged to $BOXEN_HOME/agent.log. No
+Claude runs on the VM: this is a dumb relay, and the policy is here, not
+in the container.
+
+A project's socket is scoped to that project, and the project is the one
+whose socket took the connection, never anything in the request: `ls`,
+`show`, `logs`, `restart` and `update` for itself (a missing name is filled
+in; another project's name is refused), nothing else. `restart` and
+`update` recreate the container the client lives in, so they run detached:
+the reply comes at once, the command's output goes to
+$BOXEN_HOME/projects/<name>/agent.log, and the client going away doesn't
+end it; a project may ask for one of them once a minute. The projects
+folder is rescanned every 5 seconds: a new project gets a socket, a
+removed one loses it.
 
 Installed as a systemd user service (boxen-agent.service) by install.sh.
 After an update of this file (boxen self-update, run through the agent
@@ -26,6 +41,7 @@ itself), the agent re-executes itself once the running command is done.
 import json
 import os
 import re
+import selectors
 import signal
 import socket
 import struct
@@ -41,9 +57,20 @@ REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BOXEN = os.path.join(REPO, "bin", "boxen")
 AGENT_DIR = os.path.join(BOXEN_HOME, "agent")
 SOCK = os.path.join(AGENT_DIR, "agent.sock")
+PROJECTS_DIR = os.path.join(BOXEN_HOME, "projects")
 LOG = os.path.join(BOXEN_HOME, "agent.log")
+LOG_MAX = 1000000
 TIMEOUT = 30 * 60
 MAX_REQUEST = 64 * 1024
+RESCAN = 5.0
+COOLDOWN = 60.0           # between a project's own restart/update requests
+GLOBAL_WAIT = 600.0       # a global job waits this long for project jobs
+# Verbs whose first argument names the one project they touch (unless it's
+# "all"); the rest take the global lock.
+PROJECT_SCOPED = ("up", "restart", "down", "logs", "show", "update", "resume", "tokens")
+# What a project's own socket may ask for (the name is the socket's).
+PROJECT_VERBS = ("ls", "show", "logs", "restart", "update")
+DETACHED_VERBS = ("restart", "update")
 
 NAME = re.compile(r"^[a-z0-9]+([_-][a-z0-9]+)*$")
 NUMBER = re.compile(r"^[0-9]+$")
@@ -119,6 +146,12 @@ def check_logs(args):
     return flags(args[1:], {"--tail": 1})
 
 
+def check_show(args):
+    if len(args) != 1 or not name(args[0]):
+        return "needs a project name, nothing else"
+    return None
+
+
 def check_update(args):
     if not args:
         return None
@@ -179,6 +212,7 @@ VERBS = {
     "restart": check_start,
     "down": check_down,
     "logs": check_logs,
+    "show": check_show,
     "update": check_update,
     "self-update": check_self_update,
     "new": check_new,
@@ -188,13 +222,21 @@ VERBS = {
 }
 
 
-def validate(argv):
-    """The reason argv isn't allowed, or None."""
+def shape(argv):
+    """The reason argv isn't even a request worth checking, or None."""
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
         return "argv must be a non-empty list of strings"
     for a in argv:
         if not a or len(a) > 256 or not a.isprintable() or any(c.isspace() for c in a):
             return "argument %r isn't allowed" % a[:40]
+    return None
+
+
+def validate(argv):
+    """The reason argv isn't allowed, or None."""
+    why = shape(argv)
+    if why:
+        return why
     verb = argv[0]
     if verb not in VERBS:
         return "'%s' isn't available here (allowed: %s)" % (verb, ", ".join(VERBS))
@@ -202,24 +244,129 @@ def validate(argv):
     return "%s: %s" % (verb, why) if why else None
 
 
+def scope(argv, project):
+    """For a request on project's own socket: the argv to run (the name
+    filled in when it's missing) or an error. Only the verbs in
+    PROJECT_VERBS, each for that project alone, with no options except
+    logs --tail."""
+    verb = argv[0]
+    if verb not in PROJECT_VERBS:
+        return None, "not allowed from a project"
+    if verb == "ls":
+        return argv, None
+    rest = argv[1:]
+    if not rest or rest[0].startswith("-"):
+        rest = [project] + rest
+    if rest[0] != project:
+        return None, "not allowed from a project"
+    if verb != "logs" and len(rest) != 1:
+        return None, "not allowed from a project"
+    return [verb] + rest, None
+
+
 # --- running -----------------------------------------------------------
 
-lock = threading.Lock()
-running = [None]          # argv of the command running now
+# Jobs: one per project at a time, or one global job alone. `ls` is a
+# reader: any number at once, blocked only by a global job. A global job
+# waits (up to GLOBAL_WAIT) for running project jobs and readers, and
+# nothing new starts while it waits.
+state = threading.Condition()
+global_job = [None]       # argv of the global job running (or waiting)
+project_jobs = {}         # project -> argv
+readers = [0]
+last_apply = {}           # project -> monotonic time of its last self restart/update
 log_lock = threading.Lock()
 started_mtime = os.stat(os.path.realpath(__file__)).st_mtime
 
 
-def log(argv, result):
-    line = "%s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), json.dumps(argv), result)
+def job_key(argv):
+    """What a request locks: a project name, "ls" for a reader, or None
+    for a global job."""
+    if argv[0] == "ls":
+        return "ls"
+    if argv[0] in PROJECT_SCOPED and len(argv) > 1 and argv[1] != "all":
+        return argv[1]
+    return None
+
+
+def busy_msg():
+    if global_job[0]:
+        return "busy: %s is running" % " ".join(["boxen"] + global_job[0])
+    if project_jobs:
+        return "busy: %s is running" % " ".join(["boxen"] + next(iter(project_jobs.values())))
+    return "busy: boxen ls is running"
+
+
+def acquire(argv, key):
+    """Take the job's lock without waiting (a global job waits for project
+    jobs to finish, but never behind another global job). Returns an error
+    message, or None once the job may run."""
+    with state:
+        if global_job[0] is not None:
+            return busy_msg()
+        if key == "ls":
+            readers[0] += 1
+            return None
+        if key is not None:
+            if key in project_jobs:
+                return busy_msg()
+            project_jobs[key] = argv
+            return None
+        global_job[0] = argv
+        deadline = time.monotonic() + GLOBAL_WAIT
+        while project_jobs or readers[0]:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                global_job[0] = None
+                state.notify_all()
+                return busy_msg()
+            state.wait(left)
+        return None
+
+
+def release(key):
+    with state:
+        if key == "ls":
+            readers[0] -= 1
+        elif key is not None:
+            project_jobs.pop(key, None)
+        else:
+            global_job[0] = None
+        state.notify_all()
+
+
+def idle_as_global(argv):
+    """Take the global lock only if nothing at all is running; no waiting
+    (for the main loop, which must keep accepting)."""
+    with state:
+        if global_job[0] or project_jobs or readers[0]:
+            return False
+        global_job[0] = argv
+        return True
+
+
+def log(argv, result, project=None):
+    who = "" if project is None else " [%s]" % project
+    line = "%s%s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), who, json.dumps(argv), result)
     with log_lock:
         try:
-            if os.path.getsize(LOG) > 1000000:
+            if os.path.getsize(LOG) > LOG_MAX:
                 open(LOG, "w").close()
         except OSError:
             pass
         with open(LOG, "a") as f:
             f.write(line)
+
+
+def project_log(project):
+    """The project's own log for detached commands, truncated past LOG_MAX."""
+    path = os.path.join(PROJECTS_DIR, project, "agent.log")
+    try:
+        if os.path.getsize(path) > LOG_MAX:
+            open(path, "w").close()
+    except OSError:
+        pass
+    return open(path, "a")
 
 
 def send(conn, obj):
@@ -259,6 +406,36 @@ def run(conn, argv):
     return rc, note[0]
 
 
+def run_detached(argv, project):
+    """Run boxen for a project's own restart/update: no client to relay to
+    (its container is being recreated), output to the project's agent.log.
+    Returns (exit code, note) like run."""
+    env = dict(os.environ, BOXEN_AGENT="1")
+    with project_log(project) as out:
+        out.write("%s boxen %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), " ".join(argv)))
+        out.flush()
+        proc = subprocess.Popen([BOXEN] + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, cwd=HOME, env=env, start_new_session=True)
+        note = [""]
+
+        def kill(why):
+            note[0] = why
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        timer = threading.Timer(TIMEOUT, kill, ("timed out",))
+        timer.start()
+        for raw in proc.stdout:
+            out.write(ANSI.sub("", raw.decode("utf-8", "replace")).rstrip("\r\n") + "\n")
+            out.flush()
+        rc = proc.wait()
+        timer.cancel()
+        out.write("exit %d%s\n" % (rc, " (%s)" % note[0] if note[0] else ""))
+    return rc, note[0]
+
+
 def peer_ok(conn):
     """Only the user the agent runs as (the container runs as that uid)."""
     try:
@@ -277,7 +454,9 @@ def reply(conn, msgs):
         pass
 
 
-def handle(conn):
+def handle(conn, project=None):
+    """One connection: project is the name of the project whose socket
+    accepted it, or None on the supervisor's."""
     try:
         conn.settimeout(10)
         data = b""
@@ -294,33 +473,60 @@ def handle(conn):
             argv = req["argv"]
         except (ValueError, KeyError, TypeError, AttributeError):
             reply(conn, [{"error": "bad request: expected {\"argv\": [...]}"}, {"exit": 2}])
-            log(data[:200].decode("utf-8", "replace"), "exit=2 bad request")
+            log(data[:200].decode("utf-8", "replace"), "exit=2 bad request", project)
             return
-        why = validate(argv)
+        why = shape(argv)
+        if why is None and project is not None:
+            argv, why = scope(argv, project)
+        if why is None:
+            why = validate(argv)
         if why:
             reply(conn, [{"error": why}, {"exit": 2}])
-            log(argv, "exit=2 rejected: " + why)
+            log(argv, "exit=2 rejected: " + why, project)
             return
-        if not lock.acquire(blocking=False):
-            busy = "busy: %s is running" % " ".join(["boxen"] + (running[0] or []))
+        detached = project is not None and argv[0] in DETACHED_VERBS
+        if detached:
+            # Once a minute per project: a restart takes about that long,
+            # and a session that asks again meanwhile only makes it longer.
+            with state:
+                wait = last_apply.get(project, -COOLDOWN) + COOLDOWN - time.monotonic()
+            if wait > 0:
+                why = "cooldown: wait %d s" % int(wait + 0.999)
+                reply(conn, [{"error": why}, {"exit": 2}])
+                log(argv, "exit=2 " + why, project)
+                return
+        key = job_key(argv)
+        busy = acquire(argv, key)
+        if busy:
             reply(conn, [{"error": busy}, {"exit": 2}])
-            log(argv, "exit=2 " + busy)
+            log(argv, "exit=2 " + busy, project)
             return
         try:
-            running[0] = argv
-            rc, note = run(conn, argv)
+            if detached:
+                with state:
+                    last_apply[project] = time.monotonic()
+                # The container asking is the one about to be recreated:
+                # answer now, close, and run without a client.
+                reply(conn, [{"out": "%s: applying environment and restarting; this session "
+                                     "reconnects when the server is back" % project}, {"exit": 0}])
+                conn.close()
+                log(argv, "detached (output in projects/%s/agent.log)" % project, project)
+                rc, note = run_detached(argv, project)
+            else:
+                rc, note = run(conn, argv)
         finally:
-            running[0] = None
-            lock.release()
+            release(key)
         # The lock is free: a slow client can't hold up the next command.
         if note == "timed out":
-            log(argv, "timed out")
-            reply(conn, [{"error": "timed out"}, {"exit": 124}])
+            log(argv, "timed out", project)
+            if not detached:
+                reply(conn, [{"error": "timed out"}, {"exit": 124}])
         elif note == "client gone":
-            log(argv, "exit=%d client gone (command killed)" % rc)
+            log(argv, "exit=%d client gone (command killed)" % rc, project)
         else:
-            log(argv, "exit=%d" % rc)
-            reply(conn, [{"exit": rc}])
+            log(argv, "exit=%d" % rc, project)
+            if not detached:
+                reply(conn, [{"exit": rc}])
     except OSError:
         pass
     finally:
@@ -337,55 +543,120 @@ def updated():
         return False
 
 
-def main():
-    os.makedirs(AGENT_DIR, mode=0o700, exist_ok=True)
-    os.chmod(AGENT_DIR, 0o700)
-    os.makedirs(BOXEN_HOME, exist_ok=True)
-    if os.path.exists(SOCK):
-        os.unlink(SOCK)
+def bind(path):
+    """A listening socket at path (folder 0700, socket 0600). Only the last
+    folder is created, and only if its parent exists: a removed project is
+    never brought back as an empty folder. Bound by its short name from
+    inside the folder: socket paths are limited to 107 bytes, which a long
+    home path could exceed."""
+    folder = os.path.dirname(path)
+    if not os.path.isdir(os.path.dirname(folder)):
+        raise OSError("%s is gone" % os.path.dirname(folder))
+    if not os.path.isdir(folder):
+        os.mkdir(folder, 0o700)
+    os.chmod(folder, 0o700)
+    if os.path.exists(path):
+        os.unlink(path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     old = os.umask(0o077)
     cwd = os.getcwd()
     try:
-        # Bound by its short name from inside the folder: socket paths are
-        # limited to 107 bytes, which a long home path could exceed.
-        os.chdir(AGENT_DIR)
-        srv.bind(os.path.basename(SOCK))
+        os.chdir(folder)
+        srv.bind(os.path.basename(path))
     finally:
         os.chdir(cwd)
         os.umask(old)
-    os.chmod(SOCK, 0o600)
+    os.chmod(path, 0o600)
     srv.listen(8)
-    srv.settimeout(1.0)
+    srv.setblocking(False)
+    return srv
+
+
+def project_names():
+    """The projects with a socket of their own: every folder under
+    projects/ with a project's name, except the supervisor."""
+    try:
+        entries = os.listdir(PROJECTS_DIR)
+    except OSError:
+        return set()
+    return set(e for e in entries if e != "supervisor" and name(e)
+               and os.path.isdir(os.path.join(PROJECTS_DIR, e)))
+
+
+def project_sock(project):
+    return os.path.join(PROJECTS_DIR, project, "agent", "agent.sock")
+
+
+def main():
+    os.makedirs(BOXEN_HOME, exist_ok=True)
+    sel = selectors.DefaultSelector()
+    srv = bind(SOCK)
+    sel.register(srv, selectors.EVENT_READ, None)
     sys.stderr.write("boxen-agentd: listening on %s, running %s\n" % (SOCK, BOXEN))
     sys.stderr.flush()
+    socks = {}        # project -> its listening socket
+
+    def rescan():
+        """Bind a socket for each new project, drop the ones of removed
+        projects (and rebind one whose socket file went missing)."""
+        current = project_names()
+        for p in list(socks):
+            if p not in current or not os.path.exists(project_sock(p)):
+                sel.unregister(socks[p])
+                socks[p].close()
+                del socks[p]
+                try:
+                    os.unlink(project_sock(p))
+                except OSError:
+                    pass
+                if p not in current:
+                    sys.stderr.write("boxen-agentd: %s removed\n" % p)
+        for p in sorted(current - set(socks)):
+            try:
+                socks[p] = bind(project_sock(p))
+            except OSError as e:
+                sys.stderr.write("boxen-agentd: can't listen for %s: %s\n" % (p, e))
+                continue
+            sel.register(socks[p], selectors.EVENT_READ, p)
+            sys.stderr.write("boxen-agentd: listening for %s\n" % p)
+        sys.stderr.flush()
 
     def stop(*_):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    last_scan = 0.0
     try:
         while True:
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                # Re-exec after an update, but never under a running command:
-                # the lock is held across the check and the exec.
-                if updated() and lock.acquire(blocking=False):
-                    try:
-                        sys.stderr.write("boxen-agentd: updated on disk; restarting\n")
-                        sys.stderr.flush()
-                        srv.close()
-                        os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)])
-                    finally:
-                        lock.release()
-                continue
-            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+            if time.monotonic() - last_scan >= RESCAN:
+                rescan()
+                last_scan = time.monotonic()
+            for key, _ in sel.select(timeout=1.0):
+                try:
+                    conn, _addr = key.fileobj.accept()
+                except OSError:
+                    continue
+                conn.setblocking(True)
+                threading.Thread(target=handle, args=(conn, key.data), daemon=True).start()
+            # Re-exec after an update, but never under a running command:
+            # taken as a global job, so nothing starts in between.
+            if updated() and idle_as_global(["self-update"]):
+                try:
+                    sys.stderr.write("boxen-agentd: updated on disk; restarting\n")
+                    sys.stderr.flush()
+                    sel.close()
+                    srv.close()
+                    for sk in socks.values():
+                        sk.close()
+                    os.execv(sys.executable, [sys.executable, os.path.realpath(__file__)])
+                finally:
+                    release(None)
     finally:
-        try:
-            os.unlink(SOCK)
-        except OSError:
-            pass
+        for path in [SOCK] + [project_sock(p) for p in socks]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
