@@ -1,13 +1,26 @@
 # boxen
 
-One Docker container per project on an Ubuntu VM, each running a Claude Code
-[Remote Control](https://code.claude.com/docs/en/remote-control) server that
-you drive from the Claude app's Code tab. Every container shares one
-`~/.claude` (login, settings, CLAUDE.md, skills, memory), so you sign in once.
+Claude Code agents on an Ubuntu VM, one project folder each, with every
+project's builds in a container of its own.
 
-Needs an Ubuntu 24.04 VM with sudo, and a Claude Pro, Max, Team or Enterprise
-plan signed in with a claude.ai account (on Team/Enterprise an Owner must
-enable Remote Control first).
+- **Agents run on the VM** as you, in `~/src/<project>`, inside Claude Code's
+  [sandbox](https://code.claude.com/docs/en/sandboxing): a session's shell can
+  write only its own project folder, reaches only GitHub, and can't use
+  Docker. Its file tools ask before touching anything outside the project.
+- **Builds run in containers**: each project has a build container
+  (`boxen.<project>.env`, Ubuntu 24.04) and optional sidecars (databases,
+  caches) under [rootless Docker](https://docs.docker.com/engine/security/rootless/),
+  defined in the project's own `.boxen/` folder. Agents reach it with
+  `boxen run`: root inside, which is you on the VM, so `apt` works and files
+  land as yours. Toolchains never collide and never touch the VM.
+- **Drive it from anywhere**: sessions are normal Claude Code sessions in
+  boxen's tmux, so you can work in a terminal (`boxen claude <project>`,
+  `boxen ui`, or plain `claude`) and in the Claude app at once: every
+  session connects to [Remote Control](https://code.claude.com/docs/en/remote-control).
+
+Needs an Ubuntu 24.04 VM with sudo, and a Claude Pro, Max, Team or
+Enterprise plan signed in with a claude.ai account (on Team/Enterprise an
+Owner must enable Remote Control).
 
 ## Install
 
@@ -18,10 +31,106 @@ gh repo clone theycallmeboxy/boxen ~/boxen
 ~/boxen/install.sh
 ```
 
-`install.sh` is safe to re-run: Docker CE, a few tools, the `docker` group,
-`boxen` in `~/.local/bin`, the base image, `boxen ui`'s Python environment
-(`~/.local/share/boxen/ui-venv`). Then log out and back in if
-`boxen` isn't on your PATH yet, run `boxen github`, and create a project.
+`install.sh` is safe to re-run. It installs Claude Code, the sandbox's
+`bubblewrap` and `socat` (with the AppArmor profile Ubuntu 24.04 needs for
+`bwrap`), Docker with rootless mode for your user (lingering on, cgroup
+delegation for limits), the GitHub CLI, tmux and vim; links `boxen` into
+`~/.local/bin`; and runs `boxen setup`: the base image, boxen's Claude
+settings and instructions, git settings for `~/src` and the token timer.
+
+Then: run `claude` once and `/login`, `boxen github`, `boxen new <name>`,
+and `boxen doctor` to check the whole setup. Coming from boxen v1? See
+[Moving from v1](#moving-from-v1).
+
+## Layout
+
+```
+~/src/<project>/             the project: repos, worktrees, build output (the agent's only writable place)
+~/src/<project>/.boxen/      its build container: Dockerfile, services.yaml (the agent may edit these)
+~/.claude/                   Claude Code: login, settings, sessions, memory (shared by every project)
+~/.config/boxen/             boxen's own: per-project compose files, repo lists, tokens (agents can't write here)
+~/.local/share/docker/       rootless Docker: images and volumes, all named boxen.<project>.*
+```
+
+## Day to day
+
+```bash
+boxen new myproj https://github.com/you/myproj   # or no URL for an empty folder
+boxen claude myproj        # a session in the project, in a tmux window (also in the app)
+boxen ui                   # the dashboard: projects, sessions, files, terminals
+boxen ls                   # build containers, sessions, serve, GitHub tokens
+```
+
+Sessions live in a tmux server of boxen's own (`tmux -L boxen`), so they keep
+running when SSH drops: `boxen ui` or `boxen claude` again reattaches. Plain
+`cd ~/src/myproj && claude` works too; `claude --resume` there finds the
+project's earlier sessions.
+
+Every interactive session also shows in the Claude app (boxen turns on
+**Enable Remote Control for all sessions**, unless you've set it yourself).
+To start new sessions from the app when nothing is running in a project,
+keep a Remote Control server up for it:
+
+```bash
+boxen serve myproj         # a server in tmux window myproj~serve; back after reboots
+boxen serve myproj --off
+```
+
+The first time, the server asks to trust the folder and to enable Remote
+Control: answer in `boxen ui`.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `new <name> [git-url]` | Create `~/src/<name>` (cloning the URL), its `.boxen/` and its build container |
+| `ls [--json]` | Projects: build container, Claude sessions, serve, GitHub tokens |
+| `claude <name> [args]` | A Claude session in the project (tmux window; in the app too) |
+| `serve [<name> [--off]]` | A Remote Control server for the project, kept up |
+| `ui [--restart]` | The dashboard |
+| `shell <name>` | A root shell in the project's build container |
+| `up <name\|all>` / `down <name\|all>` | Start (applying changes) / stop build containers and sidecars |
+| `rm <name> [--yes]` | Remove the build container, image, sidecars and their data; the code stays |
+| `repos <name> [add\|rm <owner/repo>...]` | The GitHub repos a project's tokens cover |
+| `github` | Connect GitHub |
+| `doctor [--lan <host:port>]` | Check rootless Docker, the sandbox and isolation |
+| `migrate [--cleanup]` | Move from boxen v1 |
+| `update` | Rebuild the base image and every build container |
+| `self-update` | Update boxen and apply it |
+
+## Build environments
+
+A project's build container is defined in its own folder, so the agent can
+set up its toolchain itself:
+
+- `.boxen/Dockerfile`: `FROM boxen-env:latest` (Ubuntu 24.04 with
+  build-essential, cmake, git, python3, curl). Built as root: `apt-get
+  install` directly, no `USER` lines.
+- `.boxen/services.yaml`: sidecars, each reachable from the build container
+  at its service name. Image, environment, named volumes, healthcheck,
+  depends_on and limits only: no ports, host paths, privileges or the Docker
+  socket. It's parsed in a container that sees only that file, then checked
+  by `bin/boxen-services` before anything starts.
+
+From the project folder (this is what agents run):
+
+```bash
+boxen run make test            # in the build container, same folder, same path
+boxen run -C api npm ci        # in a subfolder
+boxen run -d web npm run dev   # in the background; --logs web, --stop web, --ps
+boxen env apply                # rebuild after editing .boxen/ (errors are printed; nothing changes on a failure)
+boxen env show                 # containers, sidecars, GitHub repos
+boxen env logs postgres        # a sidecar's logs
+```
+
+`/root` in the build container is a volume (rustup, nvm, `pip --user`, caches
+survive rebuilds); anything else outside the project folder is rebuilt from
+the Dockerfile. Your own changes go in
+`~/.config/boxen/projects/<name>/compose.override.yaml` (service `env`, or a
+sidecar's name; see the `.example` next to it): ports to the VM or LAN, host
+folders, memory and CPU limits. Agents can't write there. Additions for every
+project's base image: `~/.config/boxen/env.local.Dockerfile`, starting with
+`FROM boxen-env:core`, then `boxen update`.
 
 ## Connect GitHub
 
@@ -29,11 +138,14 @@ gh repo clone theycallmeboxy/boxen ~/boxen
 boxen github
 ```
 
-Containers never get a long-lived GitHub token. A private GitHub App that you
-own mints 1-hour tokens per project, scoped to the repos on that project's list
-only (see below); the app's private key stays on the VM, cron refreshes the
-tokens, and git and `gh` inside the container pick them up. The walkthrough
-takes about 3 minutes:
+No agent gets a long-lived GitHub token. A private GitHub App that you own
+mints 1-hour tokens per project, scoped to the repos on that project's list;
+a systemd user timer refreshes them every 30 minutes. In a folder under
+`~/src/<project>`, git (through boxen's credential helper, set up by an
+`includeIf` in your `~/.gitconfig`) and `gh` (boxen's wrapper in
+`~/.local/bin`) use that project's tokens and never your own login. The
+app's private key is unreadable from the sandbox. The walkthrough takes
+about 3 minutes:
 
 1. It prints a link that pre-fills a new GitHub App (private, no webhook,
    permissions: Contents, Pull requests, Issues write; Actions, Checks,
@@ -44,21 +156,18 @@ takes about 3 minutes:
 3. It prints the app's install link. Choose **All repositories** so repos you
    create later work too.
 
-It also sets the commit identity for containers to your GitHub name and
-no-reply address (`ID+username@users.noreply.github.com`), unless
-`GIT_AUTHOR_EMAIL` is already in `boxen.env`; running projects are restarted
-to pick it up.
+It also sets the commit identity for repos under `~/src` to your GitHub name
+and no-reply address (`ID+username@users.noreply.github.com`), unless one is
+set already.
 
 ### Which repos a project can push to
 
-Each project has a list of repos its tokens cover, kept on the VM
-(`~/.config/boxen/projects/<name>/repos`, never mounted into a container) and
-changed only by you. It starts with the repo `boxen new` clones (or, for a
-project made before lists existed, its `origin` at the time); after that a
-project can't widen its own access by changing its remotes: a push to an
-unlisted repo fails with GitHub's usual auth error. A project can list
-several repos, from several owners (you, your orgs): boxen mints one token per
-owner, and git and `gh` inside pick the right one by the repo they talk to.
+Each project has a list of repos its tokens cover
+(`~/.config/boxen/projects/<name>/repos`), changed only by you. It starts
+with the repo `boxen new` clones (or the project's `origin` at the time);
+after that a project can't widen its own access by changing its remotes: a
+push to an unlisted repo fails with GitHub's usual auth error. A project can
+list repos from several owners: boxen mints one token per owner.
 
 ```bash
 boxen repos myproj                          # the list, each repo's state, and repos found unlisted
@@ -67,244 +176,116 @@ boxen repos myproj rm other/lib
 ```
 
 States: `ok` (the token covers it), `not your repo` (the app isn't installed
-on that account, so no token is possible: pulls work if it's public; to push,
-fork it and add the fork), `no access` (the app is on that account but not on
-this repo: add it to the app's installation on GitHub). `boxen repos` also
-lists the GitHub repos the project's folder mentions (every remote of the
-repo and of nested repos and submodules, read from their git config as text,
-never by running git) that aren't on the list, so a project asking for a
-fork or a second repo is one `add` away. Adding takes effect at once (tokens
-are minted again); in `boxen ui` (**G**) it asks you to confirm first, like
-trusting a folder.
-
-## Create a project
-
-```bash
-boxen new <name> [git-url]
-```
-
-`<name>` becomes the folder `~/src/<name>`, the container `boxen-<name>` and
-the name in the Claude app: lowercase letters and digits, single `-` or `_`
-between them, up to 40 characters (not `all`, `supervisor`, or `global`,
-`dashboard`, `ui`, which `boxen ui` uses).
-
-| You have | Run | Result |
-|---|---|---|
-| A repo on GitHub | `boxen new myproj https://github.com/you/myproj.git` | Cloned into `~/src/myproj` |
-| Nothing yet | `boxen new myproj` | Empty `~/src/myproj`; `git init` and add a remote later |
-| Code already in `~/src/myproj` | `boxen new myproj` | Uses the folder as-is |
-
-You'll be asked to sign in to Claude (first project only: open the URL on any
-device, paste the code back), then, with your terminal attached to the new
-server, **y** to trust the folder and (first time ever) **y** to enable Remote
-Control. boxen detaches on its own once the server is up, and the project
-appears in the app's Code tab.
-
-## Day to day
-
-### boxen ui
-
-`boxen ui` opens the dashboard: every project with its container, server,
-CPU, memory and GitHub token; per project its state, GitHub repos, sidecars,
-last apply, earlier sessions, logs and open terminals; and a jobs panel with
-the live output of everything you run from it. Actions go through `boxen`
-itself, and a question (trusting a folder, `rm`, adding a repo with **G**)
-comes up as a dialog. Shells, Claude,
-log tails and resumed sessions open as tmux windows (tabs at the bottom):
-**F1** (or **Ctrl+B 0**, when a program like htop wants the F-keys, which
-tmux takes first) comes back to the dashboard, **F2**/**F3** go to the
-previous/next window. It all runs in a tmux session of its own, so an SSH
-drop loses nothing: `boxen ui` again picks up where you were. **q** detaches
-(everything keeps running), **Q** quits it all, **?** lists the keys. After
-`boxen self-update`, `boxen ui --restart` loads the new dashboard.
-
-### Commands
-
-- `boxen ls` — every project: container, server state, GitHub token
-  (`--json` for scripts).
-- `boxen up <name|all>` — start; also applies env/compose changes, and if the
-  server is waiting on a question, lets you answer it.
-- `boxen down <name|all>` — stop.
-- `boxen restart <name|all>` — recreate the container (picks up env changes).
-- `boxen logs <name> [-f] [--tail N]` — the server's output, as plain text.
-- `boxen show <name>` — the project's environment: sidecars, the log of the
-  last apply run from inside it, `env/Dockerfile`, `env/services.yaml`,
-  whether it has a `compose.override.yaml`.
-- `boxen shell <name>` — bash inside the container.
-- `boxen claude <name> [args]` — a terminal Claude session inside it.
-- `boxen repos <name> [add|rm <owner/repo>...]` — the GitHub repos the
-  project's tokens cover (see "Which repos a project can push to").
-- `boxen rm <name> [--yes]` — remove container, image, config, the project's
-  home volume (tool installs: the next `boxen new` starts from a fresh home)
-  and sidecar data; keeps `~/src/<name>` and its Claude history.
-
-`boxen update` rebuilds the base image from a fresh Ubuntu with the newest
-stable Claude Code and then every project; `boxen update <name>` rebuilds one
-project. `boxen self-update` pulls the latest boxen, re-runs its installer and
-applies template changes to every project; servers restart, app sessions
-reconnect on their own. Running both monthly is reasonable.
+on that account: pulls work if it's public; to push, fork it and add the
+fork), `no access` (the app is on that account but not on this repo: add it
+to the app's installation on GitHub).
 
 ## Old conversations
 
-In any project session in the Claude app, send `/carry`. Claude lists that
-project's earlier conversations (date, length, title, whether already
-carried), you pick some (`/carry all`, `/carry new` for the ones not yet
-carried, `/carry 1 3`), and it reads each one and writes a handoff into the
-project's auto memory: goal, what was done, decisions and why, open items,
-gotchas, key files. Long conversations are read in full, in parts. Auto
-memory is on by default here, so every later session in that project loads
-it without being asked, and `/carry` ends with where things stand.
-Transcripts aren't changed, and boxen keeps them for 365 days (Claude Code's
-default is 30; a `cleanupPeriodDays` you've set is left alone).
+In any session, send `/carry`. Claude lists the project's earlier
+conversations, you pick some (`/carry all`, `/carry new`, `/carry 1 3`), and
+it writes a handoff for each into the project's auto memory: goal, outcome,
+decisions, open items, commands that worked. Long conversations are read in
+full, in parts. Transcripts aren't changed, and boxen keeps them for 365
+days (Claude Code's default is 30; a `cleanupPeriodDays` you've set is left
+alone). For an exact replay instead, `claude --resume` in the project folder.
 
-For an exact replay instead, `boxen resume <name>` on the VM lists the same
-sessions; pick one (or pass its number or ID) and it reopens in the Claude app
-with its full history, under "Remote Control" rather than the project, as
-`<name> · <title>`. `--force` opens one that's already open elsewhere,
-`--attach` shows it in your terminal (Ctrl+B then D to leave it running),
-`--stop` closes one you resumed. A restarted server brings its recent sessions
-back by itself; `resume` is for older ones.
+## Moving from v1
 
-## Supervisor
-
-`boxen supervisor` (run once, from a terminal on the VM) creates a project,
-"boxen supervisor", that runs boxen for you from the Claude app: what's
-running, start or stop a project, a server's log, a new project from a
-GitHub URL, resume an old conversation, update. Inside it, `boxen` is a
-client of a small listener on the VM (`boxen-agentd`: a systemd user service
-set up by `install.sh`, with a cron `@reboot` fallback) that runs the real
-boxen only for `ls`, `show`, `up`, `restart`, `down`, `logs --tail`,
-`update`, `self-update`, `new`, `resume`, `rm` and `tokens`, arguments
-checked first; no shell, no Docker socket, nothing that needs a terminal.
-Every other project gets a socket of its own, scoped to itself: inside it,
-`boxen` runs only `ls`, `show`, `logs`, `repos` (read only), `restart` and
-`update` for that project (see Customizing). When an action
-needs a decision (trusting a new folder, `rm`), boxen prints the exact
-question instead of answering, the supervisor shows it to you in the app,
-and only your yes re-runs it with `--approve trust` or `--yes`.
-
-Be clear about what that protects: the approval flow is enforced by the
-supervisor's instructions (its read-only `CLAUDE.md`), not by the listener,
-which accepts `--approve trust` and `--yes` from the container. It guards
-against mistakes and casual injection, not a fully compromised supervisor
-session. `down all`, `restart all` and `update` need no approval and are
-disruptive; `down all` from the supervisor leaves the supervisor itself
-running, so the app can't lock itself out. Every request goes to
-`~/.config/boxen/agent.log`.
-
-## Moving from a Mac
-
-`boxen import-mac` prints these with your details filled in. On the Mac:
+boxen v1 ran each project's Claude inside its container. To move:
 
 ```bash
-scp you@vm:boxen/mac/boxen-export ~/boxen-export
-bash ~/boxen-export you@vm                          # everything
-bash ~/boxen-export you@vm --only memory,config     # some scopes
-bash ~/boxen-export you@vm --projects alpha,gamma   # some projects
+cd ~/boxen && git pull && ./install.sh   # installs v2 beside v1 (the system Docker daemon stays on)
+boxen migrate                            # stops v1, brings everything across
+boxen doctor
+boxen migrate --cleanup                  # later, once you're happy: deletes v1's leftovers
 ```
 
-Scopes: `code` (project folders, and a boxen project for each), `memory`
-(auto memory per project), `sessions` (transcripts; includes memory) and
-`config` (`CLAUDE.md`, rules, skills, agents, commands, output styles;
-`settings.json` saved as `settings.mac.json` for reference; your MCP list).
+`migrate` copies v1's shared Claude config into `~/.claude` (login, settings,
+every session and memory: v1 used the same paths, so `claude --resume` in a
+project finds its sessions), turns each project's `env/Dockerfile` and
+`services.yaml` into `~/src/<project>/.boxen/` (showing the diff: `FROM` now
+names `boxen-env`, and `USER` lines go), copies sidecar volumes to rootless
+Docker, and builds each project's container. Repo lists and tokens stay as
+they are. Not copied: tool installs in v1's per-project home volumes (put
+what a project needs in its Dockerfile) and v1's `compose.override.yaml`
+(kept in `~/.config/boxen/projects/<project>/v1/`; v2's service is `env`).
+The supervisor project is gone; its files stay until `--cleanup`, which also
+turns the system Docker daemon off and takes you out of the `docker` group.
 
-- The Mac pushes over SSH (rsync); nothing on it is changed, and nothing
-  already on the VM is overwritten. Run `boxen github` first.
-- It shows a plan (one project per folder Claude Code was used in) to edit or
-  narrow before anything is copied; re-running reuses it and syncs again.
-- `node_modules`, virtualenvs and caches are skipped (`--exclude` for more).
-- New projects are started as they arrive (trust prompt included). Imported
-  sessions are continued with `boxen resume`.
-- MCP servers are listed in `~/.config/boxen/mac-mcp.json`, not installed.
-
-## Customizing
-
-A project's environment is its own: `~/.config/boxen/projects/<name>/env/`
-holds its `Dockerfile` and `services.yaml`, mounted at `/boxen` inside the
-container, so the project's Claude can set up its toolchain and sidecars
-itself and apply them with `boxen update` / `boxen restart` from inside (a
-shared `boxen.md` in `~/.claude` tells it how, and `env/STATUS.md`, written
-at every start, tells it the project's repo, push status, sidecars and
-timezone). Tools installed under the home folder (conda, cargo, go, npm,
-SDKs) live in a volume per project and survive rebuilds.
-
-| To change | Edit | Then |
-|---|---|---|
-| Packages for one project | `/boxen/Dockerfile` from inside the project (or `~/.config/boxen/projects/<name>/env/Dockerfile`) | `boxen update <name>` (or `boxen update` inside) |
-| Sidecar services (a database, a cache) for one project | `/boxen/services.yaml` (or `.../projects/<name>/env/services.yaml`): image, environment, named volumes, healthcheck, depends_on, limits; no ports, host paths or privileges | `boxen restart <name>` (or `boxen restart` inside) |
-| Everything else: ports, host mounts, limits on the `claude` service, `--spawn=worktree` | `~/.config/boxen/projects/<name>/compose.override.yaml` (see the `.example`) | `boxen restart <name>` |
-| Tools for every project | `~/.config/boxen/base.local.Dockerfile` (starts with `FROM boxen-base:core`) | `boxen update` |
-| Env for every project | `~/.config/boxen/boxen.env` | `boxen restart all` |
-| Env for one project | `~/.config/boxen/projects/<name>/project.env` | `boxen restart <name>` |
-
-Containers have no sudo, so Dockerfiles install as `root` and switch back to
-your user (the container runs as your user regardless: compose pins it).
-Install outside the home folder in a Dockerfile; the home folder is a
-volume that masks the image's copy. A `services.yaml` is parsed in a
-container that sees only that file, then checked before anything starts; a
-rejected one is printed and the project is left as it was. Don't edit files in this
-repo or a project's `compose.yaml` (`self-update` rewrites it);
-`compose.override.yaml` is never touched.
+To bring Claude Code work over from a Mac, see `tools/mac-to-boxen --help`.
 
 ## Security
 
-- Containers run as your UID with no sudo and `no-new-privileges`; no Docker
-  socket.
-- Sidecars from a project's `services.yaml` are restricted to an image,
-  named volumes of that project (`boxen.<project>.<name>`) and the project's
-  network: no host paths, published ports, privileges, capabilities, devices
-  or the Docker socket, and `no-new-privileges` plus a pids limit are added.
-  Files under `env/` are never followed through symlinks.
-- A project's own `boxen` socket is scoped to that project by which socket
-  it is (never by what the request says): `ls`, `show`, `logs`, `repos`
-  (read only), `restart`, `update` for itself, nothing for any other project.
-- Tool installs under a container's home folder persist per project in its
-  own volume, removed with `boxen rm`.
-- The shared `claude-config` volume isn't isolated between projects: any
-  container can read the login and every transcript. Untrusted code belongs
-  on another VM.
-- A project's GitHub tokens are visible to everything in its container,
-  hence only the repos you listed for it, and one hour. Its git remotes don't
-  widen that: the list lives on the VM, out of the container's reach. The
-  app's private key never enters a container.
-- Containers reach anything the VM can, including your LAN: give the VM its
-  own VLAN and block RFC1918 except what you need.
+What boxen promises, and what it doesn't:
+
+- **Between projects:** an agent's shell can't write outside its project
+  folder or reach Docker (Claude Code's sandbox, enforced by the OS with
+  bubblewrap); its file tools ask before writing outside it. `boxen run` and
+  `boxen env`, the sandbox's only exceptions, act only on the project of the
+  folder they're run in. This stops accidents. It's not a wall against a
+  hostile agent: all agents run as your user, can read each other's folders
+  and tokens, and could ask you to approve something. Run untrusted code on
+  another VM.
+- **The VM:** nothing an agent builds or installs lands on the VM: build
+  containers run under rootless Docker, where root is your own user, so even
+  a container escape isn't root. boxen never uses the system Docker daemon,
+  and `migrate --cleanup` takes you out of the `docker` group (which is root
+  in all but name).
+- **Settings boxen keeps:** in `~/.claude/settings.json`, re-applied at every
+  install: sandbox on and required (`failIfUnavailable`), no unsandboxed
+  retries, `boxen run *` and `boxen env *` excluded and allowed, network to
+  GitHub only, no reads of the Docker sockets, `~/.ssh`, gh's login or the
+  GitHub App's key. Your other settings are left alone.
+- **Sidecars and build containers** get the project folder (build container
+  only), named volumes of their project, and its own network: no host paths,
+  published ports, privileges, capabilities or devices unless you add them
+  in your override. A symlinked `.boxen/` file is refused.
+- **GitHub:** tokens last an hour and cover only the repos you listed.
+- **Network:** build containers and sidecars reach anything the VM can,
+  including your LAN. Give the VM its own VLAN and block RFC1918 except what
+  you need; `boxen doctor --lan <host:port>` checks it from a build container.
 - Cloned repos can carry hooks and settings (`.claude/settings.json`,
   `.mcp.json`); only trust repos you'd run yourself.
 
 ## Troubleshooting
 
-- **A project doesn't show in the app:** `boxen ls`. The SERVER column says
-  what to run: "waiting for an answer" or "not trusted" → `boxen up <name>`;
-  "not signed in" → `boxen login`. A climbing restart count means the server
-  keeps exiting; `boxen logs <name>` says why.
-- **Sign-in expired or wrong account:** `boxen login`.
-- **Env change didn't take effect:** `boxen restart <name>` (a plain Docker
-  restart doesn't re-read env files).
+Start with `boxen doctor`: it checks rootless Docker (and that files a
+container writes are yours), the sandbox's packages and AppArmor profile,
+boxen's Claude settings, git and token setup, and prints the one check that
+needs a real session.
+
+- **An agent says `boxen run` can't reach Docker:** it put something around
+  the command (`cd x &&`, a pipe, a redirect). `boxen run` has to be the whole
+  command line; the instructions boxen installs say so.
+- **A session doesn't show in the app:** Remote Control needs a claude.ai
+  login (`/login` in `claude`). `claude` → `/config` → "Enable Remote Control
+  for all sessions".
+- **Claude won't start ("sandbox unavailable"):** `boxen doctor`; usually
+  bubblewrap's AppArmor profile (re-run `install.sh`).
 - **Clone, push or `gh` fails with an auth error:** `boxen repos <name>`
-  shows whether the repo is on the project's list and its state. Usually
-  it isn't listed, the app isn't installed on that repo, or lacks a permission
-  (e.g. Workflows for `.github/workflows/`); `~/.config/boxen/tokens.log` has
-  cron-time failures. The VM's clock must be right.
+  shows whether the repo is listed and its state. `~/.config/boxen/tokens.log`
+  has the timer's failures. The VM's clock must be right.
+- **Limits (`mem_limit`, `cpus`) are ignored:** cgroup delegation applies
+  after a reboot; `boxen doctor` shows the driver.
 
 ## Network egress (VLAN allowlist)
 
 Claude Code: `api.anthropic.com`, `claude.ai`, `claude.com`,
 `platform.claude.com`, `downloads.claude.ai`. Optional:
 `mcp-proxy.anthropic.com` (claude.ai connectors), `registry.npmjs.org`
-(plugins, npx MCP servers), `raw.githubusercontent.com` (release notes),
-`code.claude.com` (doc lookups). Telemetry hosts are optional. See
+(plugins, npx MCP servers), `code.claude.com` (doc lookups). See
 [network configuration](https://code.claude.com/docs/en/network-config).
 
-GitHub: `github.com`, `api.github.com` (gh CLI).
+GitHub: `github.com`, `api.github.com`, `codeload.github.com`,
+`objects.githubusercontent.com`.
 
 Install and image builds: `download.docker.com`, `archive.ubuntu.com`,
 `security.ubuntu.com` (or `ports.ubuntu.com` on arm64), `cli.github.com`,
 Docker Hub (`registry-1.docker.io`, `auth.docker.io`,
 `production.cloudflare.docker.com`), and for `boxen ui`'s Python packages
-`pypi.org` and `files.pythonhosted.org`.
-
-Plus whatever package registries your projects use.
+`pypi.org` and `files.pythonhosted.org`. Plus whatever package registries
+your projects' builds use.
 
 Don't set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: it disables Remote
-Control. `boxen.env` lists the other settings that do.
+Control.
