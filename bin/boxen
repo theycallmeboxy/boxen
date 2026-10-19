@@ -125,6 +125,7 @@ require_setup() {
 dc() {
   local name=$1; shift
   local dir; dir=$(proj_dir "$name")
+  fresh_compose "$name" || return 1
   local files=(-f "$dir/compose.yaml")
   [[ -f "$dir/compose.services.yaml" ]] && files+=(-f "$dir/compose.services.yaml")
   [[ -f "$dir/compose.override.yaml" ]] && files+=(-f "$dir/compose.override.yaml")
@@ -245,7 +246,9 @@ cmd_setup() {
   # the new installer, and so this, before it re-renders every project.
   local n
   while read -r n; do
-    [[ -f "$(proj_dir "$n")/compose.yaml" ]] && migrate_env "$n"
+    [[ -f "$(proj_dir "$n")/compose.yaml" ]] || continue
+    migrate_env "$n"
+    fresh_compose "$n"
   done < <(projects)
   return 0
 }
@@ -801,14 +804,35 @@ server_state() {
 sed_esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 
 render() {
-  # $1 template, $2 name, $3 source dir
-  sed -e "s|__NAME__|$(sed_esc "$2")|g" \
-      -e "s|__USER__|$(sed_esc "$USER_NAME")|g" \
-      -e "s|__UID__|$USER_UID|g" \
-      -e "s|__GID__|$USER_GID|g" \
-      -e "s|__CHOME__|$(sed_esc "$CHOME")|g" \
-      -e "s|__BOXEN_HOME__|$(sed_esc "$BOXEN_HOME")|g" \
-      -e "s|__SRC__|$(sed_esc "$3")|g" "$1"
+  # $1 template, $2 name, $3 source dir. A placeholder this render doesn't
+  # know (a template newer than the running script) is never written out.
+  local out left
+  out=$(sed -e "s|__NAME__|$(sed_esc "$2")|g" \
+            -e "s|__USER__|$(sed_esc "$USER_NAME")|g" \
+            -e "s|__UID__|$USER_UID|g" \
+            -e "s|__GID__|$USER_GID|g" \
+            -e "s|__CHOME__|$(sed_esc "$CHOME")|g" \
+            -e "s|__BOXEN_HOME__|$(sed_esc "$BOXEN_HOME")|g" \
+            -e "s|__SRC__|$(sed_esc "$3")|g" "$1")
+  if left=$(grep -oE '__[A-Z_]+__' <<<"$out" | head -1) && [[ -n "$left" ]]; then
+    die "template $1 has unfilled placeholder $left"
+  fi
+  printf '%s\n' "$out"
+}
+
+# fresh_compose NAME: a compose.yaml with placeholders left in it was
+# written by an older boxen from a newer template (a self-update renders
+# with the code that started it); re-render it with this code before
+# compose sees it. Called from dc, so any command heals it.
+fresh_compose() {
+  local pdir
+  pdir=$(proj_dir "$1")
+  [[ -f "$pdir/compose.yaml" ]] || return 0
+  grep -qE '__[A-Z_]+__' "$pdir/compose.yaml" || return 0
+  render "$(compose_template "$1")" "$1" "$SRC_ROOT/$1" > "$pdir/compose.yaml.new" || return 1
+  mv -f "$pdir/compose.yaml.new" "$pdir/compose.yaml"
+  chmod 0644 "$pdir/compose.yaml"
+  printf '%s: compose.yaml was stale; re-rendered\n' "$1" >&2
 }
 
 # attach_prompts NAME: the server is waiting at one of Claude's one-time
@@ -1022,6 +1046,7 @@ wait_server() {
 start_project() {
   local n=$1 sc
   shift
+  fresh_compose "$n" || return 1
   render_services "$n" || return $?
   refresh_project "$n" || true
   write_status "$n" || return $?
@@ -1644,6 +1669,7 @@ cmd_show() {
 # container and wait for the server. One line of output.
 update_one() {
   local n=$1 sc
+  fresh_compose "$n" || return 1
   render_services "$n" || return $?
   run_quiet "building image for $n" dc "$n" build || return 1
   check_image_user "$n"
