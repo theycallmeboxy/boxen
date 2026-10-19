@@ -78,7 +78,7 @@ doctor_rootful() {
 }
 
 doctor_sandbox() {
-  local v s
+  local v
   d_head "Claude Code and its sandbox (agents)"
   if command -v claude >/dev/null; then
     v=$(claude --version 2>/dev/null | head -1 || true)
@@ -102,22 +102,27 @@ doctor_sandbox() {
       d_fail "bwrap can't build a sandbox here (bwrap --ro-bind / / --unshare-user --unshare-net true failed)"
     fi
   fi
-  s="$CLAUDE_DIR/settings.json"
-  if jq -e '.sandbox.enabled == true and .sandbox.failIfUnavailable == true and .sandbox.allowUnsandboxedCommands == false' "$s" >/dev/null 2>&1; then
-    d_ok "settings: sandbox on and required, no unsandboxed retries ($s)"
+  # boxen's rules are managed settings (see managed_settings in bin/boxen).
+  if [[ ! -f "$MANAGED" ]]; then
+    d_fail "boxen's sandbox settings aren't installed ($MANAGED missing): re-run install.sh"
+  elif ! jq -e --slurpfile want <(managed_settings) '. == $want[0]' "$MANAGED" >/dev/null 2>&1; then
+    d_fail "$MANAGED differs from what this boxen writes: re-run install.sh"
   else
-    d_fail "settings: the sandbox isn't on and required in $s (re-run install.sh)"
+    d_ok "managed settings: sandbox on and required, boxen run/env its only exceptions, runtime and Docker sockets hidden, no bypass mode ($MANAGED)"
   fi
-  if jq -e '(.sandbox.excludedCommands // []) | sort == ["boxen env *", "boxen run *"]' "$s" >/dev/null 2>&1; then
-    d_ok "settings: boxen run and boxen env are the sandbox's only exceptions"
-  else
-    d_warn "settings: sandbox.excludedCommands has more than boxen run/env: $(jq -c '.sandbox.excludedCommands' "$s" 2>/dev/null)"
-  fi
-  if jq -e --arg s "$DOCKER_SOCK" '(.sandbox.filesystem.denyRead // []) | index($s)' "$s" >/dev/null 2>&1; then
-    d_ok "settings: sandboxed commands can't open the Docker socket"
-  else
-    d_fail "settings: the Docker socket isn't in sandbox.filesystem.denyRead (re-run install.sh)"
-  fi
+  # Your own settings can add to the lists, and allow rules there decide
+  # what the file tools (not sandboxed) may do without asking.
+  local f broad extra
+  for f in "$CLAUDE_DIR/settings.json" "$CLAUDE_DIR/settings.local.json"; do
+    [[ -f "$f" ]] || continue
+    extra=$(jq -r '(.sandbox.excludedCommands // []) | map(select(. != "boxen run *" and . != "boxen env *")) | join(", ")' "$f" 2>/dev/null || true)
+    [[ -z "$extra" ]] || d_warn "$f takes more commands out of the sandbox: $extra"
+    broad=$(jq -r '(.permissions.allow // []) | map(select(test("^(Edit|Write|MultiEdit|NotebookEdit)(\\((\\*|\\*\\*|/\\*\\*|//\\*\\*|~/\\*\\*)\\))?$") or test("^Bash(\\(\\*\\))?$"))) | join(", ")' "$f" 2>/dev/null || true)
+    [[ -z "$broad" ]] || d_warn "$f allows without asking: $broad (file edits outside a project folder then don't ask either)"
+    if [[ "$(jq -r '.permissions.defaultMode // empty' "$f" 2>/dev/null)" == bypassPermissions ]]; then
+      d_warn "$f asks for bypassPermissions mode by default; boxen's managed settings turn that mode off"
+    fi
+  done
   if grep -qx '@boxen.md' "$CLAUDE_DIR/CLAUDE.md" 2>/dev/null && [[ -f "$CLAUDE_DIR/boxen.md" ]]; then
     d_ok "agents get boxen's instructions (CLAUDE.md imports boxen.md)"
   else
@@ -128,6 +133,8 @@ doctor_sandbox() {
         to run each of these; every one must fail (don't approve a retry):
           touch ~/sandbox-probe        (Read-only file system)
           docker ps                    (can't connect)
+          tmux -L boxen ls             (no server: its socket is hidden)
+          systemctl --user status      (can't connect to the bus)
           curl -sI https://example.com (blocked by the sandbox proxy)
         and this one must work:  boxen run echo ok
 EOF
@@ -137,10 +144,23 @@ doctor_github() {
   d_head "GitHub"
   if app_configured; then d_ok "GitHub App: $(app_conf APP_SLUG)"
   else d_warn "GitHub isn't connected (boxen github): agents can't push"; fi
-  if git config --global --get-all "includeIf.gitdir:$SRC_ROOT/.path" 2>/dev/null | grep -qxF "$GITCONFIG"; then
+  local t helpers
+  if git config --global --get-all "includeIf.gitdir:$SRC_ROOT/.path" 2>/dev/null | grep -xF "$GITCONFIG" >/dev/null; then
     d_ok "git in $SRC_ROOT uses boxen's tokens and identity ($GITCONFIG)"
   else
     d_fail "$HOME/.gitconfig doesn't include $GITCONFIG for $SRC_ROOT (re-run install.sh)"
+  fi
+  # What git really asks, in a repo under ~/src: boxen's helper must be the
+  # last one after the last reset (gh auth setup-git, for one, adds a reset
+  # and its own helper after boxen's include).
+  t=$(mktemp -d -p "$SRC_ROOT" .boxen-doctor.XXXXXX)
+  git init -q "$t" 2>/dev/null
+  helpers=$(git -C "$t" config --get-all credential.https://github.com.helper 2>/dev/null | awk 'NF == 0 { n = 0; next } { h[n++] = $0 } END { for (i = 0; i < n; i++) print h[i] }')
+  rm -rf "$t"
+  if [[ "$helpers" == "!"*" git-credential" && "$helpers" != *$'\n'* ]]; then
+    d_ok "in $SRC_ROOT, git asks only boxen for GitHub credentials"
+  else
+    d_fail "in $SRC_ROOT, git asks other credential helpers too (${helpers//$'\n'/; }): re-run install.sh (moves boxen's include last), and don't run 'gh auth setup-git' on the VM"
   fi
   if systemctl --user is-active --quiet boxen-tokens.timer 2>/dev/null; then
     d_ok "the boxen-tokens timer refreshes tokens every 30 minutes"

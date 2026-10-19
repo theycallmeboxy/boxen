@@ -446,7 +446,9 @@ cmd_tokens() {
   if (( $# )); then
     for n in "$@"; do require_project "$n"; list+=("$n"); done
   else
-    mapfile -t list < <(projects)
+    # v1 projects too, until they're migrated: their containers read the
+    # same token files.
+    mapfile -t list < <(projects; v1_projects | grep -vx supervisor || true)
   fi
   for n in "${list[@]}"; do
     refresh_project "$n" || rc=1
@@ -554,7 +556,7 @@ cmd_github() {
     url="https://github.com/settings/apps/new?name=boxen-$login"
     url+="&description=Short-lived%20per-repo%20tokens%20for%20boxen%20projects"
     url+="&url=https://github.com/$login&public=false&webhook_active=false"
-    url+="&contents=write&pull_requests=write&issues=write"
+    url+="&contents=write&pull_requests=write&issues=write&workflows=write"
     url+="&actions=read&checks=read&statuses=read&metadata=read"
     cat <<EOF
 

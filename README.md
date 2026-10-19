@@ -35,8 +35,10 @@ gh repo clone theycallmeboxy/boxen ~/boxen
 `bubblewrap` and `socat` (with the AppArmor profile Ubuntu 24.04 needs for
 `bwrap`), Docker with rootless mode for your user (lingering on, cgroup
 delegation for limits), the GitHub CLI, tmux and vim; links `boxen` into
-`~/.local/bin`; and runs `boxen setup`: the base image, boxen's Claude
-settings and instructions, git settings for `~/src` and the token timer.
+`~/.local/bin`; runs `boxen setup` (the base image, boxen's instructions for
+agents, git settings for `~/src`, the token timer); and installs boxen's
+Claude Code sandbox rules as managed settings,
+`/etc/claude-code/managed-settings.d/boxen.json` (see [Security](#security)).
 
 Then: run `claude` once and `/login`, `boxen github`, `boxen new <name>`,
 and `boxen doctor` to check the whole setup. Coming from boxen v1? See
@@ -123,9 +125,11 @@ boxen env show                 # containers, sidecars, GitHub repos
 boxen env logs postgres        # a sidecar's logs
 ```
 
-`/root` in the build container is a volume (rustup, nvm, `pip --user`, caches
-survive rebuilds); anything else outside the project folder is rebuilt from
-the Dockerfile. Your own changes go in
+Only the project folder and the download caches (`/root/.cache`, where pip,
+npm, go and cargo's caches are pointed) survive a rebuild; everything else
+in the container comes from the Dockerfiles, so what a project needs goes
+there (rustup installs into `/opt/cargo`; set paths with `ENV`). Your own
+changes go in
 `~/.config/boxen/projects/<name>/compose.override.yaml` (service `env`, or a
 sidecar's name; see the `.example` next to it): ports to the VM or LAN, host
 folders, memory and CPU limits. Agents can't write there. Additions for every
@@ -148,9 +152,13 @@ app's private key is unreadable from the sandbox. The walkthrough takes
 about 3 minutes:
 
 1. It prints a link that pre-fills a new GitHub App (private, no webhook,
-   permissions: Contents, Pull requests, Issues write; Actions, Checks,
-   Statuses read). Click **Create GitHub App**, copy the **Client ID**, and
-   click **Generate a private key** (a `.pem` downloads).
+   permissions: Contents, Pull requests, Issues, Workflows write; Actions,
+   Checks, Statuses read). Click **Create GitHub App**, copy the **Client
+   ID**, and click **Generate a private key** (a `.pem` downloads). An app
+   made by v1 has no Workflows permission, so pushes that touch
+   `.github/workflows/` fail: add it in the app's settings on GitHub
+   (Permissions, Workflows: Read and write) and accept it on the
+   installation.
 2. Paste the Client ID, then the `.pem` file's contents (not echoed; a `*`
    per line). If the file is on the VM: `boxen github --key /path/to/file.pem`.
 3. It prints the app's install link. Choose **All repositories** so repos you
@@ -158,7 +166,9 @@ about 3 minutes:
 
 It also sets the commit identity for repos under `~/src` to your GitHub name
 and no-reply address (`ID+username@users.noreply.github.com`), unless one is
-set already.
+set already. Don't run `gh auth setup-git` on the VM: it puts gh's own
+credential helper after boxen's; `boxen doctor` catches it and re-running
+`install.sh` fixes it.
 
 ### Which repos a project can push to
 
@@ -201,9 +211,9 @@ boxen doctor
 boxen migrate --cleanup                  # later, once you're happy: deletes v1's leftovers
 ```
 
-`migrate` copies v1's shared Claude config into `~/.claude` (login, settings,
-every session and memory: v1 used the same paths, so `claude --resume` in a
-project finds its sessions), turns each project's `env/Dockerfile` and
+`migrate` copies v1's shared Claude config into `~/.claude` (login, settings
+except permissions, every session and memory: v1 used the same paths, so
+`claude --resume` in a project finds its sessions), turns each project's `env/Dockerfile` and
 `services.yaml` into `~/src/<project>/.boxen/` (showing the diff: `FROM` now
 names `boxen-env`, and `USER` lines go), copies sidecar volumes to rootless
 Docker, and builds each project's container. Repo lists and tokens stay as
@@ -220,23 +230,36 @@ To bring Claude Code work over from a Mac, see `tools/mac-to-boxen --help`.
 What boxen promises, and what it doesn't:
 
 - **Between projects:** an agent's shell can't write outside its project
-  folder or reach Docker (Claude Code's sandbox, enforced by the OS with
-  bubblewrap); its file tools ask before writing outside it. `boxen run` and
-  `boxen env`, the sandbox's only exceptions, act only on the project of the
-  folder they're run in. This stops accidents. It's not a wall against a
-  hostile agent: all agents run as your user, can read each other's folders
-  and tokens, and could ask you to approve something. Run untrusted code on
-  another VM.
+  folder or reach Docker, systemd or tmux (Claude Code's sandbox, enforced
+  by the OS with bubblewrap); its file tools ask before writing outside it,
+  and bypass mode is off. `boxen run` and `boxen env`, the sandbox's only
+  exceptions, act only on the project of the folder they're run in. This
+  stops accidents. It's not a wall against a hostile agent: all agents run
+  as your user, can read each other's folders and tokens, and could ask you
+  to approve something. Run untrusted code on another VM.
+- **Inside a project:** the sandbox keeps the shell from writing a repo's
+  `.git/config` and hooks or the project's `.claude/` settings, but
+  `boxen run` (the build container, which mounts the project read-write)
+  can. A build that sets `core.hooksPath` (husky) or `core.fsmonitor` makes
+  git run those programs unsandboxed, for Claude Code and for you; look
+  before trusting a repo that does.
 - **The VM:** nothing an agent builds or installs lands on the VM: build
   containers run under rootless Docker, where root is your own user, so even
   a container escape isn't root. boxen never uses the system Docker daemon,
   and `migrate --cleanup` takes you out of the `docker` group (which is root
   in all but name).
-- **Settings boxen keeps:** in `~/.claude/settings.json`, re-applied at every
-  install: sandbox on and required (`failIfUnavailable`), no unsandboxed
-  retries, `boxen run *` and `boxen env *` excluded and allowed, network to
-  GitHub only, no reads of the Docker sockets, `~/.ssh`, gh's login or the
-  GitHub App's key. Your other settings are left alone.
+- **Settings boxen keeps:** managed settings in
+  `/etc/claude-code/managed-settings.d/boxen.json`, which outrank every
+  settings file (yours, a project's, a migrated v1 config): sandbox on and
+  required (`failIfUnavailable`), no unsandboxed retries, `boxen run *` and
+  `boxen env *` excluded and allowed, network to GitHub only, nothing of
+  `$XDG_RUNTIME_DIR` (rootless Docker, systemd, D-Bus), the tmux sockets or
+  the system Docker socket, no `~/.ssh`, gh's login, the GitHub App's key or
+  `GITHUB_TOKEN`/`GH_TOKEN` in a sandboxed command, and no
+  `bypassPermissions` mode. In `~/.claude/settings.json` boxen only sets
+  defaults you haven't (Remote Control for every session, a year of
+  transcripts). `boxen doctor` warns about allow rules there broad enough
+  to let the file tools edit outside a project without asking.
 - **Sidecars and build containers** get the project folder (build container
   only), named volumes of their project, and its own network: no host paths,
   published ports, privileges, capabilities or devices unless you add them
@@ -255,9 +278,10 @@ container writes are yours), the sandbox's packages and AppArmor profile,
 boxen's Claude settings, git and token setup, and prints the one check that
 needs a real session.
 
-- **An agent says `boxen run` can't reach Docker:** it put something around
-  the command (`cd x &&`, a pipe, a redirect). `boxen run` has to be the whole
-  command line; the instructions boxen installs say so.
+- **An agent says `boxen run` "ran inside Claude Code's sandbox":** it put
+  something around the command (`cd x &&`, a pipe, a redirect). `boxen run`
+  has to be the whole command line; the message and boxen's instructions
+  say so.
 - **A session doesn't show in the app:** Remote Control needs a claude.ai
   login (`/login` in `claude`). `claude` → `/config` → "Enable Remote Control
   for all sessions".

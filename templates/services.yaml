@@ -13,8 +13,10 @@
 # Everything else is rejected: no ports, no host paths (volumes are named,
 # "pgdata" below, and stored as boxen.__NAME__.pgdata), no privileges, caps,
 # devices, network modes, build, env_file, the Docker socket. Values are
-# taken literally ($ isn't expanded). At most 8 services; names are
-# lowercase, not "env", not starting with "boxen"; no volume called "home".
+# taken literally: $ is never expanded from the VM, and $ and $$ both mean
+# one literal $ (so "pg_isready -U $$POSTGRES_USER" works in a healthcheck,
+# as in compose's docs). At most 8 services; names are lowercase, not
+# "env", not starting with "boxen"; no volume called "cache".
 # To reach a sidecar from the VM or the LAN, the user adds ports in
 # ~/.config/boxen/projects/__NAME__/compose.override.yaml.
 #

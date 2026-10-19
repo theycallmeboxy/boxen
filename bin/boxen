@@ -247,7 +247,11 @@ require_docker() {
     # The socket is there but can't be reached: most likely a Claude Code
     # sandbox, which blocks it (boxen run/env are excluded only when they
     # are the whole command line).
-    [[ ! -S "$DOCKER_SOCK" ]] || die "can't reach Docker. In a Claude session: make 'boxen run ...' the whole command line (no 'cd ... &&', pipes, redirects or \$(...)); otherwise check 'systemctl --user status docker'"
+    # (Inside the sandbox the socket is hidden: denied, it's /dev/null.)
+    if [[ -n "${SANDBOX_RUNTIME:-}" || -c "$DOCKER_SOCK" ]]; then
+      die "this ran inside Claude Code's sandbox, which blocks Docker: make 'boxen run ...' (or 'boxen env ...') the whole command line, with no 'cd ... &&', pipes, redirects or \$(...) around it"
+    fi
+    [[ ! -S "$DOCKER_SOCK" ]] || die "can't reach rootless Docker at $DOCKER_HOST (systemctl --user status docker)"
     die "can't reach rootless Docker at $DOCKER_HOST (systemctl --user start docker; or re-run $BOXEN_REPO/install.sh)"
   fi
   [[ "$so" == *rootless* ]] || die "the Docker daemon at $DOCKER_HOST isn't rootless; boxen's build containers need it to be (see install.sh)"
@@ -319,18 +323,20 @@ render() {
 }
 
 # write_compose NAME: compose.yaml from the template, and the override
-# example. A compose.yaml you edited by hand (it differs from both the new
-# render and OLD, the render of the template it came from, when known) is
-# kept as compose.yaml.old.
+# example. The template each project was rendered from is kept next to it
+# (.compose.template), so a compose.yaml edited by hand (it differs from
+# both the new render and the render of that template) is recognized and
+# kept as compose.yaml.old. Every `boxen setup` runs this for every
+# project, with the code that's just been installed.
 write_compose() {
-  local n=$1 old=${2:-} pdir new prev
+  local n=$1 pdir new prev
   pdir=$(proj_dir "$n")
   mkdir -p "$pdir"
   new=$(mktemp -p "$pdir" .compose.XXXXXX)
-  render "$BOXEN_REPO/templates/compose.yaml" "$n" > "$new"
+  render "$BOXEN_REPO/templates/compose.yaml" "$n" > "$new" || { rm -f "$new"; return 1; }
   if [[ -f "$pdir/compose.yaml" ]] && ! cmp -s "$pdir/compose.yaml" "$new"; then
     prev=$(mktemp)
-    if [[ -n "$old" && -s "$old" ]]; then render "$old" "$n" > "$prev" 2>/dev/null || true; fi
+    if [[ -f "$pdir/.compose.template" ]]; then render "$pdir/.compose.template" "$n" > "$prev" 2>/dev/null || true; fi
     if ! cmp -s "$pdir/compose.yaml" "$prev"; then
       cp -f "$pdir/compose.yaml" "$pdir/compose.yaml.old"
       echo "$n: compose.yaml had your edits; kept as compose.yaml.old (they belong in compose.override.yaml)"
@@ -339,6 +345,7 @@ write_compose() {
   fi
   chmod 0644 "$new"
   mv -f "$new" "$pdir/compose.yaml"
+  cp -f "$BOXEN_REPO/templates/compose.yaml" "$pdir/.compose.template"
   render "$BOXEN_REPO/templates/compose.override.example.yaml" "$n" > "$pdir/compose.override.example.yaml"
 }
 
@@ -416,22 +423,25 @@ compose_plugin() {
   return 1
 }
 
-# render_services NAME: .boxen/services.yaml -> compose.services.yaml (dc
-# adds it when it exists). The file is normalized by `docker compose
-# config` in a container with no network that sees only a copy of it
-# (`include:` and `extends:` can't pull in other files), then checked by
+# render_services NAME: .boxen/services.yaml -> the sidecars' compose file,
+# staged as compose.services.yaml.new (empty: no sidecars) until
+# commit_services puts it in place, so a later failure (the build) leaves
+# the running definition as it was. The file is normalized by `docker
+# compose config` in a container with no network that sees only a copy of
+# it (`include:` and `extends:` can't pull in other files), then checked by
 # boxen-services, which renames volumes to this project's and refuses
 # anything that could reach the VM. Problems are printed, rc 2.
 render_services() {
   local n=$1 pdir sf json out err rc=0 tmpd plugin
   pdir=$(proj_dir "$n")
+  rm -f "$pdir/compose.services.yaml.new"
   tmpd=$(mktemp -d)
   sf="$tmpd/services.yaml"
   env_read "$n" services.yaml > "$sf" || rc=$?
   if (( rc == 2 )); then rm -rf "$tmpd"; return 2; fi
   if (( rc == 1 )) || ! services_declared < "$sf"; then
     rm -rf "$tmpd"
-    rm -f "$pdir/compose.services.yaml"
+    : > "$pdir/compose.services.yaml.new"
     return 0
   fi
   rc=0
@@ -448,13 +458,26 @@ render_services() {
   if (( rc )); then
     printf 'boxen: %s: services.yaml rejected; nothing changed\n' "$n" >&2
   elif [[ "$(jq -r '.services | length' "$out")" == 0 ]]; then
-    rm -f "$pdir/compose.services.yaml"
+    : > "$pdir/compose.services.yaml.new"
   else
     chmod 0644 "$out"
-    mv -f "$out" "$pdir/compose.services.yaml"
+    mv -f "$out" "$pdir/compose.services.yaml.new"
   fi
   rm -rf "$json" "$out" "$err" "$tmpd"
   return "$rc"
+}
+
+# commit_services NAME: what render_services staged becomes the sidecars'
+# compose file (an empty one: no sidecars).
+commit_services() {
+  local pdir
+  pdir=$(proj_dir "$1")
+  [[ -e "$pdir/compose.services.yaml.new" ]] || return 0
+  if [[ -s "$pdir/compose.services.yaml.new" ]]; then
+    mv -f "$pdir/compose.services.yaml.new" "$pdir/compose.services.yaml"
+  else
+    rm -f "$pdir/compose.services.yaml.new" "$pdir/compose.services.yaml"
+  fi
 }
 
 sidecar_names() {
@@ -474,8 +497,9 @@ start_env() {
   [[ -f "$(bdir "$n")/Dockerfile" ]] || { printf 'boxen: %s: .boxen/Dockerfile is missing\n' "$n" >&2; return 2; }
   render_services "$n" || return $?
   if [[ "${2:-}" == --build ]] || ! docker image inspect "boxen-env-$n:latest" >/dev/null 2>&1; then
-    run_quiet "building $n's build container (.boxen/Dockerfile)" dc "$n" build || return 1
+    run_quiet "building $n's build container (.boxen/Dockerfile)" dc "$n" build env || return 1
   fi
+  commit_services "$n"
   run_quiet "starting $n" dc "$n" up -d --remove-orphans || return 1
   sc=$(sidecar_names "$n" | paste -sd, - | sed 's/,/, /g')
   echo "$n: build container up${sc:+; sidecars: $sc}"
@@ -617,49 +641,64 @@ write_unit() {
 
 # ---------------------------------------------------------------- Claude
 
-# claude_settings: the settings in ~/.claude/settings.json that make boxen's
-# isolation hold, merged into yours (every other key is left alone; lists
-# get boxen's entries added). Kept on at every setup:
-#   - the sandbox, on, required (failIfUnavailable), with no unsandboxed
-#     retries; `boxen run` and `boxen env` are its only exceptions (they act
-#     on the folder they're run in), and are allowed without a prompt
+# managed_settings: the Claude Code settings boxen's isolation depends on,
+# as JSON. install.sh puts them in /etc/claude-code/managed-settings.d/
+# boxen.json (with sudo): managed settings rank above every other file, so
+# nothing in your settings, a project's or an old config can loosen them,
+# and a project's own settings can't take a command out of the sandbox.
+#   - the sandbox: on, required (Claude won't start without it), no
+#     unsandboxed retries; `boxen run` and `boxen env` are its only
+#     exceptions (they act on the folder they're run in), allowed without a
+#     prompt
 #   - its network: GitHub only
-#   - no reading the Docker sockets, SSH keys, gh's login or the GitHub
-#     App's key from a sandboxed command
-#   - Remote Control for every session, unless you set it yourself
-#   - transcripts kept a year (cleanupPeriodDays), unless you set it
+#   - nothing of the session's runtime folder ($XDG_RUNTIME_DIR: rootless
+#     Docker's socket, the systemd and D-Bus sockets) or of the tmux
+#     sockets: a command there would run outside the sandbox; nor the
+#     system Docker sockets
+#   - no reading SSH keys, gh's login or the GitHub App's key, and no
+#     GITHUB_TOKEN/GH_TOKEN from your environment, in a sandboxed command
+#   - no bypassPermissions mode: the file tools aren't sandboxed, and
+#     without prompts they could write anywhere
+managed_settings() {
+  local deny=("$RUNTIME_DIR" "/tmp/tmux-$USER_UID" /var/run/docker.sock /run/docker.sock)
+  jq -n --arg key "$GH_DIR" '{
+    sandbox: {
+      enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
+      excludedCommands: ["boxen run *", "boxen env *"],
+      network: {allowedDomains: ["github.com", "api.github.com", "*.githubusercontent.com"]},
+      filesystem: {denyRead: $ARGS.positional},
+      credentials: {
+        files: [{path: "~/.ssh", mode: "deny"}, {path: "~/.config/gh", mode: "deny"}, {path: $key, mode: "deny"}],
+        envVars: [{name: "GITHUB_TOKEN", mode: "deny"}, {name: "GH_TOKEN", mode: "deny"},
+                  {name: "GH_ENTERPRISE_TOKEN", mode: "deny"}, {name: "GITHUB_ENTERPRISE_TOKEN", mode: "deny"}]
+      }
+    },
+    permissions: {
+      allow: ["Bash(boxen run *)", "Bash(boxen env *)"],
+      disableBypassPermissionsMode: "disable"
+    }
+  }' --args "${deny[@]}"
+}
+MANAGED="/etc/claude-code/managed-settings.d/boxen.json"
+
+# claude_settings: your own ~/.claude/settings.json gets two defaults, each
+# only if you haven't set it: Remote Control for every session, and
+# transcripts kept a year (cleanupPeriodDays). Everything else is yours.
 claude_settings() {
-  local s="$CLAUDE_DIR/settings.json" tmp socks=() p
+  local s="$CLAUDE_DIR/settings.json" tmp
   mkdir -p "$CLAUDE_DIR"
   [[ -s "$s" ]] || printf '{}\n' > "$s"
   if ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
-    warn "$s isn't a JSON object, so boxen's sandbox settings are NOT applied; fix it and re-run install.sh"
+    warn "$s isn't a JSON object; leaving it alone"
     return 1
   fi
-  socks=("$DOCKER_SOCK")
-  for p in /var/run/docker.sock /run/docker.sock; do [[ -e "$p" ]] && socks+=("$p"); done
   tmp=$(mktemp -p "$CLAUDE_DIR" .settings.XXXXXX)
-  jq --arg key "$GH_DIR" --args '
-    def union($a; $b): ($a // []) as $a | $a + [$b[] | select(. as $x | $a | index([$x]) | not)];
-    .cleanupPeriodDays //= 365
-    | if has("remoteControlAtStartup") then . else .remoteControlAtStartup = true end
-    | .sandbox = ((.sandbox // {}) + {enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false})
-    | .sandbox.excludedCommands = union(.sandbox.excludedCommands; ["boxen run *", "boxen env *"])
-    | .sandbox.network = (.sandbox.network // {})
-    | .sandbox.network.allowedDomains = union(.sandbox.network.allowedDomains;
-        ["github.com", "api.github.com", "*.githubusercontent.com"])
-    | .sandbox.filesystem = (.sandbox.filesystem // {})
-    | .sandbox.filesystem.denyRead = union(.sandbox.filesystem.denyRead; $ARGS.positional)
-    | .sandbox.credentials = (.sandbox.credentials // {})
-    | .sandbox.credentials.files = union(.sandbox.credentials.files;
-        [{path: "~/.ssh", mode: "deny"}, {path: "~/.config/gh", mode: "deny"}, {path: $key, mode: "deny"}])
-    | .permissions = (.permissions // {})
-    | .permissions.allow = union(.permissions.allow; ["Bash(boxen run *)", "Bash(boxen env *)"])
-  ' "${socks[@]}" < "$s" > "$tmp" || { rm -f "$tmp"; warn "couldn't update $s"; return 1; }
+  jq '.cleanupPeriodDays //= 365
+      | if has("remoteControlAtStartup") then . else .remoteControlAtStartup = true end' "$s" > "$tmp" \
+    || { rm -f "$tmp"; warn "couldn't update $s"; return 1; }
   if cmp -s "$tmp" "$s"; then rm -f "$tmp"; return 0; fi
   chmod --reference="$s" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
   mv -f "$tmp" "$s"
-  info "Claude settings: sandbox on for every session, boxen run/env its only exceptions ($s)"
 }
 
 # claude_config: boxen.md (how agents work here) next to the shared
@@ -698,6 +737,12 @@ cmd_setup() {
   write_gitconfig
   ensure_token_timer || true
   serve_unit || true
+  # Every project's compose.yaml from the template just installed (a
+  # project a self-update skipped, busy, catches up here).
+  local n
+  while read -r n; do
+    locked "$n" write_compose "$n" || warn "$n: couldn't update its compose.yaml (busy?); the next setup tries again"
+  done < <(projects)
 }
 
 # ---------------------------------------------------------------- new
@@ -814,8 +859,12 @@ cmd_run() {
   if [[ -t 0 && -t 1 ]]; then t=(-it); fi
   case $mode in
     exec)
-      exec docker exec "${t[@]}" -w "$target" -e "TERM=${TERM:-dumb}" "$(env_name "$HERE")" \
-        bash -lc 'exec "$@"' boxen-run "$@" ;;
+      # In a terminal, Ctrl+C reaches the command through it.
+      if [[ -t 0 && -t 1 ]]; then
+        exec docker exec -it -w "$target" -e "TERM=${TERM:-dumb}" "$(env_name "$HERE")" \
+          bash -lc 'exec "$@"' boxen-run "$@"
+      fi
+      run_supervised "$target" "$@" ;;
     bg)
       exec docker exec -i -w "$target" "$(env_name "$HERE")" \
         bash -lc 'exec boxen-bg start "$@"' boxen-run "$name" "$@" ;;
@@ -823,6 +872,29 @@ cmd_run() {
     stop) exec docker exec -i "$(env_name "$HERE")" boxen-bg stop "$name" ;;
     ps)   exec docker exec -i "$(env_name "$HERE")" boxen-bg ps ;;
   esac
+}
+
+# run_supervised DIR CMD...: boxen run without a terminal (how agents run
+# it). docker exec doesn't stop a command whose client goes away, so the
+# command runs under boxen-exec with an ID, and if this process is
+# interrupted (Claude's Esc or command timeout send it a signal), it ends
+# the command's whole process group in the container before exiting.
+run_supervised() {
+  local target=$1 c id in pid rc=0
+  shift
+  c=$(env_name "$HERE")
+  id=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+  # A background job gets /dev/null as its input unless it's given one.
+  exec {in}<&0
+  docker exec -i -w "$target" -e "TERM=${TERM:-dumb}" "$c" \
+    boxen-exec "$id" bash -lc 'exec "$@"' boxen-run "$@" <&"$in" &
+  pid=$!
+  exec {in}<&-
+  # shellcheck disable=SC2064  # c, id and pid are fixed now, on purpose
+  trap "docker exec '$c' boxen-exec --kill '$id' >/dev/null 2>&1; kill '$pid' 2>/dev/null; exit 130" INT TERM HUP
+  wait "$pid" || rc=$?
+  trap - INT TERM HUP
+  exit "$rc"
 }
 
 cmd_env() {
@@ -1268,7 +1340,7 @@ cmd_update() {
 }
 
 cmd_self_update() {
-  local old new changed n r list=() failed=() oldt rebuild=0
+  local old new changed n r list=() failed=() rebuild=0
   lock_global
   old=$(git -C "$BOXEN_REPO" rev-parse HEAD)
   run_quiet "git pull" nolocks git -c gc.autoDetach=false -C "$BOXEN_REPO" pull --ff-only \
@@ -1280,19 +1352,17 @@ cmd_self_update() {
   changed=$(git -C "$BOXEN_REPO" diff --name-only "$old" "$new")
   info "running the updated installer"
   BOXEN_SELF_UPDATE=1 nolocks "$BOXEN_REPO/install.sh"
+  # The installer's setup rewrote every project's compose.yaml; a changed
+  # base image or template means rebuilding the running ones.
   mapfile -t list < <(projects)
-  oldt=$(mktemp)
-  git -C "$BOXEN_REPO" show "$old:templates/compose.yaml" > "$oldt" 2>/dev/null || true
   grep -qE '^(image/|templates/compose\.yaml$)' <<<"$changed" && rebuild=1
   for n in "${list[@]}"; do
     r=0
-    locked "$n" write_compose "$n" "$oldt" || r=$?
-    if (( ! r && rebuild )) && docker inspect "$(env_name "$n")" >/dev/null 2>&1; then
+    if (( rebuild )) && docker inspect "$(env_name "$n")" >/dev/null 2>&1; then
       locked "$n" update_one "$n" || r=$?
     fi
     (( r == 0 )) || failed+=("$n")
   done
-  rm -f "$oldt"
   (( ${#failed[@]} == 0 )) || die "self-update finished, but these projects failed (or were busy): ${failed[*]}"
   info "self-update done"
 }
@@ -1338,6 +1408,7 @@ case "$cmd" in
   update)   cmd_update "$@" ;;
   self-update) cmd_self_update ;;
   setup)    cmd_setup "$@" ;;
+  managed-settings) managed_settings ;;
   tokens)   cmd_tokens "$@" ;;
   git-credential) cmd_git_credential "$@" ;;
   help|-h|--help) usage ;;

@@ -52,7 +52,7 @@ apt_missing() {
 # 0. Packages from Ubuntu: what boxen uses on the VM (tokens: curl, jq,
 #    openssl; boxen ui: tmux, a Python venv, vim), the sandbox's (bubblewrap,
 #    socat) and rootless Docker's (uidmap, dbus-user-session).
-mapfile -t missing < <(apt_missing ca-certificates curl git jq openssl gnupg tmux python3-venv vim \
+mapfile -t missing < <(apt_missing ca-certificates curl git jq openssl gnupg tmux python3-venv vim ripgrep \
                                    bubblewrap socat uidmap dbus-user-session)
 if (( ${#missing[@]} )); then
   info "installing ${missing[*]}"
@@ -179,7 +179,7 @@ fi
 # 5. boxen on your PATH, with its gh wrapper (each project's own token in
 #    ~/src) and boxen-carry (for /carry).
 mkdir -p "$BIN_DIR"
-chmod +x "$REPO_DIR"/bin/* "$REPO_DIR/image/boxen-bg"
+chmod +x "$REPO_DIR"/bin/* "$REPO_DIR"/image/boxen-*
 ln -sfn "$REPO_DIR/bin/boxen" "$BIN_DIR/boxen"
 ln -sfn "$REPO_DIR/bin/boxen-gh" "$BIN_DIR/gh"
 ln -sfn "$REPO_DIR/bin/boxen-carry" "$BIN_DIR/boxen-carry"
@@ -201,7 +201,20 @@ fi
 #    settings for ~/src, the token timer, the serve service.
 "$REPO_DIR/bin/boxen" setup
 
-# 8. boxen ui's Python environment (Textual), rebuilt only when
+# 8. The Claude Code settings boxen's isolation depends on (the sandbox, its
+#    only exceptions, what it hides, no bypass mode), as managed settings:
+#    they outrank every settings file, so nothing can loosen them. See
+#    managed_settings in bin/boxen.
+managed=/etc/claude-code/managed-settings.d/boxen.json
+tmp=$(mktemp)
+"$REPO_DIR/bin/boxen" managed-settings > "$tmp"
+if ! sudo cmp -s "$tmp" "$managed" 2>/dev/null; then
+  sudo install -D -m 0644 "$tmp" "$managed"
+  info "Claude Code: boxen's sandbox settings are in $managed (managed: no settings file overrides them)"
+fi
+rm -f "$tmp"
+
+# 9. boxen ui's Python environment (Textual), rebuilt only when
 #    ui/requirements.lock changes. Everything else works without it.
 "$REPO_DIR/ui/install-venv.sh" \
   || warn "boxen ui isn't installed (see above); everything else works. Re-run install.sh to retry."

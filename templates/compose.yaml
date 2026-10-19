@@ -33,9 +33,10 @@ services:
       # The project folder, at the same path as on the VM. Nothing else of
       # the VM is mounted.
       - __SRC__:__SRC__
-      # /root: toolchains and caches installed here (rustup, nvm, pip
-      # --user, ~/.cache) survive rebuilds.
-      - home:/root
+      # Download caches (pip, npm, go, cargo's registry...) survive rebuilds.
+      # Only the cache: a volume over all of /root would hide whatever the
+      # Dockerfile installs there.
+      - cache:/root/.cache
     labels:
       boxen.project: __NAME__
     security_opt:
@@ -55,7 +56,7 @@ networks:
       boxen.project: __NAME__
 
 volumes:
-  home:
-    name: boxen.__NAME__.home
+  cache:
+    name: boxen.__NAME__.cache
     labels:
       boxen.project: __NAME__

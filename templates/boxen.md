@@ -12,9 +12,12 @@ This applies when your working folder is a boxen project, `~/src/<project>`
   around it, and don't install anything on the VM (`pip install --user`,
   `npm -g`, `cargo install`, curl-to-shell all fail).
 - Other folders under `~/src` are other projects with their own agents.
-  Read them if asked; never change them.
-- The VM has git, gh, ripgrep, jq, python3 (standard library only), tmux.
-  No compilers, SDKs or package managers: those live in the build container.
+  Read them if asked; never change them. Keep everything of yours,
+  worktrees included, inside this project folder.
+- The VM has git, gh, ripgrep, jq, python3 (standard library only). No
+  compilers, SDKs or package managers: those live in the build container.
+  No tmux, systemd or Docker either: to keep something running, use
+  `boxen run -d`.
 - The user may be on a phone in the Claude app: ask short, concrete questions.
 
 ## Build, test, run: `boxen run`
@@ -27,7 +30,7 @@ the same path, and the files you write are the user's on the VM.
 boxen run make test                 run a command in the current folder
 boxen run -C api npm ci             in a subfolder of the project
 boxen run -d web npm run dev        start a long-running process named "web"
-boxen run --logs web [-f] [--tail N]   its output
+boxen run --logs web [--tail N]     its output so far
 boxen run --stop web                stop it
 boxen run --ps                      list background processes
 ```
@@ -36,23 +39,30 @@ boxen run --ps                      list background processes
   (`boxen run make | tail`), a redirect or `$(...)` keeps it in the sandbox,
   where it fails. Use `-C` for a subfolder and put pipes and redirects
   inside: `boxen run sh -c 'make 2>&1 | tail -50'`.
+- Servers, watchers, anything that doesn't end: always `-d`, never in the
+  foreground (a foreground run is stopped when your command times out).
+  Don't follow logs (`-f`): check them with `--logs`.
 - The container starts on its own the first time. Its shell is a login
-  shell: `~/.profile` (in the container, /root) is read on every run.
-- Persists: the project folder; `/root` in the container (a volume:
-  rustup, nvm, `pip --user`, caches). Everything else in the container,
-  including background processes, is lost when it's recreated
-  (`boxen env apply`, the user's `boxen update`).
+  shell. Builds and first starts can take minutes: give such commands a
+  long timeout.
+- Persists: the project folder, and the download caches in `/root/.cache`.
+  Everything else in the container (anything installed at run time,
+  background processes) is gone when it's recreated (`boxen env apply`,
+  the user's `boxen update`): the Dockerfile is the record.
 - Network from the container: outbound only. Nothing in it is reachable
   from the VM or LAN unless the user publishes a port. Test servers from
-  inside: `boxen run curl -s localhost:3000`.
+  inside: `boxen run curl -s localhost:3000`. A server the user should open
+  in a browser must listen on 0.0.0.0, not localhost.
 
 ## The environment: `.boxen/` (yours to edit)
 
 - `.boxen/Dockerfile`: the project's toolchain, `FROM boxen-env:latest`,
   built as root (`RUN apt-get update && apt-get install -y ...`, no USER
-  lines needed). Put every system package and SDK the project needs here,
-  so a rebuild brings it back. It may `COPY` other files from `.boxen/`
-  (the build context).
+  lines needed). Put every system package and SDK the project needs here.
+  Set paths and variables with `ENV` (`ENV PATH=/opt/node/bin:$PATH`):
+  shell startup files like `~/.bashrc` aren't read for commands. rustup
+  installs to `/opt/cargo` (already on PATH). It may `COPY` other files
+  from `.boxen/` (the build context).
 - `.boxen/services.yaml`: sidecars (postgres, redis...), up to 8, each
   reachable from `boxen run` at hostname = service name. Its comments list
   what's allowed: no ports, host paths or privileges.
@@ -70,9 +80,20 @@ boxen run --ps                      list background processes
 `git push` and `gh` work for the repos in this project's list, with a
 short-lived token chosen by the folder you're in. `boxen env show` lists
 them and their state. To push anywhere else, ask the user to run
-`boxen repos <project> add owner/repo` on the VM. A repo that isn't the
-user's ("not your repo"): they fork it, you set `origin` to the fork (keep
-the old one as `upstream`), they add the fork. Clone over https, never SSH.
+`boxen repos <project> add owner/repo` on the VM. Clone over https, never
+SSH.
+
+The sandbox doesn't let your shell change a repo's `.git/config`. Run git
+commands that do through the build container instead (no network or
+token needed there):
+- remotes: `boxen run git remote add|set-url|rename ...`
+- push with `git push origin <branch>`, then set the upstream:
+  `boxen run git branch --set-upstream-to=origin/<branch>`
+- `git config` (repo-level): `boxen run git config ...`
+A repo that isn't the user's ("not your repo"): they fork it, you point
+`origin` at the fork (keep the old one as `upstream`), they add the fork.
+Never set `core.hooksPath`, `core.fsmonitor` or other settings that run
+programs: git runs them outside the sandbox too.
 
 ## The `boxen` command for you
 

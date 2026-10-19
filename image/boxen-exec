@@ -1,0 +1,44 @@
+#!/bin/sh
+# boxen-exec: runs `boxen run`'s command in the build container.
+#
+#   boxen-exec ID cmd...    run cmd in a session of its own, recorded as ID
+#   boxen-exec --kill ID    end that session's whole process group
+#
+# docker exec doesn't stop a command when its client goes away, so when
+# Claude interrupts a `boxen run` (Esc, or its command timeout), the boxen
+# client on the VM catches the signal and calls --kill with the ID it chose:
+# the command and everything it started stop, rather than running on and
+# holding ports. (A client killed outright, with SIGKILL, can't do that.)
+set -u
+dir=${BOXEN_EXEC_DIR:-/run/boxen-exec}
+
+die() { printf 'boxen run: %s\n' "$*" >&2; exit 125; }
+valid() { printf '%s' "$1" | grep -Ezqx '[A-Za-z0-9]{8,64}' || die "bad run id"; }
+
+if [ "${1:-}" = --kill ]; then
+  [ $# -eq 2 ] || die "usage: boxen-exec --kill ID"
+  valid "$2"
+  p=$(cat "$dir/$2" 2>/dev/null) || exit 0
+  printf '%s' "$p" | grep -Ezqx '[0-9]+' || exit 0
+  kill -s TERM -- "-$p" 2>/dev/null || exit 0
+  i=0
+  while kill -s 0 -- "-$p" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -s KILL -- "-$p" 2>/dev/null || true
+  exit 0
+fi
+
+[ $# -ge 2 ] || die "usage: boxen-exec ID cmd..."
+id=$1
+shift
+valid "$id"
+mkdir -p "$dir"
+# The command keeps this script's stdin (a background job would otherwise
+# get /dev/null): 3 is a copy made before, handed back explicitly.
+exec 3<&0
+setsid sh -c 'echo $$ > "$0"; exec "$@"' "$dir/$id" "$@" <&3 3<&- &
+child=$!
+exec 3<&-
+wait "$child"
+rc=$?
+rm -f "$dir/$id"
+exit "$rc"

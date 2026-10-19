@@ -15,8 +15,8 @@ doubled so compose interpolates nothing from the VM's environment when it
 reads the output. Containers and volumes are named boxen.<project>.<name>:
 the dot can't appear in a project, service or volume name, so two projects
 can never produce the same name. The project's own build container
-(boxen.<project>.env) and its home volume (boxen.<project>.home) are
-reserved: no sidecar is called env, no volume home.
+(boxen.<project>.env) and its cache volume (boxen.<project>.cache) are
+reserved: no sidecar is called env, no volume cache (or home).
 
 bin/boxen runs `docker compose config` in a throwaway container that sees
 only the file, so `include:` and `extends: {file: ...}` can't read other
@@ -90,11 +90,13 @@ def is_strs(v):
 
 
 def escape(v):
-    """$ -> $$ in every string value, recursively: compose interpolates
-    ${VAR} from the environment of the `docker compose` that reads the
-    output (boxen's, on the VM); doubled, it stays a literal $."""
+    """Every $ made literal, in every string value, recursively: compose
+    interpolates ${VAR} from the environment of the `docker compose` that
+    reads the output (boxen's, on the VM); doubled, it stays a literal $.
+    The input is uninterpolated (--no-interpolate), so a $$ written the
+    usual compose way is still $$ here: it's one literal $ too, not two."""
     if is_str(v):
-        return v.replace("$", "$$")
+        return v.replace("$$", "$").replace("$", "$$")
     if isinstance(v, list):
         return [escape(x) for x in v]
     if isinstance(v, dict):
@@ -123,8 +125,8 @@ def check_volume(v, project, problems):
             return None
     if not is_str(src) or not VOLUME_NAME.match(src):
         problems.append("volumes: volume name %r must match %s" % (src, VOLUME_NAME.pattern))
-    elif src == "home":
-        problems.append("volumes: 'home' is the build container's own volume (boxen.<project>.home); pick another name")
+    elif src in ("home", "cache"):
+        problems.append("volumes: '%s' is reserved for the build container; pick another name" % src)
         return None
     if not is_str(tgt) or not tgt.startswith("/"):
         problems.append("volumes: mount path %r must be absolute" % (tgt,))
@@ -247,10 +249,18 @@ def check_service(name, svc, names, project, problems):
     if "labels" in out:
         lab = out["labels"]
         if isinstance(lab, dict):
+            names = list(lab)
             if not all(is_str(k) and "$" not in k and (is_str(v) or v is None) for k, v in lab.items()):
                 problems.append("labels must map names to strings")
         elif not is_strs(lab):
+            names = []
             problems.append("labels must map names to strings")
+        else:
+            names = [x.split("=", 1)[0] for x in lab]
+        # compose's and boxen's own labels decide which project a container
+        # belongs to (boxen ls, boxen rm): not the file's to set.
+        if any(is_str(k) and k.startswith(("com.docker.compose.", "boxen.")) for k in names):
+            problems.append("labels starting with com.docker.compose. or boxen. are reserved")
     # Fixed, and not overridable from the file (the keys are refused above).
     out["container_name"] = "boxen.%s.%s" % (project, name)
     out["security_opt"] = ["no-new-privileges:true"]

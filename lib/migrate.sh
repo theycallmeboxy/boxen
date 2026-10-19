@@ -56,17 +56,25 @@ migrate_claude() {
     | tar -C "$tmp" --no-same-owner -xf - \
     || { rm -rf "$tmp"; die "couldn't copy the claude-config volume"; }
   mkdir -p "$CLAUDE_DIR"
-  # settings.json: v1's, with anything set on the VM since on top.
+  # settings.json: v1's, with anything set on the VM since on top, except
+  # its permissions and sandbox settings: in v1 the container was the
+  # boundary, so a permissive mode or broad allow rules were harmless there;
+  # on the VM the file tools aren't sandboxed. The whole v1 file stays as
+  # settings.json.v1.
   if [[ -f "$tmp/settings.json" ]]; then
-    if [[ -f "$CLAUDE_DIR/settings.json" ]]; then
-      jq -s "$DEEP_MERGE" "$tmp/settings.json" "$CLAUDE_DIR/settings.json" > "$tmp/settings.merged" \
-        && mv -f "$tmp/settings.merged" "$CLAUDE_DIR/settings.json" \
-        || warn "couldn't merge v1's settings.json (kept as $CLAUDE_DIR/settings.json.v1)"
-      cp -f "$tmp/settings.json" "$CLAUDE_DIR/settings.json.v1"
-    else
-      cp "$tmp/settings.json" "$CLAUDE_DIR/settings.json"
+    cp -f "$tmp/settings.json" "$CLAUDE_DIR/settings.json.v1"
+    if jq -e '(.permissions // {}) != {} or has("sandbox") or has("skipDangerousModePermissionPrompt")' \
+         "$tmp/settings.json" >/dev/null 2>&1; then
+      info "Claude config: v1's permission and sandbox settings were for a container and aren't carried over (they're in $CLAUDE_DIR/settings.json.v1)"
     fi
-    rm -f "$tmp/settings.json"
+    jq 'del(.permissions, .sandbox, .skipDangerousModePermissionPrompt)' "$tmp/settings.json" > "$tmp/settings.v1" \
+      || cp /dev/null "$tmp/settings.v1"
+    [[ -s "$tmp/settings.v1" ]] || echo '{}' > "$tmp/settings.v1"
+    [[ -f "$CLAUDE_DIR/settings.json" ]] || echo '{}' > "$CLAUDE_DIR/settings.json"
+    jq -s "$DEEP_MERGE" "$tmp/settings.v1" "$CLAUDE_DIR/settings.json" > "$tmp/settings.merged" \
+      && mv -f "$tmp/settings.merged" "$CLAUDE_DIR/settings.json" \
+      || warn "couldn't merge v1's settings.json (it's in $CLAUDE_DIR/settings.json.v1)"
+    rm -f "$tmp/settings.json" "$tmp/settings.v1"
   fi
   # .claude.json (v1 kept it inside the config dir; on the VM it's ~/.claude.json):
   # per-folder state (trust, history) comes across; a login made on the VM stays.
