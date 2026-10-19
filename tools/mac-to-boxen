@@ -1,0 +1,1138 @@
+#!/bin/bash
+# mac-to-boxen: move your Claude Code work from a Mac to a boxen VM.
+# Run 'mac-to-boxen --help' for how to use it.
+#
+# One file for both ends, with no other part of boxen needed:
+#
+#   export (on the Mac)  finds the folders Claude Code was used in (from
+#       ~/.claude.json), turns them into an editable plan (one project per
+#       folder, named after it), and packs code, auto memory, session
+#       transcripts and personal config into a .tar.gz. It either pushes that
+#       over SSH straight into 'import' on the VM (so the VM never connects
+#       to the Mac or your LAN), or writes a file you carry over yourself.
+#       Nothing on the Mac is changed.
+#   import (on the VM)   refuses the archive unless every entry is a plain
+#       file or folder in the expected layout, with no path that climbs out,
+#       within size limits; unpacks it into a private staging folder; then
+#       copies into ~/src/<name> and ~/.claude, re-filing sessions and memory
+#       under the new paths. Nothing already on the VM is overwritten.
+#
+# The Mac side is written for the bash that ships with macOS (3.2) and the
+# BSD tools there; the VM side needs GNU tar and coreutils (any Linux).
+
+set -e
+set -o pipefail
+
+PROG="mac-to-boxen"
+FORMAT=1
+ALL_SCOPES="code,memory,sessions,config"
+CONFIG_DIRS="rules skills agents commands output-styles agent-memory"
+CONFIG_FILES="CLAUDE.md settings.json"
+EXCLUDES="node_modules .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS_Store .next .turbo .parcel-cache .gradle"
+RESERVED="all global dashboard ui"      # names boxen keeps for itself
+NAME_RE='^[a-z0-9]+([_-][a-z0-9]+)*$'  # boxen's project names
+KEY_RE='^[A-Za-z0-9-]+$'                # Claude's per-folder data keys
+MAX_KEY=200                             # longer keys are filed differently by Claude
+DEFAULT_MAX_SIZE=20G
+DEFAULT_MAX_FILES=2000000
+TAB=$(printf '\t')
+
+usage() {
+  cat <<'EOF'
+mac-to-boxen: move your Claude Code work from a Mac to a boxen VM.
+
+It's one file. Copy it to the Mac (and, for the file route, to the VM too).
+
+On the Mac, in Terminal:
+
+  bash mac-to-boxen export you@your-vm        copy straight to the VM over SSH
+  bash mac-to-boxen export -o work.tar.gz     or write a file to carry over
+  bash mac-to-boxen plan > plan.tsv           just print the plan, to edit
+
+  With an address, the Mac signs in to the VM once over SSH, sends this
+  script and the data, and runs the import there. The VM never connects to
+  the Mac. With -o, copy the file over however you like, then on the VM:
+
+  bash mac-to-boxen import work.tar.gz
+
+What comes over (pick with --only; default: all of it)
+  code      each project folder, minus node_modules, virtualenvs and caches,
+            to ~/src/<name> on the VM
+  memory    Claude's auto memory for each project
+  sessions  session transcripts (includes memory), so 'claude --resume' in
+            ~/src/<name> lists them
+  config    from ~/.claude: CLAUDE.md, rules, skills, agents, commands,
+            output styles, agent memory; settings.json (kept aside as
+            settings.mac.json); your MCP servers (listed, not installed)
+
+The plan
+  Every folder Claude Code was used in becomes a project named after it.
+  Folders inside a project (subfolders, worktrees) come along with it. Your
+  home folder, system and temporary folders, folders that no longer exist,
+  and folders that only hold other projects are left out. Before anything
+  is copied you can rename projects, drop some, or pick a few for this run.
+
+export options (on the Mac)
+  you@your-vm        where to send it (anything ssh accepts, e.g. a Host alias)
+  -o, --output FILE  write an archive instead (it holds your transcripts:
+                     delete it once imported)
+  --only SCOPES      comma-separated: code,memory,sessions,config
+  --projects LIST    only these projects this run: numbers as shown in the
+                     plan, ranges (2-4) or names, comma-separated
+  --plan FILE        use a plan you saved and edited (from 'plan')
+  --exclude NAME     also skip files or folders with this name in code (repeatable)
+  -n, --dry-run      show the plan and what would be packed; write nothing
+  -y, --yes          don't ask; go ahead with the plan as it is
+  --src, --boxen-new, --max-size   passed on to import (with an address)
+
+import options (on the VM)
+  ARCHIVE            the file from 'export -o' ('-' reads it from stdin)
+  -n, --dry-run      check the archive and show what would be copied where
+  --src DIR          where projects go (default: $BOXEN_SRC or ~/src)
+  --boxen-new        also run 'boxen new <name>' for projects that aren't
+                     boxen projects yet (needs boxen; otherwise it's suggested)
+  --max-size SIZE    refuse archives that unpack bigger than this (default 20G)
+  --max-files N      refuse archives with more entries (default 2000000)
+
+Nothing is overwritten on the VM
+  Files that already exist there (sessions, memory, code, config) are kept
+  as they are; only what's missing is added. So re-running is safe: it adds
+  new sessions and files. To refresh code you've changed on both sides, use
+  git. CLAUDE.md and settings.json from the Mac are kept aside as
+  CLAUDE.mac.md and settings.mac.json when the VM has its own.
+
+Environment: CLAUDE_CONFIG_DIR (Claude's folder, default ~/.claude) on
+either side; BOXEN_SRC on the VM; MAC_TO_BOXEN_SSH, the ssh command on the
+Mac (default: ssh).
+EOF
+}
+
+# ---------------------------------------------------------------- common
+
+if [ -t 2 ]; then BOLD=$(printf '\033[1m') DIM=$(printf '\033[2m') OFF=$(printf '\033[0m')
+else BOLD="" DIM="" OFF=""; fi
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+# Progress goes to stderr, so 'plan' can print the plan alone on stdout.
+info() { printf '%s==>%s %s\n' "$BOLD" "$OFF" "$*" >&2; }
+
+# Names and paths from an archive are shown with control characters masked.
+clean() { printf '%s' "${1//[[:cntrl:]]/?}"; }
+
+is_reserved() { case " $RESERVED " in *" $1 "*) return 0 ;; esac; return 1; }
+valid_name() { [[ $1 =~ $NAME_RE ]] && [ ${#1} -le 40 ] && ! is_reserved "$1"; }
+
+human_kb() {
+  local kb=$1
+  if [ "$kb" -ge 1048576 ]; then printf '%d.%dG' $((kb / 1048576)) $((kb % 1048576 * 10 / 1048576))
+  elif [ "$kb" -ge 1024 ]; then printf '%dM' $((kb / 1024))
+  else printf '%dK' "$kb"; fi
+}
+
+# 20G, 500M, 1T, or plain bytes -> bytes
+parse_size() {
+  local n=${1%[KkMmGgTt]} u=${1#"${1%[KkMmGgTt]}"}
+  case $n in ''|*[!0-9]*) return 1 ;; esac
+  case $u in
+    '') echo "$n" ;; [Kk]) echo $((n * 1024)) ;; [Mm]) echo $((n * 1048576)) ;;
+    [Gg]) echo $((n * 1073741824)) ;; [Tt]) echo $((n * 1099511627776)) ;;
+  esac
+}
+
+# want_code etc. from "code,memory" (or "all")
+parse_scopes() {
+  local s=$1 x
+  [ "$s" = all ] && s=$ALL_SCOPES
+  want_code=0 want_memory=0 want_sessions=0 want_config=0
+  for x in $(printf '%s' "$s" | tr ',' ' '); do
+    case $x in
+      code) want_code=1 ;; memory) want_memory=1 ;;
+      sessions) want_sessions=1 ;; config) want_config=1 ;;
+      all) want_code=1 want_memory=1 want_sessions=1 want_config=1 ;;
+      *) die "unknown scope '$x' (use: $ALL_SCOPES)" ;;
+    esac
+  done
+  SCOPES=""
+  [ $want_code = 1 ] && SCOPES="$SCOPES,code"
+  [ $want_memory = 1 ] && SCOPES="$SCOPES,memory"
+  [ $want_sessions = 1 ] && SCOPES="$SCOPES,sessions"
+  [ $want_config = 1 ] && SCOPES="$SCOPES,config"
+  SCOPES=${SCOPES#,}
+  [ -n "$SCOPES" ] || die "--only needs at least one of: $ALL_SCOPES"
+}
+
+# ================================================================ the Mac
+
+# Reading ~/.claude.json, and turning paths into Claude's folder keys the
+# way Claude does (JavaScript's replace, per UTF-16 unit), takes a JSON
+# parser: macOS always has JavaScript in osascript; elsewhere, node.
+JS_MAIN='
+function enc(p) { return p.replace(/[^a-zA-Z0-9]/g, "-"); }
+function main(mode, text) {
+  var out = [], k, n, i;
+  if (mode === "keys") {
+    var ls = text.split("\n");
+    for (i = 0; i < ls.length; i++) if (ls[i] !== "") out.push(enc(ls[i]) + "\t" + ls[i]);
+    return out.join("\n");
+  }
+  var j = JSON.parse(text) || {}, pr = j.projects || {};
+  if (mode === "paths") {
+    for (k in pr) if (k.charAt(0) === "/" && !/[\t\n\r]/.test(k)) out.push(k);
+    return out.join("\n");
+  }
+  var mcp = { user: j.mcpServers || {}, projects: {} }, names = {};
+  for (k in mcp.user) names[k] = 1;
+  for (k in pr) {
+    var m = pr[k] && pr[k].mcpServers, any = false;
+    if (!m || typeof m !== "object") continue;
+    for (n in m) { names[n] = 1; any = true; }
+    if (any) mcp.projects[k] = m;
+  }
+  if (mode === "mcpnames") return Object.keys(names).sort().join(", ");
+  return JSON.stringify(mcp, null, 2);
+}
+'
+JS_JXA='
+function run(argv) {
+  ObjC.import("Foundation");
+  var s = $.NSString.stringWithContentsOfFileEncodingError(argv[1], $.NSUTF8StringEncoding, null);
+  if (s.isNil()) throw new Error("cannot read " + argv[1]);
+  return main(argv[0], ObjC.unwrap(s));
+}
+'
+JS_NODE='
+process.stdout.write(main(process.argv[2], require("fs").readFileSync(process.argv[3], "utf8")) + "\n");
+'
+
+# js MODE FILE: modes paths, mcp, mcpnames (FILE is ~/.claude.json) and
+# keys (FILE has one path per line; prints KEY<TAB>PATH).
+js() {
+  local engine=${MAC_TO_BOXEN_JS:-}
+  if [ -z "$engine" ]; then
+    if [ "$(uname -s)" = Darwin ] && command -v osascript >/dev/null 2>&1; then engine=osascript
+    elif command -v node >/dev/null 2>&1; then engine=node
+    else die "can't read Claude's settings here: this needs macOS (osascript) or node"; fi
+  fi
+  case $engine in
+    osascript) printf '%s\n%s\n' "$JS_MAIN" "$JS_JXA" > "$WORK/q.js"
+               osascript -l JavaScript "$WORK/q.js" "$1" "$2" ;;
+    node)      printf '%s\n%s\n' "$JS_MAIN" "$JS_NODE" > "$WORK/q.js"
+               node "$WORK/q.js" "$1" "$2" ;;
+    *)         die "MAC_TO_BOXEN_JS must be osascript or node" ;;
+  esac
+}
+
+# key_of PATH: Claude's key for a path, from $WORK/keys
+key_of() { awk -F'\t' -v p="$1" '$2 == p { print $1; exit }' "$WORK/keys"; }
+
+# The plan, from $WORK/probe ("exists<TAB>git<TAB>path" per folder): a
+# project per folder that still exists, isn't home, system or temporary,
+# and isn't just a folder of other projects; folders inside a project come
+# along with it. Prints "R<TAB>name<TAB>path<TAB>git" and "S<TAB>why".
+plan_awk() {
+  awk -F'\t' -v home="$HOME" -v cdir="$MAC_CLAUDE" -v reserved="$RESERVED" '
+    function under(p, r) { return substr(p, 1, length(r) + 1) == r "/" }
+    function san(b,   s) {
+      s = tolower(b); gsub(/[^a-z0-9]/, "-", s)
+      while (index(s, "--")) gsub(/--/, "-", s)
+      sub(/^-/, "", s); sub(/-$/, "", s)
+      s = substr(s, 1, 40); sub(/-$/, "", s)
+      if (s == "") s = "project"
+      return s
+    }
+    BEGIN { nr = split(reserved, rr, " "); for (i = 1; i <= nr; i++) res[rr[i]] = 1 }
+    { n++; E[n] = $1; G[n] = $2; P[n] = $3 }
+    END {
+      for (i = 1; i <= n; i++) {
+        p = P[i]
+        if (E[i] != 1) { S[++ns] = p " (no longer exists)"; continue }
+        if (p == "/" || p == home) { S[++ns] = p " (your home folder)"; continue }
+        if (p == cdir || under(p, cdir) || under(cdir, p) || p == "/tmp" || under(p, "/tmp") ||
+            under(p, "/private") || under(p, "/var")) { S[++ns] = p " (system or temporary folder)"; continue }
+        C[++nc] = i
+      }
+      # Shortest paths first, so parents are seen before their subfolders.
+      for (i = 2; i <= nc; i++) {
+        v = C[i]; j = i - 1
+        while (j >= 1 && length(P[C[j]]) > length(P[v])) { C[j + 1] = C[j]; j-- }
+        C[j + 1] = v
+      }
+      for (i = 1; i <= nc; i++) {
+        p = P[C[i]]; inside = 0
+        for (r = 1; r <= nroot; r++) if (under(p, P[RT[r]])) { inside = 1; break }
+        if (inside) continue
+        desc = 0
+        for (q = 1; q <= nc; q++) if (under(P[C[q]], p)) { desc = 1; break }
+        if (desc && G[C[i]] != 1) { S[++ns] = p " (a folder of projects, not a project itself)"; continue }
+        RT[++nroot] = C[i]
+      }
+      for (r = 1; r <= nroot; r++) {
+        p = P[RT[r]]; b = p; sub(/.*\//, "", b)
+        base = san(b); if (base in res) base = base "-1"
+        name = base; k = 2
+        while (name in used) { t = substr(base, 1, 37); sub(/-$/, "", t); name = t "-" k; k++ }
+        used[name] = 1
+        printf "R\t%s\t%s\t%s\n", name, p, G[RT[r]]
+      }
+      for (i = 1; i <= ns; i++) printf "S\t%s\n", S[i]
+    }' "$WORK/probe"
+}
+
+make_plan() {
+  local name path git note kb
+  plan_awk > "$WORK/planraw"
+  cat <<'EOF'
+# mac-to-boxen plan: one project per line, NAME<TAB>MAC FOLDER.
+# Rename a project by editing NAME (lowercase letters, digits, - and _);
+# leave one out by deleting its line or starting it with #. Code goes to
+# ~/src/NAME on the VM. Folders inside a project (subfolders or worktrees
+# you ran Claude in) come along with it. Sizes are before skipping
+# node_modules, virtualenvs and caches.
+EOF
+  grep "^R$TAB" "$WORK/planraw" | sort -t "$TAB" -k2,2 | while IFS="$TAB" read -r _ name path git; do
+    note=""
+    if [ "$want_code" = 1 ]; then
+      kb=$(du -sk "$path" 2>/dev/null | cut -f1)
+      note="$(human_kb "${kb:-0}"), "
+    fi
+    if [ "$git" = 1 ]; then note="${note}git"; else note="${note}not git"; fi
+    printf '%s\t%s\t# %s\n' "$name" "$path" "$note"
+  done
+  if grep -q "^S$TAB" "$WORK/planraw"; then
+    echo "#"
+    echo "# Not included (uncomment and name one to include it anyway):"
+    grep "^S$TAB" "$WORK/planraw" | cut -f2- | sed 's/^/#   /'
+  fi
+}
+
+# Check the plan; on success $WORK/rows has "name<TAB>path" per project.
+read_plan() {
+  local line name rest path names=" " paths="$TAB" re
+  : > "$WORK/rows"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; esac
+    name=${line%%[ "$TAB"]*}
+    rest=${line#"$name"}
+    while :; do case $rest in [" $TAB"]*) rest=${rest#?} ;; *) break ;; esac; done
+    path=${rest%%"$TAB"*}
+    while :; do case $path in *[" "]) path=${path%?} ;; *) break ;; esac; done
+    if [ -z "$path" ]; then PLAN_ERR="this line needs NAME<TAB>FOLDER: $line"; return 1; fi
+    if ! valid_name "$name"; then
+      PLAN_ERR="'$name' can't be a project name (lowercase letters and digits, single - or _ between them, at most 40; not $RESERVED)"
+      return 1
+    fi
+    case $names in *" $name "*) PLAN_ERR="two projects are named '$name'"; return 1 ;; esac
+    case $path in /*) ;; *) PLAN_ERR="'$path' isn't a full path (it should start with /)"; return 1 ;; esac
+    path=${path%/}
+    if [ -z "$path" ] || [ "$path" = "$HOME" ]; then PLAN_ERR="'${path:-/}' is too big to be a project"; return 1; fi
+    case "$MAC_CLAUDE/" in "$path"/*) PLAN_ERR="'$path' holds Claude's own folder; pick the project folders inside it"; return 1 ;; esac
+    case $path in *[[:cntrl:]]*) PLAN_ERR="'$(clean "$path")' has control characters in it; rename the folder first"; return 1 ;; esac
+    case $paths in *"$TAB$path$TAB"*) PLAN_ERR="'$path' is in the plan twice"; return 1 ;; esac
+    names="$names$name " paths="$paths$path$TAB"
+    printf '%s\t%s\n' "$name" "$path" >> "$WORK/rows"
+  done < "$1"
+  # Nested projects would copy the same files twice.
+  re=$(awk -F'\t' '{ p[NR] = $2 } END { for (i in p) for (j in p) if (i != j && index(p[j], p[i] "/") == 1) { print p[j] " is inside " p[i]; exit } }' "$WORK/rows")
+  if [ -n "$re" ]; then PLAN_ERR="$re (folders inside a project come along with it; leave the inner one out)"; return 1; fi
+  return 0
+}
+
+# Projects this run covers: the selection if any, else all of them.
+run_rows() {
+  if [ -s "$WORK/selected" ]; then
+    awk -F'\t' 'NR == FNR { s[$0] = 1; next } s[$1]' "$WORK/selected" "$WORK/rows"
+  else
+    cat "$WORK/rows"
+  fi
+}
+
+show_plan() {
+  local line i=0 name mark
+  echo >&2
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      '') continue ;;
+      '#'*) printf '  %s%s%s\n' "$DIM" "$(clean "$line")" "$OFF" >&2; continue ;;
+    esac
+    i=$((i + 1))
+    name=${line%%[ "$TAB"]*}
+    mark=" "
+    if [ -s "$WORK/selected" ]; then
+      if grep -qxF -- "$name" "$WORK/selected"; then mark="*"; else mark="-"; fi
+    fi
+    printf '  %s %2d) %s\n' "$mark" "$i" "$(clean "${line//"$TAB"/   }")" >&2
+  done < "$WORK/plan"
+  if [ -s "$WORK/selected" ]; then
+    printf '\n  This run: the %s project(s) marked *. Those marked - are left for another run.\n' \
+      "$(wc -l < "$WORK/selected" | tr -d ' ')" >&2
+  fi
+  echo >&2
+}
+
+# select_projects "1 3 5-7 name ...": which projects this run covers, by
+# number as shown, range, or name (as v1's import did); "all" clears it.
+select_projects() {
+  local names=() name n t a b i chosen=""
+  while IFS="$TAB" read -r name _; do names+=("$name"); done < "$WORK/rows"
+  n=${#names[@]}
+  set -f
+  # shellcheck disable=SC2046  # split on spaces and commas, no globbing
+  set -- $(printf '%s' "$1" | tr ',' ' ')
+  set +f
+  [ $# -gt 0 ] || { warn "pick projects by number, range (2-4) or name"; return 1; }
+  if [ "$1" = all ]; then rm -f "$WORK/selected"; return 0; fi
+  for t in "$@"; do
+    a=${t%%-*} b=${t#*-}
+    case $t in
+      *[!0-9-]*|-*|*-|*-*-*) a="" ;;
+      *-*) ;;
+      *) b=$t ;;
+    esac
+    if [ -n "$a" ]; then
+      [ "$a" -le "$b" ] || { warn "'$t' isn't a range like 2-4"; return 1; }
+      i=$a
+      while [ "$i" -le "$b" ]; do
+        [ "$i" -ge 1 ] && [ "$i" -le "$n" ] || { warn "no project number $i"; return 1; }
+        chosen="$chosen${names[i - 1]}$TAB"
+        i=$((i + 1))
+      done
+    else
+      for name in "${names[@]}"; do [ "$name" = "$t" ] && break; name=""; done
+      [ -n "$name" ] || { warn "no project named '$t' in the plan"; return 1; }
+      chosen="$chosen$t$TAB"
+    fi
+  done
+  printf '%s' "$chosen" | tr '\t' '\n' | grep -v '^$' | sort -u > "$WORK/selected"
+}
+
+# origin_url FOLDER: the origin remote from .git/config, without git (which
+# on a Mac without the developer tools pops up an installer).
+origin_url() {
+  [ -f "$1/.git/config" ] || return 0
+  awk '/^[ \t]*\[remote "origin"\]/ { o = 1; next } /^[ \t]*\[/ { o = 0 }
+       o && $1 == "url" { sub(/^[^=]*=[ \t]*/, ""); print; exit }' "$1/.git/config"
+}
+
+# list_tree DIR: plain files and folders under DIR (not DIR itself), as
+# NUL-separated paths relative to /, into $WORK/list. A symlinked DIR is
+# followed; symlinks and special files inside it are counted and left out.
+list_tree() {
+  local rel=${1#/}
+  ( cd / && find -H "$rel" -mindepth 1 \( -type d -o -type f \) -print0 ) >> "$WORK/list"
+  ( cd / && find -H "$rel" -mindepth 1 ! -type d ! -type f -print0 ) >> "$WORK/other"
+}
+
+# list_code DIR NAME: the project's files, minus excluded names, into
+# $WORK/list; its symlinks are recorded (path and target) in the archive's
+# symlinks file for the VM to recreate, not packed as links.
+list_code() {
+  local rel=${1#/} name=$2 x l t
+  set --
+  for x in $EXCLUDES; do
+    [ $# -gt 0 ] && set -- "$@" -o
+    set -- "$@" -name "$x"
+  done
+  ( cd / && find "$rel" -mindepth 1 \( "$@" \) -prune -o \( -type d -o -type f \) -print0 ) >> "$WORK/list"
+  ( cd / && find "$rel" -mindepth 1 \( "$@" \) -prune -o -type l -print0 ) |
+    while IFS= read -r -d '' l; do
+      t=$(readlink "/$l") || continue
+      printf 'code/%s/%s\0%s\0' "$name" "${l#"$rel"/}" "$t"
+    done >> "$WORK/meta/symlinks"
+}
+
+count0() { tr -cd '\000' < "$1" | wc -c | tr -d ' '; }
+
+# Escape a path for a basic regular expression (tar's name rewriting).
+bre() { printf '%s' "$1" | sed 's/[].[\*^$]/\\&/g'; }
+
+# Gather everything for the projects this run covers into $WORK/list (and
+# the manifest), and the name-rewriting rules into $WORK/rules.
+gather() {
+  local name path git url code rootkey f fk relkey ncode=0 nproj=0 x
+  mkdir -p "$WORK/meta" "$WORK/cfg"
+  : > "$WORK/list"; : > "$WORK/other"; : > "$WORK/meta/symlinks"; : > "$WORK/rules"
+  {
+    printf 'format\t%s\n' "$FORMAT"
+    printf 'home\t%s\n' "$HOME"
+    printf 'scopes\t%s\n' "$SCOPES"
+  } > "$WORK/meta/manifest"
+  run_rows > "$WORK/run"
+
+  # Claude's keys for each project folder and every folder inside one.
+  { cut -f2 "$WORK/run"; cat "$WORK/paths"; } | sort -u > "$WORK/kpaths"
+  if [ -s "$WORK/kpaths" ]; then js keys "$WORK/kpaths" > "$WORK/keys"; else : > "$WORK/keys"; fi
+
+  while IFS="$TAB" read -r name path; do
+    nproj=$((nproj + 1))
+    git=0 url="" code=0
+    [ -e "$path/.git" ] && git=1
+    [ $git = 1 ] && url=$(origin_url "$path")
+    case $url in ''|*[!A-Za-z0-9@:/._~+%=-]*) url="-" ;; esac
+    if [ "$want_code" = 1 ]; then
+      if [ -d "$path" ]; then
+        list_code "$path" "$name"
+        printf '%s\t%s/\tcode/%s/\n' "${#path}" "${path#/}" "$name" >> "$WORK/rules"
+        code=1 ncode=$((ncode + 1))
+      else
+        warn "$name: $path is gone, so its code isn't included"
+      fi
+    fi
+    printf 'project\t%s\t%s\t%s\t%s\t%s\n' "$name" "$git" "$url" "$code" "$path" >> "$WORK/meta/manifest"
+
+    if [ "$want_sessions" = 1 ] || [ "$want_memory" = 1 ]; then
+      rootkey=$(key_of "$path")
+      { printf '%s\n' "$path"; awk -v r="$path/" 'index($0, r) == 1' "$WORK/paths"; } | sort -u |
+      while IFS= read -r f; do
+        fk=$(key_of "$f")
+        [ -n "$fk" ] && [ -d "$MAC_CLAUDE/projects/$fk" ] || continue
+        case $fk in "$rootkey"*) ;; *) continue ;; esac
+        relkey=${fk#"$rootkey"}
+        if [ "$want_sessions" = 1 ]; then
+          list_tree "$MAC_CLAUDE/projects/$fk"
+        elif [ -d "$MAC_CLAUDE/projects/$fk/memory" ]; then
+          list_tree "$MAC_CLAUDE/projects/$fk/memory"
+        else
+          continue
+        fi
+        printf 'folder\t%s\t%s\t%s\t%s\n' "$name" "${relkey:-.}" "$fk" "$f" >> "$WORK/meta/manifest"
+      done
+    fi
+  done < "$WORK/run"
+
+  if [ "$want_config" = 1 ]; then
+    for x in $CONFIG_FILES; do
+      # Copied (following a symlink, as for dotfiles) rather than packed in place.
+      [ -f "$MAC_CLAUDE/$x" ] && cp "$MAC_CLAUDE/$x" "$WORK/cfg/$x"
+    done
+    for x in $CONFIG_DIRS; do
+      [ -d "$MAC_CLAUDE/$x" ] && list_tree "$MAC_CLAUDE/$x"
+    done
+    ( cd / && find "${WORK#/}/cfg" -mindepth 1 -type f -print0 ) >> "$WORK/list"
+    if [ -f "$MAC_JSON" ]; then
+      js mcpnames "$MAC_JSON" > "$WORK/meta/mcp-names"
+      if grep -q . "$WORK/meta/mcp-names"; then js mcp "$MAC_JSON" > "$WORK/meta/mcp.json"
+      else rm -f "$WORK/meta/mcp-names"; fi
+    fi
+  fi
+  [ -s "$WORK/meta/symlinks" ] || rm -f "$WORK/meta/symlinks"
+
+  # Claude data under claude/, the config copies too, and the manifest
+  # under mac-to-boxen/; longest source first (bsdtar uses the first match).
+  {
+    printf '%s\t%s/\tclaude/\n' "${#MAC_CLAUDE}" "${MAC_CLAUDE#/}"
+    printf '%s\t%s/cfg/\tclaude/\n' "${#WORK}" "${WORK#/}"
+    printf '%s\t%s/meta/\tmac-to-boxen/\n' "${#WORK}" "${WORK#/}"
+  } >> "$WORK/rules"
+  ( cd / && find "${WORK#/}/meta" -mindepth 1 -type f -print0 ) >> "$WORK/list"
+
+  N_PROJ=$nproj N_CODE=$ncode
+  N_FOLD=$(grep -c "^folder$TAB" "$WORK/meta/manifest" || true)
+  N_FILES=$(count0 "$WORK/list")
+  N_LINKS=0; [ -f "$WORK/meta/symlinks" ] && N_LINKS=$(( $(count0 "$WORK/meta/symlinks") / 2 ))
+  N_OTHER=$(count0 "$WORK/other")
+}
+
+# The archive (gzip'd tar) on stdout, with member names rewritten from
+# Mac paths to the layout import expects: code/<name>/, claude/,
+# mac-to-boxen/. macOS tar is bsdtar (-s); GNU tar (--transform) for tests.
+make_archive() {
+  local d="" c len src dst all
+  all=$(cut -f2 "$WORK/rules")
+  for c in ',' '|' '#' '%' '@' ':' ';' '!' '~' '='; do
+    case $all in *"$c"*) ;; *) d=$c; break ;; esac
+  done
+  [ -n "$d" ] || die "folder names use every separator tar's renaming could; rename one"
+  set --
+  if tar --version 2>/dev/null | grep -q bsdtar; then
+    while IFS="$TAB" read -r len src dst; do
+      set -- "$@" -s "$d^$(bre "$src")$d$dst$d"
+    done < <(sort -t "$TAB" -k1,1nr "$WORK/rules")
+    COPYFILE_DISABLE=1 tar -C / -czf - -n --null -T "$WORK/list" \
+      --no-mac-metadata --no-xattrs --no-acls --no-fflags "$@"
+  else
+    while IFS="$TAB" read -r len src dst; do
+      set -- "$@" --transform "s$d^$(bre "$src")$d$dst$d"
+    done < <(sort -t "$TAB" -k1,1nr "$WORK/rules")
+    tar -C / -czf - --no-recursion --null -T "$WORK/list" "$@"
+  fi
+  : "$len"
+}
+
+# Quote for the VM's shell.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+cmd_export() {
+  local vm="" out="" only=all projects="" plan_file="" yes=0 dry=0 fwd="" plan_only=${PLAN_ONLY:-0} ans pick x
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -o|--output)  [ $# -ge 2 ] || die "$1 needs a file name"; out=$2; shift ;;
+      --output=*)   out=${1#*=} ;;
+      --only)       [ $# -ge 2 ] || die "--only needs scopes"; only=$2; shift ;;
+      --only=*)     only=${1#*=} ;;
+      --projects)   [ $# -ge 2 ] || die "--projects needs a list"; projects=$2; shift ;;
+      --projects=*) projects=${1#*=} ;;
+      --plan)       [ $# -ge 2 ] || die "--plan needs a file"; plan_file=$2; shift ;;
+      --plan=*)     plan_file=${1#*=} ;;
+      --exclude)    [ $# -ge 2 ] || die "--exclude needs a name"; EXCLUDES="$EXCLUDES $2"; shift ;;
+      --exclude=*)  EXCLUDES="$EXCLUDES ${1#*=}" ;;
+      -y|--yes)     yes=1 ;;
+      -n|--dry-run) dry=1 ;;
+      --boxen-new)  fwd="$fwd --boxen-new" ;;
+      --src|--max-size|--max-files)
+                    [ $# -ge 2 ] || die "$1 needs a value"; fwd="$fwd $1 $(sq "$2")"; shift ;;
+      -h|--help)    usage; exit 0 ;;
+      -*)           die "unknown option '$1' (see --help)" ;;
+      *)            [ -z "$vm" ] || die "one address at a time ('$vm' and '$1')"; vm=$1 ;;
+    esac
+    shift
+  done
+  parse_scopes "$only"
+  if [ "$plan_only" = 0 ] && [ "$dry" = 0 ]; then
+    [ -n "$vm" ] || [ -n "$out" ] || die "say where it goes: an address (you@your-vm) or -o FILE (see --help)"
+    [ -z "$vm" ] || [ -z "$out" ] || die "give an address or -o FILE, not both"
+  fi
+  [ -z "$out" ] || [ -z "$fwd" ] || warn "--src, --boxen-new and --max-size are import options; give them to import on the VM"
+
+  MAC_CLAUDE=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  MAC_CLAUDE=${MAC_CLAUDE%/}
+  MAC_JSON="$HOME/.claude.json"
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$MAC_CLAUDE/.claude.json" ] && MAC_JSON="$MAC_CLAUDE/.claude.json"
+  [ -d "$MAC_CLAUDE" ] || [ -f "$MAC_JSON" ] || die "no Claude Code data here ($MAC_CLAUDE)"
+
+  x=${TMPDIR:-/tmp}
+  WORK=$(mktemp -d "${x%/}/mac-to-boxen.XXXXXX")   # macOS's TMPDIR ends in /
+  case $WORK in /*) ;; *) WORK="$(pwd)/$WORK" ;; esac
+  trap 'rm -rf "$WORK"' EXIT
+  chmod 700 "$WORK"
+
+  # 1. Every folder Claude Code has been used in, from ~/.claude.json,
+  #    checked here: does it still exist, is it a git repo?
+  if [ -f "$MAC_JSON" ]; then js paths "$MAC_JSON" | grep -v '^$' | sort -u > "$WORK/paths" || true
+  else : > "$WORK/paths"; fi
+  while IFS= read -r x; do
+    if [ -d "$x" ]; then
+      if [ -e "$x/.git" ]; then printf '1\t1\t%s\n' "$x"; else printf '1\t0\t%s\n' "$x"; fi
+    else printf '0\t0\t%s\n' "$x"; fi
+  done < "$WORK/paths" > "$WORK/probe"
+
+  # 2. The plan: built here, or the one you saved.
+  if [ -n "$plan_file" ]; then
+    [ -f "$plan_file" ] || die "no plan file '$plan_file'"
+    cp "$plan_file" "$WORK/plan"
+  else
+    [ "$plan_only" = 1 ] || info "looking at the $(wc -l < "$WORK/paths" | tr -d ' ') folders Claude Code has been used in"
+    make_plan > "$WORK/plan"
+  fi
+  if [ "$plan_only" = 1 ]; then cat "$WORK/plan"; return 0; fi
+  read_plan "$WORK/plan" || die "$PLAN_ERR"
+  if [ -n "$projects" ]; then select_projects "$projects" || exit 1; fi
+
+  # 3. Review.
+  show_plan
+  if [ "$dry" = 0 ] && [ "$yes" = 0 ]; then
+    [ -t 0 ] || die "nothing copied: add --yes to go ahead without being asked (see the plan above)"
+    while :; do
+      printf 'Copy %s to %s? [y]es / [s]elect projects / [e]dit the plan / [n]o: ' "$SCOPES" "${vm:-$out}" >&2
+      read -r ans || ans=n
+      case $ans in
+        y|Y|yes) break ;;
+        s|S|select)
+          printf 'Projects for this run (numbers, ranges or names, e.g. 1 3 5-7; "all" for every one): ' >&2
+          read -r pick || pick=""
+          select_projects "$pick" || true
+          show_plan ;;
+        e|E|edit)
+          while :; do
+            ${VISUAL:-${EDITOR:-nano}} "$WORK/plan" < /dev/tty > /dev/tty || true
+            if read_plan "$WORK/plan"; then break; fi
+            warn "$PLAN_ERR"
+            printf 'Edit again? [Y/n]: ' >&2; read -r ans || ans=n
+            case $ans in n|N|no) echo "Nothing copied." >&2; exit 1 ;; esac
+          done
+          rm -f "$WORK/selected"
+          show_plan
+          printf '  These names are for this run. To use them again later: %s plan > plan.tsv,\n  make the same edits there, and pass --plan plan.tsv.\n\n' "$PROG" >&2 ;;
+        *) echo "Nothing copied." >&2; exit 0 ;;
+      esac
+    done
+  fi
+
+  # 4. What goes in the archive.
+  gather
+  info "packing $SCOPES: $N_PROJ project(s), code for $N_CODE, Claude data for $N_FOLD folder(s); $N_FILES files and folders"
+  [ "$N_LINKS" = 0 ] || echo "    $N_LINKS symlink(s) in code are sent as a list and recreated on the VM if they stay inside their project" >&2
+  [ "$N_OTHER" = 0 ] || echo "    $N_OTHER symlink(s) or special file(s) under $MAC_CLAUDE are left out" >&2
+  if [ "$dry" = 1 ]; then
+    if [ -n "$vm" ] || [ -n "$out" ]; then echo "Dry run: nothing was packed or sent." >&2
+    else echo "Dry run: nothing was packed. (Give an address or -o FILE to do it.)" >&2; fi
+    return 0
+  fi
+  if [ "$N_PROJ" = 0 ] && [ "$want_config" = 0 ]; then die "nothing to copy"; fi
+
+  # 5a. To a file.
+  if [ -n "$out" ]; then
+    ( umask 077; make_archive > "$out.part" ) || { rm -f "$out.part"; die "couldn't write $out"; }
+    mv -f "$out.part" "$out"
+    info "wrote $out ($(human_kb "$(du -sk "$out" | cut -f1)"))"
+    cat >&2 <<EOF
+    Next: copy it and this script to the VM, and there run
+      bash $PROG import $(basename "$out")
+    (add --dry-run first to see what goes where). It holds your session
+    transcripts: delete it from both machines once it's imported.
+EOF
+    return 0
+  fi
+
+  # 5b. Over SSH: one sign-in for the whole run. The VM gets this script
+  #     and the archive on stdin, and imports it.
+  local ctl="/tmp/$PROG-$$" ssh_cmd=${MAC_TO_BOXEN_SSH:-ssh} remote=".cache/$PROG/$PROG"
+  ssh_vm() {
+    # shellcheck disable=SC2086  # MAC_TO_BOXEN_SSH may carry options
+    $ssh_cmd -o ConnectTimeout=15 -o ControlMaster=auto -o ControlPath="$ctl" -o ControlPersist=600 "$vm" "$@"
+  }
+  # shellcheck disable=SC2064
+  trap "$(printf '%s -o ControlPath=%s -O exit %s >/dev/null 2>&1 || true; rm -rf %s' "$ssh_cmd" "$(sq "$ctl")" "$(sq "$vm")" "$(sq "$WORK")")" EXIT
+  info "connecting to $vm"
+  ssh_vm true < /dev/null || die "can't SSH to $vm"
+  ssh_vm "umask 077 && mkdir -p .cache/$PROG && cat > $remote" < "${BASH_SOURCE[0]}" \
+    || die "couldn't copy this script to $vm"
+  info "sending to $vm (the VM checks it, then copies it into place)"
+  if make_archive | ssh_vm "bash $remote import - $fwd"; then
+    ssh_vm "rm -f $remote" < /dev/null || true
+  else
+    ssh_vm "rm -f $remote" < /dev/null || true
+    die "the import on $vm didn't finish (see above); nothing on the Mac was changed"
+  fi
+}
+
+# ================================================================ the VM
+
+# Claude's key for a path on the VM: every character other than A-Z, a-z,
+# 0-9 becomes '-', two for characters outside the BMP (JavaScript counts
+# UTF-16 units).
+ALNUM=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
+encode_path() (
+  local s=$1 out="" c n i
+  export LC_ALL=C
+  case $s in
+    *[!\ -~]*) ;;
+    *) printf '%s' "${s//[!$ALNUM]/-}"; exit 0 ;;
+  esac
+  LC_ALL=C.UTF-8
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      ["$ALNUM"]) out+=$c ;;
+      *) printf -v n '%d' "'$c"; if ((n > 65535)); then out+=--; else out+=-; fi ;;
+    esac
+  done
+  printf '%s' "$out"
+)
+
+# Check every entry of the archive before unpacking anything: only plain
+# files and folders, only the layout export writes, no absolute paths or
+# '..', within the size and count limits. Prints why, and fails, if not.
+check_listing() {
+  local arch=$1 why
+  why=$(tar -tvzf "$arch" --numeric-owner --quoting-style=escape --warning=no-unknown-keyword 2>"$WORK/tar.err" |
+    awk -v max="$MAX_SIZE" -v maxn="$MAX_FILES" -v cfgd="$CONFIG_DIRS" -v cfgf="$CONFIG_FILES" -v reserved="$RESERVED" '
+      function bad(why) { if (!out) out = why; failed = 1 }
+      BEGIN {
+        n = split(cfgd, a, " "); for (i = 1; i <= n; i++) cd[a[i]] = 1
+        n = split(cfgf, a, " "); for (i = 1; i <= n; i++) cf[a[i]] = 1
+        n = split(reserved, a, " "); for (i = 1; i <= n; i++) res[a[i]] = 1
+        mf["manifest"] = 1; mf["mcp.json"] = 1; mf["mcp-names"] = 1; mf["symlinks"] = 1
+      }
+      failed { next }
+      {
+        if (!match($0, /^[^ ]+ +[^ ]+ +[0-9,]+ +[0-9-]+ +[0-9:]+ /)) { bad("an entry it cannot read: " $0); next }
+        t = substr($0, 1, 1); name = substr($0, RLENGTH + 1); size = $3
+        if (t == "l") { bad("a symbolic link: " name); next }
+        if (t == "h") { bad("a hard link: " name); next }
+        if (t != "-" && t != "d") { bad("a special file (a device, pipe or socket): " name); next }
+        if (t == "d") sub(/\/$/, "", name)
+        if (name == "" || substr(name, 1, 1) == "/") { bad("an absolute path: " name); next }
+        k = split(name, c, "/")
+        for (i = 1; i <= k; i++) if (c[i] == "" || c[i] == "." || c[i] == "..") { bad("a path that could climb out of where it is unpacked: " name); next }
+        ok = 0
+        if (c[1] == "mac-to-boxen") ok = (k == 1 && t == "d") || (k == 2 && t == "-" && (c[2] in mf))
+        else if (c[1] == "claude") {
+          if (k == 1) ok = (t == "d")
+          else if (c[2] == "projects") ok = (k == 2 && t == "d") || (k >= 3 && c[3] ~ /^[A-Za-z0-9-]+$/ && !(k == 3 && t != "d"))
+          else if (c[2] in cf) ok = (k == 2 && t == "-")
+          else if (c[2] in cd) ok = (k > 2 || t == "d")
+        } else if (c[1] == "code") {
+          if (k == 1) ok = (t == "d")
+          else ok = c[2] ~ /^[a-z0-9]+([_-][a-z0-9]+)*$/ && length(c[2]) <= 40 && !(c[2] in res) && !(k == 2 && t != "d")
+        }
+        if (!ok) { bad("something export does not write: " name); next }
+        total += size; count++
+        if (total > max) { bad("more than the size limit (" max " bytes; see --max-size)"); next }
+        if (count > maxn) { bad("more than " maxn " entries (see --max-files)"); next }
+      }
+      END {
+        if (failed) { print "it contains " out; exit 1 }
+        if (!count) { print "it is empty"; exit 1 }
+        print "OK " total " " count
+      }') || {
+    # tar itself failed (not gzip, damaged): say that rather than "empty".
+    if grep -q . "$WORK/tar.err" && { [ -z "$why" ] || [ "$why" = "it is empty" ]; }; then
+      why="it isn't a readable .tar.gz ($(head -1 "$WORK/tar.err"))"
+    fi
+    die "refusing $(clean "$ARCH_NAME"): $(clean "${why#OK }")"
+  }
+  ARCH_BYTES=$(printf '%s' "$why" | cut -d' ' -f2)
+  ARCH_COUNT=$(printf '%s' "$why" | cut -d' ' -f3)
+}
+
+# merge_tree SRC DEST [UMASK]: copy files (and empty folders) from SRC that
+# DEST doesn't have; anything already in DEST is kept. Sets M_NEW and
+# M_KEPT, with the new paths in $WORK/new (one per line). Files get their
+# modes from the archive less UMASK (default 077: private).
+merge_tree() {
+  local src=$1 dest=$2 mask=${3:-077} f
+  M_NEW=0 M_KEPT=0
+  : > "$WORK/new0"; : > "$WORK/new"
+  while IFS= read -r -d '' f; do
+    f=${f#./}
+    if [ -e "$dest/$f" ] || [ -L "$dest/$f" ]; then
+      M_KEPT=$((M_KEPT + 1))
+    else
+      M_NEW=$((M_NEW + 1))
+      printf '%s\0' "$f" >> "$WORK/new0"
+      printf '%s\n' "$f" >> "$WORK/new"
+    fi
+  done < <(cd "$src" && find . -mindepth 1 \( -type f -o \( -type d -empty \) \) -print0)
+  [ "$DRY" = 0 ] && [ "$M_NEW" -gt 0 ] || return 0
+  mkdir -p "$dest"
+  # --skip-old-files: even if something appeared since the check, keep it.
+  if ! ( cd "$src" && tar -cf - --null --no-recursion -T "$WORK/new0" ) |
+       ( umask "$mask"; cd "$dest" && tar -xf - --skip-old-files --no-same-owner --no-same-permissions ) 2>"$WORK/merge.err"; then
+    warn "some files couldn't be written into $dest:"
+    head -5 "$WORK/merge.err" >&2
+  fi
+}
+
+# Is TARGET, followed from folder REL_DIR (both inside a project), still
+# inside the project? (By name only; the real check is after linking.)
+link_inside() {
+  local depth=0 p parts IFS=/
+  read -ra parts <<< "$1/$2"
+  for p in "${parts[@]}"; do
+    case $p in
+      ''|.) ;;
+      ..) depth=$((depth - 1)); [ $depth -ge 0 ] || return 1 ;;
+      *) depth=$((depth + 1)) ;;
+    esac
+  done
+  return 0
+}
+
+# Recreate a project's symlinks from the archive's list, after its files:
+# only where nothing exists yet, only relative targets that stay inside the
+# project, never inside a folder that leads out of it; each one is checked
+# again once all are made, and removed if it resolves outside.
+make_links() {
+  local name=$1 dest=$2 list="$X/mac-to-boxen/symlinks" l t rel root made=() bad=0 kept=0 n=0 r
+  L_MADE=0 L_KEPT=0 L_BAD=0
+  [ -f "$list" ] || return 0
+  if [ "$DRY" = 0 ]; then root=$(realpath -e -- "$dest"); else root=$dest; fi
+  while IFS= read -r -d '' l && IFS= read -r -d '' t; do
+    case $l in "code/$name/"*) ;; *) continue ;; esac
+    rel=${l#"code/$name/"}
+    case "/$rel/" in */../*|*/./*|*//*) bad=$((bad + 1)); continue ;; esac
+    case $t in ''|/*|*$'\n'*) bad=$((bad + 1)); continue ;; esac
+    case $rel in *$'\n'*) bad=$((bad + 1)); continue ;; esac
+    if ! link_inside "$(dirname -- "$rel")" "$t"; then bad=$((bad + 1)); continue; fi
+    if [ -e "$dest/$rel" ] || [ -L "$dest/$rel" ]; then kept=$((kept + 1)); continue; fi
+    if [ "$DRY" = 1 ]; then n=$((n + 1)); continue; fi
+    mkdir -p -- "$(dirname -- "$dest/$rel")" 2>/dev/null || { bad=$((bad + 1)); continue; }
+    r=$(realpath -e -- "$(dirname -- "$dest/$rel")") || { bad=$((bad + 1)); continue; }
+    case $r in "$root"|"$root"/*) ;; *) bad=$((bad + 1)); continue ;; esac
+    ln -s -- "$t" "$dest/$rel" && made+=("$dest/$rel")
+  done < "$list"
+  for l in "${made[@]}"; do
+    r=$(realpath -m -- "$l")
+    case $r in
+      "$root"|"$root"/*) n=$((n + 1)) ;;
+      *) rm -f -- "$l"; bad=$((bad + 1)) ;;
+    esac
+  done
+  L_MADE=$n L_KEPT=$kept L_BAD=$bad
+}
+
+# A GitHub or https URL that 'boxen new' can clone, from the Mac's origin.
+clone_url() {
+  local r
+  case $1 in
+    https://*) printf '%s' "$1" ;;
+    git@github.com:*) r=${1#git@github.com:}; printf 'https://github.com/%s' "$r" ;;
+    ssh://git@github.com/*) r=${1#ssh://git@github.com/}; printf 'https://github.com/%s' "$r" ;;
+    *) return 1 ;;
+  esac
+}
+
+# For display: $HOME/x as ~/x
+# shellcheck disable=SC2088
+tilde() { case $1 in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+
+cmd_import() {
+  local arch="" boxen_new=0 src_opt="" i j name mac url code dest vroot vk mk relkey s nf
+  local tot_sess tot_mem tot_sess_kept tot_mem_kept todo=() boxen="" bh
+  DRY=0 MAX_SIZE="" MAX_FILES=$DEFAULT_MAX_FILES
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n|--dry-run)  DRY=1 ;;
+      --boxen-new)   boxen_new=1 ;;
+      --src)         [ $# -ge 2 ] || die "--src needs a folder"; src_opt=$2; shift ;;
+      --src=*)       src_opt=${1#*=} ;;
+      --max-size)    [ $# -ge 2 ] || die "--max-size needs a size"; MAX_SIZE=$2; shift ;;
+      --max-size=*)  MAX_SIZE=${1#*=} ;;
+      --max-files)   [ $# -ge 2 ] || die "--max-files needs a number"; MAX_FILES=$2; shift ;;
+      --max-files=*) MAX_FILES=${1#*=} ;;
+      -h|--help)     usage; exit 0 ;;
+      -)             [ -z "$arch" ] || die "one archive at a time"; arch=- ;;
+      -*)            die "unknown option '$1' (see --help)" ;;
+      *)             [ -z "$arch" ] || die "one archive at a time"; arch=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$arch" ] || die "which archive? (mac-to-boxen import FILE; see --help)"
+  MAX_SIZE=$(parse_size "${MAX_SIZE:-$DEFAULT_MAX_SIZE}") || die "--max-size wants a size like 20G or 500M"
+  case $MAX_FILES in ''|*[!0-9]*) die "--max-files wants a number" ;; esac
+  tar --version 2>/dev/null | grep -q 'GNU tar' || die "import needs GNU tar (run it on the Linux VM)"
+  command -v realpath >/dev/null || die "import needs realpath (GNU coreutils)"
+
+  umask 077
+  CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  SRC_ROOT=$(realpath -m -- "${src_opt:-${BOXEN_SRC:-$HOME/src}}")
+  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/$PROG"
+  mkdir -p "$cache"
+  WORK=$(mktemp -d "$cache/import.XXXXXX")
+  # The staged copies include transcripts; don't leave them lying around.
+  trap 'rm -rf "$WORK"' EXIT
+
+  if [ "$arch" = - ]; then
+    [ ! -t 0 ] || die "'-' reads the archive from stdin, which is a terminal here"
+    ARCH_NAME="the archive from stdin"
+    head -c $((MAX_SIZE + 1)) > "$WORK/archive.tgz"
+    [ "$(stat -c %s "$WORK/archive.tgz")" -le "$MAX_SIZE" ] || die "refusing the archive: it's bigger than the size limit (see --max-size)"
+    arch="$WORK/archive.tgz"
+  else
+    ARCH_NAME=$arch
+    [ -f "$arch" ] || die "no file '$arch'"
+  fi
+
+  # 1. Check, then unpack into the private staging folder, then check again.
+  check_listing "$arch"
+  local avail
+  avail=$(df -Pk "$WORK" | awk 'NR == 2 { print $4 }')
+  if [ -n "$avail" ] && [ $((ARCH_BYTES / 1024 + 1048576)) -gt "$avail" ]; then
+    die "not enough free space in $(tilde "$cache") to unpack $(human_kb $((ARCH_BYTES / 1024))) (and keep 1G spare)"
+  fi
+  X="$WORK/x"
+  mkdir "$X"
+  # Code keeps ordinary modes (the staging folder itself is private);
+  # Claude data is made private as it's copied out (merge_tree).
+  ( umask 022; tar -xzf "$arch" -C "$X" --no-same-owner --no-same-permissions --warning=no-unknown-keyword ) \
+    || die "couldn't unpack $(clean "$ARCH_NAME")"
+  [ "$arch" != "$WORK/archive.tgz" ] || rm -f "$arch"
+  if [ -n "$(find "$X" ! -type f ! -type d -print -quit)" ]; then
+    die "refusing $(clean "$ARCH_NAME"): it unpacked something other than plain files and folders"
+  fi
+
+  # 2. The manifest: which projects, which Claude folders belong to each.
+  local m="$X/mac-to-boxen/manifest" kind a b c d e fmt="" mac_home=""
+  [ -f "$m" ] || die "$(clean "$ARCH_NAME") isn't from '$PROG export' (it has no manifest)"
+  local P_NAME=() P_GIT=() P_URL=() P_CODE=() P_MAC=() F_NAME=() F_REL=() F_KEY=() F_MAC=()
+  while IFS="$TAB" read -r kind a b c d e; do
+    case $kind in
+      format) fmt=$a ;;
+      home) mac_home=$a ;;
+      project)
+        valid_name "$a" || die "the archive names a project '$(clean "$a")', which isn't a valid name"
+        for j in "${P_NAME[@]}"; do [ "$j" != "$a" ] || die "the archive lists project '$a' twice"; done
+        case $b$d in 00|01|10|11) ;; *) die "the archive's manifest is damaged (project $a)" ;; esac
+        case $c in -|*[!A-Za-z0-9@:/._~+%=-]*) c="" ;; esac
+        P_NAME+=("$a") P_GIT+=("$b") P_URL+=("$c") P_CODE+=("$d") P_MAC+=("$e") ;;
+      folder)
+        [[ $b == . || $b =~ $KEY_RE ]] && [[ $c =~ $KEY_RE ]] || die "the archive's manifest is damaged (a folder of $(clean "$a"))"
+        F_NAME+=("$a") F_REL+=("$b") F_KEY+=("$c") F_MAC+=("$d") ;;
+    esac
+  done < "$m"
+  [ "$fmt" = "$FORMAT" ] || die "this archive was made by a different version of $PROG (format '$(clean "$fmt")'; this one reads $FORMAT): use the same script on both machines"
+
+  W=""
+  if [ "$DRY" = 1 ]; then W="would be "; info "dry run: checking what would go where (nothing is written)"; fi
+  echo "Archive: $ARCH_COUNT files and folders, $(human_kb $((ARCH_BYTES / 1024))), from $(clean "${mac_home:-a Mac}")"
+  echo "Projects go to $(tilde "$SRC_ROOT")/<name>; Claude data to $(tilde "$CLAUDE_DIR"). Nothing already here is overwritten."
+  echo
+
+  bh=${BOXEN_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/boxen}
+  boxen=$(command -v boxen 2>/dev/null || true)
+  [ -n "$boxen" ] || { [ -x "$HOME/.local/bin/boxen" ] && boxen="$HOME/.local/bin/boxen"; } || true
+
+  # 3. Each project: code, then its Claude data under the new path's key.
+  for i in "${!P_NAME[@]}"; do
+    name=${P_NAME[i]} mac=${P_MAC[i]} url=${P_URL[i]} code=${P_CODE[i]}
+    dest="$SRC_ROOT/$name"
+    # Skip projects nothing came over for (e.g. with --only config).
+    if [ "$code" != 1 ]; then
+      j=""
+      for j in "${F_NAME[@]}"; do [ "$j" = "$name" ] && break; j=""; done
+      [ -n "$j" ] || continue
+    fi
+    printf '%s%s%s  (from %s)\n' "$BOLD" "$name" "$OFF" "$(clean "$mac")"
+    local had_dest=0
+    [ -e "$dest" ] && had_dest=1
+    if [ "$code" = 1 ] && [ -d "$X/code/$name" ]; then
+      if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+        nf=$(find "$X/code/$name" -type f | wc -l)
+        if [ "$DRY" = 0 ]; then mkdir -p "$SRC_ROOT"; mv -- "$X/code/$name" "$dest"; fi
+        echo "  code: $nf files ${W}copied to $(tilde "$dest") (a new folder)"
+      elif [ -d "$dest" ] && [ ! -L "$dest" ]; then
+        merge_tree "$X/code/$name" "$dest" 022
+        echo "  code: $(tilde "$dest") already exists: $M_NEW files ${W}added; $M_KEPT already there, kept as they are"
+      else
+        echo "  code: skipped: $(tilde "$dest") exists and isn't a folder"
+      fi
+      if [ -d "$dest" ] || [ "$DRY" = 1 ]; then
+        make_links "$name" "$dest"
+        [ "$L_MADE" = 0 ] || echo "  code: $L_MADE symlink(s) ${W}recreated"
+        [ "$L_KEPT" = 0 ] || echo "  code: $L_KEPT symlink(s) not recreated: something by that name is already there"
+        [ "$L_BAD" = 0 ] || echo "  code: $L_BAD symlink(s) left out: they point outside the project (or are malformed)"
+      fi
+    fi
+
+    vroot=$(encode_path "$dest")
+    tot_sess=0 tot_mem=0 tot_sess_kept=0 tot_mem_kept=0
+    local keys_used=""
+    for j in "${!F_NAME[@]}"; do
+      [ "${F_NAME[j]}" = "$name" ] || continue
+      mk=${F_KEY[j]} relkey=${F_REL[j]}
+      [ "$relkey" = . ] && relkey=""
+      vk="$vroot$relkey"
+      s="$X/claude/projects/$mk"
+      [ -d "$s" ] || continue
+      if [ ${#vk} -gt $MAX_KEY ]; then
+        warn "$name: skipped Claude data for $(clean "${F_MAC[j]}"): its path on the VM is too long to file"
+        continue
+      fi
+      local sk=0 mkk=0
+      merge_tree "$s" "$CLAUDE_DIR/projects/$vk"
+      sk=$(grep -c '^[^/]*\.jsonl$' "$WORK/new" || true)
+      mkk=$(grep -c '^memory/.' "$WORK/new" || true)
+      tot_sess=$((tot_sess + sk)) tot_mem=$((tot_mem + mkk))
+      tot_sess_kept=$((tot_sess_kept + $(find "$s" -maxdepth 1 -name '*.jsonl' -type f | wc -l) - sk))
+      [ -d "$s/memory" ] && tot_mem_kept=$((tot_mem_kept + $(find "$s/memory" -type f | wc -l) - mkk))
+      keys_used="$keys_used $vk"
+    done
+    if [ -n "$keys_used" ]; then
+      printf '  Claude: %s session(s) and %s memory file(s) %sadded' "$tot_sess" "$tot_mem" "$W"
+      if [ $((tot_sess_kept + tot_mem_kept)) -gt 0 ]; then
+        printf '; %s session(s) and %s memory file(s) were already here and kept' "$tot_sess_kept" "$tot_mem_kept"
+      fi
+      printf '\n    %sfiled under %s\n' "$W" "$(tilde "$CLAUDE_DIR")/projects/$vroot"
+    fi
+
+    # boxen: suggest (or, with --boxen-new, run) 'boxen new' for projects
+    # something came over for that aren't boxen projects yet.
+    if [ "$code" != 1 ] && [ -z "$keys_used" ]; then
+      :
+    elif [ ! -f "$bh/projects/$name/compose.yaml" ]; then
+      if [ -e "$dest" ] || [ "$had_dest" = 1 ] || { [ "$code" = 1 ] && [ "$DRY" = 1 ]; }; then
+        todo+=("$name")
+      elif url=$(clone_url "$url"); then
+        todo+=("$name $url")
+      else
+        todo+=("$name")
+      fi
+    else
+      echo "  already a boxen project"
+    fi
+    echo
+  done
+  local nunused
+  nunused=$( [ -d "$X/claude/projects" ] && find "$X/claude/projects" -mindepth 1 -maxdepth 1 -type d | wc -l || echo 0)
+  [ "$nunused" -le "${#F_KEY[@]}" ] || warn "the archive has Claude folders its manifest doesn't place; they were left out"
+
+  # 4. Personal config: missing files added; CLAUDE.md and settings.json
+  #    kept aside when the VM has its own; MCP servers listed.
+  if [ -d "$X/claude" ]; then
+    local item said=0 f aside
+    for item in $CONFIG_DIRS; do
+      [ -d "$X/claude/$item" ] || continue
+      [ $said = 1 ] || { echo "Config ($(tilde "$CLAUDE_DIR")):"; said=1; }
+      if [ -e "$CLAUDE_DIR/$item" ] && [ ! -d "$CLAUDE_DIR/$item" ]; then
+        echo "  $item: skipped: the VM has a file by that name"; continue
+      fi
+      merge_tree "$X/claude/$item" "$CLAUDE_DIR/$item"
+      echo "  $item: $M_NEW file(s) ${W}added; $M_KEPT already here and kept"
+    done
+    for f in $CONFIG_FILES; do
+      [ -f "$X/claude/$f" ] || continue
+      [ $said = 1 ] || { echo "Config ($(tilde "$CLAUDE_DIR")):"; said=1; }
+      case $f in CLAUDE.md) aside=CLAUDE.mac.md ;; *) aside=settings.mac.json ;; esac
+      if [ "$f" = CLAUDE.md ] && [ ! -e "$CLAUDE_DIR/$f" ]; then
+        [ "$DRY" = 1 ] || { mkdir -p "$CLAUDE_DIR"; cp -- "$X/claude/$f" "$CLAUDE_DIR/$f"; }
+        echo "  CLAUDE.md: ${W}added"
+      elif [ -f "$CLAUDE_DIR/$f" ] && cmp -s "$X/claude/$f" "$CLAUDE_DIR/$f"; then
+        echo "  $f: the same as the VM's"
+      elif [ -f "$CLAUDE_DIR/$aside" ] && cmp -s "$X/claude/$f" "$CLAUDE_DIR/$aside"; then
+        echo "  $f: the Mac's is already saved as $aside"
+      else
+        [ "$DRY" = 1 ] || { mkdir -p "$CLAUDE_DIR"; cp -- "$X/claude/$f" "$CLAUDE_DIR/$aside"; }
+        if [ "$f" = CLAUDE.md ]; then
+          echo "  CLAUDE.md: the VM has its own, so the Mac's is ${W}saved as $aside."
+          echo "    To use it too, add a line '@$aside' to $(tilde "$CLAUDE_DIR")/CLAUDE.md."
+        else
+          echo "  settings.json: ${W}saved as $aside (not active; copy what you want into settings.json by hand)"
+        fi
+      fi
+    done
+  fi
+  if [ -f "$X/mac-to-boxen/mcp.json" ]; then
+    if [ "$DRY" = 0 ] && ! cmp -s "$X/mac-to-boxen/mcp.json" "$CLAUDE_DIR/mac-mcp.json"; then
+      mkdir -p "$CLAUDE_DIR"; cp -- "$X/mac-to-boxen/mcp.json" "$CLAUDE_DIR/mac-mcp.json"; chmod 600 "$CLAUDE_DIR/mac-mcp.json"
+    fi
+    echo "MCP servers you'd added on the Mac: $(clean "$(head -c 2000 "$X/mac-to-boxen/mcp-names" 2>/dev/null)")"
+    echo "  Their settings are in $(tilde "$CLAUDE_DIR")/mac-mcp.json. They often point at Mac programs,"
+    echo "  so they aren't added: re-add the ones that make sense here with 'claude mcp add'."
+    echo "  claude.ai connectors follow your account and need nothing."
+  fi
+
+  # 5. Next steps.
+  echo
+  if [ ${#todo[@]} -gt 0 ]; then
+    if [ "$boxen_new" = 1 ] && [ -n "$boxen" ] && [ "$DRY" = 0 ]; then
+      local t
+      for t in "${todo[@]}"; do
+        info "boxen new $t"
+        # shellcheck disable=SC2086  # "name" or "name url"
+        "$boxen" new $t < /dev/null || warn "'boxen new $t' failed; run it again once the problem above is fixed"
+      done
+    else
+      if [ -n "$boxen" ]; then echo "To make these boxen projects (each gets its build container):"
+      else echo "boxen isn't installed here. Once it is, make these boxen projects with:"; fi
+      printf '  boxen new %s\n' "${todo[@]}"
+      [ "$boxen_new" = 0 ] || [ -n "$boxen" ] || [ "$DRY" = 1 ] || warn "--boxen-new: boxen isn't installed, so nothing was run"
+    fi
+    echo
+  fi
+  if [ "$DRY" = 1 ]; then
+    echo "Dry run: nothing was written. Run it again without --dry-run to copy."
+  else
+    echo "Done. Earlier sessions: cd $(tilde "$SRC_ROOT")/<name> && claude --resume"
+  fi
+}
+
+# ================================================================ main
+
+case ${1:-} in
+  export)          shift; cmd_export "$@" ;;
+  plan)            shift; PLAN_ONLY=1 cmd_export "$@" ;;
+  import)          shift; cmd_import "$@" ;;
+  -h|--help|help)  usage ;;
+  "")              usage; exit 1 ;;
+  *)               die "unknown command '$1' (export, plan or import; see --help)" ;;
+esac
