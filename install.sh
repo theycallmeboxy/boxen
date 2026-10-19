@@ -43,10 +43,12 @@ v1_present() {
   return 1
 }
 
+# apt_missing PKG...: the ones that aren't installed, one per line (nothing
+# at all when every one is).
 apt_missing() {
   local p out=()
   for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || out+=("$p"); done
-  printf '%s\n' "${out[@]}"
+  (( ${#out[@]} == 0 )) || printf '%s\n' "${out[@]}"
 }
 
 # 0. Packages from Ubuntu: what boxen uses on the VM (tokens: curl, jq,
@@ -92,10 +94,13 @@ if (( ${#missing[@]} )); then
       sudo apt-get remove -y "$pkg"
     fi
   done
-  sudo install -m 0755 -d /etc/apt/keyrings
-  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  sudo chmod a+r /etc/apt/keyrings/docker.asc
-  sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+  # Docker's repo, unless one is set up already (a second entry with another
+  # key file would make apt-get update fail).
+  if ! grep -rqs 'download.docker.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+    sudo install -m 0755 -d /etc/apt/keyrings
+    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    sudo chmod a+r /etc/apt/keyrings/docker.asc
+    sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
 Suites: $CODENAME
@@ -103,9 +108,11 @@ Components: stable
 Architectures: $ARCH
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
+  fi
   sudo apt-get update
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
-    docker-compose-plugin docker-ce-rootless-extras
+  # Only what's missing, and nothing already installed upgraded: upgrading
+  # docker-ce would restart the system daemon, and v1's containers with it.
+  sudo apt-get install -y --no-upgrade "${missing[@]}"
 fi
 # boxen never uses the system daemon (root in its containers would be root on
 # the VM). A fresh install turns it off; with v1 projects still here it stays
@@ -218,6 +225,12 @@ rm -f "$tmp"
 #    ui/requirements.lock changes. Everything else works without it.
 "$REPO_DIR/ui/install-venv.sh" \
   || warn "boxen ui isn't installed (see above); everything else works. Re-run install.sh to retry."
+
+# A dashboard already running (v1's, or before this update) keeps the code
+# it started with: start it again with this one.
+if tmux -L boxen has-session -t boxen 2>/dev/null; then
+  "$REPO_DIR/bin/boxen" ui --restart >/dev/null 2>&1 || true
+fi
 
 [[ -z "${BOXEN_SELF_UPDATE:-}" ]] || exit 0
 

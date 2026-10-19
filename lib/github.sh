@@ -206,8 +206,8 @@ repo_states() {
 # listed repos' states (repo_states) and the token files' age, no network:
 # "-" with nothing listed; "token ok" when every listed repo is covered,
 # "token partial" when some are, "no token" when none is; "token stale" when
-# a token is older than 55 minutes (tokens last an hour and cron renews them
-# every 30 minutes, so the refresh isn't happening).
+# a token is older than 55 minutes (tokens last an hour and the boxen-tokens
+# timer renews them every 30 minutes, so the refresh isn't happening).
 github_state() {
   local n=$1 s ok=0 dir
   shift
@@ -459,6 +459,9 @@ cmd_tokens() {
 # install_cron: the fallback for ensure_token_timer where `systemctl --user`
 # doesn't work.
 install_cron() {
+  # The timer's there (this ran from a session without systemd, say): it
+  # does the job already.
+  [[ ! -f "$HOME/.config/systemd/user/boxen-tokens.timer" ]] || return 0
   if ! command -v crontab >/dev/null; then
     warn "neither systemd user services nor cron work here, so tokens won't refresh on their own"
     return 1

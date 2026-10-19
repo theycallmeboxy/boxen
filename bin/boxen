@@ -87,7 +87,7 @@ In a project folder (what agents use; they act on the folder they're in)
 Setup and upkeep
   github [--reset] [--key f.pem]  Connect GitHub: your app, per-project tokens, commit identity
   doctor [--lan <host:port>]      Check rootless Docker, the sandbox and isolation on this VM
-  migrate [--cleanup]             Move a boxen v1 install (agents in containers) to this layout
+  migrate [--yes | --cleanup]     Move a boxen v1 install (agents in containers) to this layout
   update                          Rebuild the base image and every project's build container
   self-update                     Update boxen itself and apply it
 EOF
@@ -784,6 +784,10 @@ cmd_new() {
   NEW_NAME=$name NEW_PDIR=$pdir NEW_SRC=$src NEW_CREATED_SRC=0
   [[ -d "$src" ]] || NEW_CREATED_SRC=1
   trap new_cleanup EXIT
+  # Stopped by a signal (Ctrl+C, boxen ui quitting), bash would skip the
+  # EXIT trap: exit normally instead, so the cleanup runs.
+  trap 'exit 143' TERM HUP
+  trap 'exit 130' INT
   mkdir_private "$(token_dir "$name")"
   mkdir -p "$src"
 
@@ -810,7 +814,7 @@ cmd_new() {
   write_compose "$name"
   info "building $name's build container..."
   start_env "$name" --build
-  trap - EXIT
+  trap - EXIT TERM HUP INT
   NEW_PDIR=""
   info "done. Start working: boxen claude $name   (or: cd $src && claude)"
   echo "    Its build environment is $src/.boxen/ (the agent may edit it; boxen env apply applies it)."
@@ -1027,7 +1031,10 @@ cmd_claude() {
   shift
   command -v claude >/dev/null || die "Claude Code isn't installed on the VM; re-run $BOXEN_REPO/install.sh"
   [[ -t 0 && -t 1 ]] || die "claude needs a terminal"
-  argv=(claude "$@")
+  # If Claude exits with an error (say, the sandbox can't start), its last
+  # words stay on screen until Enter instead of the window vanishing.
+  # shellcheck disable=SC2016  # expanded by that sh, on purpose
+  argv=(sh -c 'claude "$@" || { printf "\nclaude exited (%s); press Enter " "$?"; read -r _; }' claude "$@")
   if in_boxen_tmux; then
     "${TMUX_CMD[@]}" new-window -t boxen: -n "$n" -c "$(src_dir "$n")" "${argv[@]}"
     return
@@ -1118,7 +1125,6 @@ serve_unit() {
 # Written by boxen; rewritten on boxen setup.
 [Unit]
 Description=boxen: start the Remote Control servers marked with boxen serve
-After=default.target
 
 [Service]
 Type=oneshot
@@ -1144,7 +1150,14 @@ claude_counts() {
   local -A c=() s=()
   for p in /proc/[0-9]*; do
     [[ -O "$p" ]] || continue
-    [[ "$(cat "$p/comm" 2>/dev/null)" == claude ]] || continue
+    # By name, or by what it runs (a native install's binary is named after
+    # its version: ~/.local/share/claude/versions/X.Y.Z).
+    if [[ "$(cat "$p/comm" 2>/dev/null)" != claude ]]; then
+      case $(readlink "$p/exe" 2>/dev/null) in
+        */claude|*/claude/versions/*) ;;
+        *) continue ;;
+      esac
+    fi
     cwd=$(readlink "$p/cwd" 2>/dev/null) || continue
     n=$(project_of_dir "$cwd") || continue
     served=0
@@ -1285,7 +1298,6 @@ cmd_ui() {
   case ${1:-} in
     "") ;;
     --restart) restart=1 ;;
-    --dashboard) ui_prepare; exec "${UI_DASH[@]}" ;;
     *) die "usage: boxen ui [--restart]" ;;
   esac
   (( restart )) || [[ -t 0 && -t 1 ]] || die "ui needs a terminal (run it in an SSH session on the VM)"

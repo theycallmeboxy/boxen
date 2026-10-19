@@ -206,22 +206,42 @@ boxen v1 ran each project's Claude inside its container. To move:
 
 ```bash
 cd ~/boxen && git pull && ./install.sh   # installs v2 beside v1 (the system Docker daemon stays on)
-boxen migrate                            # stops v1, brings everything across
+boxen migrate                            # stops v1 (asks first), brings everything across
 boxen doctor
 boxen migrate --cleanup                  # later, once you're happy: deletes v1's leftovers
 ```
 
-`migrate` copies v1's shared Claude config into `~/.claude` (login, settings
-except permissions, every session and memory: v1 used the same paths, so
-`claude --resume` in a project finds its sessions), turns each project's `env/Dockerfile` and
-`services.yaml` into `~/src/<project>/.boxen/` (showing the diff: `FROM` now
-names `boxen-env`, and `USER` lines go), copies sidecar volumes to rootless
-Docker, and builds each project's container. Repo lists and tokens stay as
-they are. Not copied: tool installs in v1's per-project home volumes (put
-what a project needs in its Dockerfile) and v1's `compose.override.yaml`
-(kept in `~/.config/boxen/projects/<project>/v1/`; v2's service is `env`).
-The supervisor project is gone; its files stay until `--cleanup`, which also
-turns the system Docker daemon off and takes you out of the `docker` group.
+Between `install.sh` and `migrate`, v1's containers keep running, but their
+own `boxen` command (and the supervisor) stops working: the install removes
+v1's agent service.
+
+`migrate`, in order:
+
+- stops v1's containers (it lists them and asks first; `--yes` doesn't);
+- copies v1's shared Claude config into `~/.claude`: login, settings except
+  permissions (those were for a container; the whole file is kept as
+  `settings.json.v1`), every session and memory. v1 used the same paths, so
+  `claude --resume` in a project finds its sessions;
+- takes the commit identity from `boxen.env` and turns
+  `base.local.Dockerfile` into `env.local.Dockerfile`;
+- per project: copies its sidecar volumes to rootless Docker first (if one
+  fails, the project is left as it was, for another `migrate`); turns its
+  `env/` folder into `~/src/<project>/.boxen/` (every file, with the
+  Dockerfile's `FROM` now naming `boxen-env` and its `USER` lines gone,
+  shown as a diff); keeps its repo list and tokens; builds its container.
+
+Not carried over: tool installs in v1's per-project home volumes (put what a
+project needs in its Dockerfile), `project.env` (named in the output; the
+agent runs on the VM now) and v1's `compose.override.yaml` (v2's service is
+`env`). Those stay in `~/.config/boxen/projects/<project>/v1/`. The
+supervisor project is gone.
+
+`--cleanup` refuses while a v1 sidecar volume has no copy in rootless Docker.
+Otherwise it deletes v1's containers (sidecars included), their images,
+volumes and build cache, and v1's files in `~/.config/boxen`; turns the
+system Docker daemon and containerd off; and takes you out of the `docker`
+group. It lists what it keeps for you: `~/.claude/settings.json.v1` and, if
+there, `~/.claude.json.before-migrate`, `CLAUDE.md.v1` and `~/src/supervisor`.
 
 To bring Claude Code work over from a Mac, see `tools/mac-to-boxen --help`.
 
@@ -248,6 +268,9 @@ What boxen promises, and what it doesn't:
   a container escape isn't root. boxen never uses the system Docker daemon,
   and `migrate --cleanup` takes you out of the `docker` group (which is root
   in all but name).
+- **Team and Enterprise plans:** settings your organization manages from
+  claude.ai can take the place of boxen's managed file on the VM. Check with
+  `/status` in a session ("Setting sources").
 - **Settings boxen keeps:** managed settings in
   `/etc/claude-code/managed-settings.d/boxen.json`, which outrank every
   settings file (yours, a project's, a migrated v1 config): sandbox on and

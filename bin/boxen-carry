@@ -8,13 +8,13 @@
 #
 # /carry reads old conversations with these and writes what they learned into
 # the project's auto memory, so later sessions start informed. The transcripts
-# themselves are never changed (boxen resume still replays them).
+# themselves are never changed (claude --resume still replays them).
 
 set -u
 
 CFG=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 # Claude Code files a folder's sessions under
-# projects/<path with every non-alphanumeric character as ->, as in boxen-sessions.
+# projects/<path with every non-alphanumeric character as ->.
 keyof() { printf '%s/projects/%s' "$CFG" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
 KEYDIR=$(keyof "$PWD")
 # Auto memory is keyed by the git repo's main root (worktrees and subfolders
@@ -48,7 +48,6 @@ sessions() {
 # message, so blocks are filtered one by one before joining). Slash commands
 # are stored as markup; those become the command name. Tool results, meta
 # records and compaction summaries aren't your messages.
-# Same as boxen-sessions preview(): keep the two in sync.
 JQ_DEFS='
   def blocks: .message.content
     | if type == "string" then [.] elif type == "array"
@@ -70,7 +69,6 @@ preview() {
 
 # title ID: the session's name: the one you gave it (/rename, or renaming it
 # in the Claude app), else the one Claude generated, else the first message.
-# Same as boxen-sessions title(): keep the two in sync.
 title() {
   local t
   t=$(grep -aE '"type":"(custom-title|ai-title)"' "$(tfile "$1")" 2>/dev/null \

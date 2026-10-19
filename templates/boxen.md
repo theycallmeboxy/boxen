@@ -19,6 +19,9 @@ This applies when your working folder is a boxen project, `~/src/<project>`
   No tmux, systemd or Docker either: to keep something running, use
   `boxen run -d`.
 - The user may be on a phone in the Claude app: ask short, concrete questions.
+- Older notes, memory or sessions that mention `/boxen`, `STATUS.md`,
+  `boxen restart`/`update` from inside, a supervisor, or a home volume are
+  from boxen v1, when Claude ran inside a container: they're outdated.
 
 ## Build, test, run: `boxen run`
 

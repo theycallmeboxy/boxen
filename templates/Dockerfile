@@ -3,9 +3,10 @@
 # project folder). You're root here, so apt-get works directly; there's no
 # sudo and no need for USER lines.
 #
-# Install system packages and SDKs here, not at run time: anything outside
-# /root and the project folder is lost when the container is recreated.
-# (/root is a volume: what's installed there survives rebuilds.)
+# Install system packages and SDKs here, not at run time: anything installed
+# at run time is lost when the container is recreated. Only the project
+# folder and the download caches (/root/.cache) survive. Set paths with ENV
+# (~/.bashrc isn't read for boxen run).
 FROM boxen-env:latest
 
 # Example:

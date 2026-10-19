@@ -137,6 +137,9 @@ doctor_sandbox() {
           systemctl --user status      (can't connect to the bus)
           curl -sI https://example.com (blocked by the sandbox proxy)
         and this one must work:  boxen run echo ok
+        Then /status there: "Setting sources" must list managed settings. (On a
+        Team or Enterprise plan, settings your organization manages from
+        claude.ai can take the place of boxen's file.)
 EOF
 }
 
@@ -145,6 +148,11 @@ doctor_github() {
   if app_configured; then d_ok "GitHub App: $(app_conf APP_SLUG)"
   else d_warn "GitHub isn't connected (boxen github): agents can't push"; fi
   local t helpers want
+  if [[ -n "$(git_ident email)" ]]; then
+    d_ok "commits in $SRC_ROOT: $(git_ident name) <$(git_ident email)>"
+  else
+    d_warn "no commit identity for $SRC_ROOT: agents' commits fail or use your global one (boxen github sets it)"
+  fi
   if git config --global --get-all "includeIf.gitdir:$SRC_ROOT/.path" 2>/dev/null | grep -xF "$GITCONFIG" >/dev/null; then
     d_ok "git in $SRC_ROOT uses boxen's tokens and identity ($GITCONFIG)"
   else
