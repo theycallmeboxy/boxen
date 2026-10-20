@@ -41,7 +41,8 @@ def ghw(vm):
                            cwd=cwd or vm.src / "alpha", env=e)
         assert r.returncode == 0, r.stderr
         f = r.stdout.split("|")
-        return {"token": f[0], "config": f[1], "github_token": f[2], "cwd": f[3], "args": f[4:-1]}
+        return {"token": f[0], "config": f[1], "github_token": f[2], "cwd": f[3], "args": f[4:-1],
+                "stderr": r.stderr}
     vm.gh = gh
     vm.gh_config = str(vm.tmp / "tmpdir" / ("boxen-gh-%d" % os.getuid()))
     return vm
@@ -52,13 +53,14 @@ def test_gh_outside_a_project_is_plain_gh(ghw):
     for cwd in (ghw.tmp, ghw.src, ghw.src / "old", ghw.src / "notaproject"):
         r = ghw.gh("pr", "list", "-R", "a/x", cwd=cwd)
         assert r == {"token": "MINE", "config": "unset", "github_token": "ALSO-MINE", "cwd": str(cwd),
-                     "args": ["pr", "list", "-R", "a/x"]}, cwd
+                     "args": ["pr", "list", "-R", "a/x"], "stderr": ""}, cwd
 
 
 def test_gh_in_a_project_uses_its_token(ghw):
     gh = ghw.gh
     r = gh("pr", "list")                         # origin theycallmeboxy/alpha: no token of that owner
     assert r["token"] == "DEFAULT" and r["github_token"] == "unset" and r["args"] == ["pr", "list"]
+    assert r["stderr"] == ""
     assert r["config"] == ghw.gh_config
     assert oct(os.stat(ghw.gh_config).st_mode & 0o777) == "0o700"
     assert os.listdir(ghw.gh_config) == []
@@ -86,8 +88,13 @@ def test_gh_in_a_project_uses_its_token(ghw):
         f.unlink()
     r = gh("pr", "list")
     assert r["token"] == "" and r["config"] == ghw.gh_config
+    # and it says why, instead of gh's own "gh auth login"
+    assert r["stderr"] == ("boxen: no GitHub token in project alpha for b, so gh has no credentials here. Its "
+                           "repos and their state: boxen env show; the user adds one with: boxen repos alpha add "
+                           "owner/repo\n")
     r = gh("pr", "list", cwd=ghw.src / "beta")
     assert r["token"] == "" and r["github_token"] == "unset"
+    assert "no GitHub token in project beta" in r["stderr"]
 
 
 @pytest.mark.skipif(os.path.exists("/usr/bin/gh"), reason="gh is installed here")

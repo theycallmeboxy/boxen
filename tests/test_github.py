@@ -168,9 +168,13 @@ def test_repos_add_rm_and_validation(gh):
     assert listed(gh) == ["theycallmeboxy/alpha", "myorg/x", "myorg/Y"]
     assert "myorg/x                                  ok" in r.stdout
     assert tokens(gh)["gh-token.myorg"] == "tok-myorg-x,Y"
-    # already listed (any case): nothing to do
+    # already listed (any case): nothing added, but GitHub is asked again at
+    # once (after a fix there, the state shouldn't wait for the timer)
+    (gh.pdir("alpha") / "token" / "state.json").write_text('{"myorg/x": "no-access"}')
     r = gh.ok("repos", "alpha", "add", "MYORG/X")
-    assert "already listed" in r.stdout
+    assert "already listed: MYORG/X; checking GitHub again" in r.stdout
+    assert state(gh)["myorg/x"] == "ok"
+    assert "myorg/x                                  ok" in r.stdout
     # rm keeps other lines (comments too) as they were
     text = (gh.pdir("alpha") / "repos").read_text()
     (gh.pdir("alpha") / "repos").write_text(text + "# my note\n")

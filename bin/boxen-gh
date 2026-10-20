@@ -56,6 +56,11 @@ fi
 GH_TOKEN=""
 [ -z "$f" ] || GH_TOKEN=$(head -n 1 "$f")
 export GH_TOKEN
+# No token: gh will say "gh auth login", which is the wrong advice here.
+if [ -z "$GH_TOKEN" ]; then
+  printf 'boxen: no GitHub token in project %s%s, so gh has no credentials here. Its repos and their state: boxen env show; the user adds one with: boxen repos %s add owner/repo\n' \
+    "$proj" "${owner:+ for $owner}" "$proj" >&2
+fi
 # An empty config folder of its own (in the temp folder, which the sandbox
 # lets it write): no stored login to fall back on.
 # A folder someone else made first (in a shared /tmp) isn't used.

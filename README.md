@@ -187,8 +187,11 @@ boxen repos myproj rm other/lib
 
 States: `ok` (the token covers it), `not your repo` (the app isn't installed
 on that account: pulls work if it's public; to push, fork it and add the
-fork), `no access` (the app is on that account but not on this repo: add it
-to the app's installation on GitHub).
+fork), `no access` (the app is on that account but not on this repo, or the
+repo doesn't exist yet: create it, or add it to the app's installation on
+GitHub). States are from the last token refresh (every 30 minutes); after
+fixing something on GitHub, `boxen repos myproj add <the same repo>` checks
+again at once.
 
 ## Old conversations
 

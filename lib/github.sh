@@ -707,7 +707,11 @@ repos_change() {
       [[ "$listed" == *" ${r,,} "* ]] || missing+=("$r")
     done
     if (( ${#missing[@]} == 0 )); then
-      echo "$n: already listed: ${want[*]}"
+      # Asked again, most likely after fixing something on GitHub (made the
+      # repo, added it to the app's installation): check now rather than at
+      # the next timer run.
+      echo "$n: already listed: ${want[*]}; checking GitHub again"
+      if app_configured; then refresh_project "$n" || true; fi
       repos_show "$n"
       return 0
     fi
