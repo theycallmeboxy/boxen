@@ -11,6 +11,10 @@
 # image, boxen's Claude settings and instructions, git settings for ~/src and
 # the token timer. Safe to re-run: every step checks whether it's done.
 set -euo pipefail
+# `boxen self-update` runs this with boxen's DOCKER_HOST set. That would hide
+# the active docker context below (and make docker warn about it), so the
+# installer goes by the contexts alone; boxen sets its own again when it runs.
+unset DOCKER_HOST
 
 REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
