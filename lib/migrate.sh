@@ -123,7 +123,7 @@ migrate_claude() {
   rm -rf "$tmp/skills/carry"
   # Everything else (sessions, memory, skills, todos...) where the VM has
   # nothing at that path.
-  cp -an "$tmp/." "$CLAUDE_DIR/"
+  cp -a --update=none "$tmp/." "$CLAUDE_DIR/"
   rm -rf "$tmp"
   claude_config
   : > "$mark"
