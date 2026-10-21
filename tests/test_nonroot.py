@@ -96,18 +96,54 @@ def test_setup_refreshes_nonroot(vm):
 
 def test_busy_container_is_not_recreated(vm):
     """With something running in the build container (here: exec-local makes
-    `docker exec ... ps` list this machine's processes), nonroot and updates
-    leave it alone."""
+    `docker exec ... ps` list this machine's processes), nonroot refuses and
+    an update builds the new image but leaves the container for later."""
     (vm.fake / "exec-local").write_text("")
     r = vm.boxen("nonroot", "alpha", "on")
     assert r.returncode == 1 and "not now, turning it on recreates the build container" in r.stderr
     assert not nonroot_file(vm).exists() and vm.compose_calls() == []
     r = vm.fn("update_one alpha && echo rc=0 || echo rc=$?")
-    assert "rc=76" in r.stdout and "alpha: not rebuilt now, something is running" in r.stderr
-    assert "When it is done: boxen up alpha" in r.stderr
-    assert vm.compose_calls() == []
-    # idle (the fake's exec prints nothing): rebuilt
+    assert "rc=76" in r.stdout and "alpha: new image built; the container switches to it once nothing runs" in r.stderr
+    assert [c["args"] for c in vm.compose_calls()] == [["build", "env"]]        # built, not recreated
+    assert (vm.pdir("alpha") / "rebuild").exists()
+    assert "Rebuild pending: " in vm.ok("env", "show", cwd=vm.src / "alpha").stdout
+    # idle (the fake's exec prints nothing): rebuilt at once, mark cleared
     (vm.fake / "exec-local").unlink()
+    vm.clear_logs()
     r = vm.fn("update_one alpha && echo rc=0 || echo rc=$?")
     assert "rc=0" in r.stdout
     assert [c["args"][0] for c in vm.compose_calls()] == ["build", "up"]
+    assert not (vm.pdir("alpha") / "rebuild").exists()
+
+
+def test_rebuild_pending(vm):
+    """The timer's check: busy, nothing; idle once, it notes when; idle again
+    REBUILD_IDLE_SECS later, it recreates the container on the built image."""
+    p = vm.pdir("alpha")
+    (p / "rebuild").write_text("1\n")
+    (vm.fake / "exec-local").write_text("")
+    vm.ok("rebuild-pending")
+    assert vm.compose_calls() == [] and not (p / "rebuild.idle").exists()
+    (vm.fake / "exec-local").unlink()
+    vm.ok("rebuild-pending")
+    assert vm.compose_calls() == [] and (p / "rebuild.idle").exists()
+    vm.ok("rebuild-pending")                              # idle, but not for long enough yet
+    assert vm.compose_calls() == []
+    (p / "rebuild.idle").write_text("1000\n")             # long ago
+    vm.load_docker(); vm.state["images"].append("boxen-env-alpha:latest"); vm.save_docker()
+    r = vm.ok("rebuild-pending")
+    assert "alpha: switched to its new build image" in r.stdout
+    assert [c["args"] for c in vm.compose_calls()] == [["up", "-d", "--remove-orphans"]]   # no build: it's built
+    assert not (p / "rebuild").exists() and not (p / "rebuild.idle").exists()
+    # busy again between the two checks: starts over
+    (p / "rebuild").write_text("1\n")
+    (p / "rebuild.idle").write_text("1000\n")
+    (vm.fake / "exec-local").write_text("")
+    vm.clear_logs()
+    vm.ok("rebuild-pending")
+    assert vm.compose_calls() == [] and not (p / "rebuild.idle").exists() and (p / "rebuild").exists()
+    # a stopped container just drops the mark (its next start uses the new image)
+    (vm.fake / "exec-local").unlink()
+    vm.container("boxen.alpha.env", "boxen-alpha", state="exited", status="Exited (0)")
+    vm.ok("rebuild-pending")
+    assert not (p / "rebuild").exists() and vm.compose_calls() == []

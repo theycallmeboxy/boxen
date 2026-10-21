@@ -718,9 +718,33 @@ OnUnitActiveSec=30min
 [Install]
 WantedBy=timers.target
 EOF
+    write_unit "$unit_dir/boxen-rebuild.service" <<EOF
+# Written by boxen; rewritten on boxen setup.
+[Unit]
+Description=boxen: switch build containers to images an update built while they were busy
+
+[Service]
+Type=oneshot
+Environment="BOXEN_HOME=$BOXEN_HOME" "BOXEN_SRC=$SRC_ROOT"
+ExecStart=/bin/sh -c 'exec "\$0" rebuild-pending >>"\$1" 2>&1' "$BOXEN_BIN" "$BOXEN_HOME/rebuild.log"
+EOF
+    write_unit "$unit_dir/boxen-rebuild.timer" <<'EOF'
+# Written by boxen; rewritten on boxen setup.
+[Unit]
+Description=boxen: check for deferred rebuilds every 2 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
     systemctl --user daemon-reload
     systemctl --user enable --now boxen-tokens.timer >/dev/null 2>&1 \
       || { warn "couldn't start the boxen-tokens timer (systemctl --user status boxen-tokens.timer)"; return 1; }
+    systemctl --user enable --now boxen-rebuild.timer >/dev/null 2>&1 \
+      || warn "couldn't start the boxen-rebuild timer (systemctl --user status boxen-rebuild.timer)"
     uninstall_cron
     return 0
   fi
@@ -1050,6 +1074,7 @@ show_project() {
   else
     echo "Non-root runs: off (for a tool that refuses root; the user turns them on with: boxen nonroot $n on)"
   fi
+  rebuild_pending_note "$n"
   echo "Build environment: $(bdir "$n")/Dockerfile, $(bdir "$n")/services.yaml"
 }
 
@@ -1081,7 +1106,8 @@ cmd_up() {
   require_project "${1:-}"
   require_setup
   lock_project "$1"
-  start_env "$1" --build
+  start_env "$1" --build || return $?
+  rm -f "$(proj_dir "$1")/rebuild" "$(proj_dir "$1")/rebuild.idle"
 }
 
 cmd_down() {
@@ -1474,18 +1500,65 @@ env_busy() {
   printf '%s\n' "$out"
 }
 
-# Rebuilding recreates the container, which ends whatever runs in it: a
-# project with something running is skipped (UPDATE_SKIPPED_RC), to be
-# rebuilt with `boxen up <name>` when it's done.
+# Rebuilding recreates the container, which ends whatever runs in it. A
+# project with something running gets its new image built now and is
+# marked (projects/<name>/rebuild); the boxen-rebuild timer swaps the
+# container over once nothing has run in it for two checks in a row
+# (rebuild_pending). UPDATE_SKIPPED_RC tells the caller it's deferred.
 UPDATE_SKIPPED_RC=76
+REBUILD_IDLE_SECS=90
 update_one() {
   local n=$1 busy
   if running "$n" && busy=$(env_busy "$n"); then
-    printf 'boxen: %s: not rebuilt now, something is running in its build container:\n%s\n  When it is done: boxen up %s\n' \
-      "$n" "$(sed 's/^ */    /' <<<"$busy" | head -n 5)" "$n" >&2
+    run_quiet "building $n's build container (.boxen/Dockerfile)" dc "$n" build env || return 1
+    date +%s > "$(proj_dir "$n")/rebuild"
+    rm -f "$(proj_dir "$n")/rebuild.idle"
+    printf 'boxen: %s: new image built; the container switches to it once nothing runs in it (now running:\n%s\n  )\n' \
+      "$n" "$(sed 's/^ */    /' <<<"$busy" | head -n 5)" >&2
     return "$UPDATE_SKIPPED_RC"
   fi
-  start_env "$n" --build
+  start_env "$n" --build || return $?
+  rm -f "$(proj_dir "$n")/rebuild" "$(proj_dir "$n")/rebuild.idle"
+}
+
+# Hidden command, from the boxen-rebuild timer (every 2 minutes): for each
+# project marked by update_one, recreate its build container on the image
+# already built, once it has been idle at two checks REBUILD_IDLE_SECS
+# apart (an agent between two commands isn't idle for that long, usually;
+# a boxen run that starts meanwhile waits for the project's lock).
+cmd_rebuild_pending() {
+  local n pdir now since
+  for n in $(projects); do
+    pdir=$(proj_dir "$n")
+    [[ -f "$pdir/rebuild" ]] || continue
+    ( LOCK_BUSY_RC=0
+      lock_project "$n"
+      [[ -f "$pdir/rebuild" ]] || exit 0
+      if ! docker inspect "$(env_name "$n")" >/dev/null 2>&1; then
+        rm -f "$pdir/rebuild" "$pdir/rebuild.idle"; exit 0          # removed or down: nothing to swap
+      fi
+      if ! running "$n"; then
+        rm -f "$pdir/rebuild" "$pdir/rebuild.idle"; exit 0          # stopped: the next start uses the new image
+      fi
+      if env_busy "$n" >/dev/null; then rm -f "$pdir/rebuild.idle"; exit 0; fi
+      now=$(date +%s)
+      if [[ ! -f "$pdir/rebuild.idle" ]]; then echo "$now" > "$pdir/rebuild.idle"; exit 0; fi
+      since=$(head -n 1 "$pdir/rebuild.idle" 2>/dev/null || echo "$now")
+      [[ "$since" =~ ^[0-9]+$ ]] || since=$now
+      (( now - since >= REBUILD_IDLE_SECS )) || exit 0
+      if start_env "$n"; then
+        rm -f "$pdir/rebuild" "$pdir/rebuild.idle"
+        printf '%s %s: switched to its new build image\n' "$(date -Is)" "$n"
+      else
+        printf '%s %s: switching to its new build image failed; boxen up %s shows why\n' "$(date -Is)" "$n" "$n"
+      fi
+    ) || true
+  done
+}
+
+rebuild_pending_note() {
+  [[ -f "$(proj_dir "$1")/rebuild" ]] || return 0
+  echo "Rebuild pending: boxen built a new image for it; the build container switches over on its own once nothing has run in it for a couple of minutes (or now: boxen up $1)"
 }
 
 cmd_update() {
@@ -1510,7 +1583,7 @@ cmd_update() {
   docker image prune -f >/dev/null 2>&1 || true
   docker builder prune -f --filter until=720h >/dev/null 2>&1 || true
   (( ${#busy[@]} == 0 )) || warn "update: skipped, busy: ${busy[*]}"
-  (( ${#skipped[@]} == 0 )) || warn "update: not rebuilt yet, work running in them: ${skipped[*]} (boxen up <name> when it's done)"
+  (( ${#skipped[@]} == 0 )) || warn "update: work is running in ${skipped[*]}: they switch to their new images on their own once it's done"
   (( ${#failed[@]} == 0 )) || die "update finished, but these projects failed: ${failed[*]}"
   info "update done"
 }
@@ -1540,7 +1613,7 @@ cmd_self_update() {
     if (( r == UPDATE_SKIPPED_RC )); then skipped+=("$n"); elif (( r )); then failed+=("$n"); fi
   done
   (( ${#skipped[@]} == 0 )) \
-    || warn "self-update: not rebuilt yet, work running in them: ${skipped[*]}. When it's done: boxen up <name>"
+    || warn "self-update: work is running in ${skipped[*]}: they switch to their new images on their own once it's done"
   (( ${#failed[@]} == 0 )) || die "self-update finished, but these projects failed (or were busy): ${failed[*]}"
   info "self-update done"
 }
@@ -1593,6 +1666,7 @@ case "$cmd" in
   setup)    cmd_setup "$@" ;;
   managed-settings) managed_settings ;;
   tokens)   cmd_tokens "$@" ;;
+  rebuild-pending) cmd_rebuild_pending ;;
   git-credential) cmd_git_credential "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;

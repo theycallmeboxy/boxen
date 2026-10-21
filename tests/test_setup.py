@@ -229,6 +229,11 @@ def test_setup_with_systemd_user_services(vm):
     assert "After=" not in (u / "boxen-serve.service").read_text()
     log = (vm.fake / "systemctl.log").read_text().splitlines()
     assert "--user enable --now boxen-tokens.timer" in log and "--user enable boxen-serve.service" in log
+    # deferred rebuilds: every 2 minutes, logged to rebuild.log
+    assert "ExecStart=/bin/sh -c 'exec \"$0\" rebuild-pending >>\"$1\" 2>&1' \"%s\" \"%s\"" % (
+        BOXEN, vm.bhome / "rebuild.log") in (u / "boxen-rebuild.service").read_text()
+    assert "OnUnitActiveSec=2min" in (u / "boxen-rebuild.timer").read_text()
+    assert "--user enable --now boxen-rebuild.timer" in log
     assert (vm.fake / "crontab").read_text() == "0 1 * * * mine\n"
     # unchanged units aren't rewritten
     m = (u / "boxen-tokens.service").stat().st_mtime_ns

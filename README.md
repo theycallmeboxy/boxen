@@ -104,7 +104,7 @@ dashboard) does.
 | `github` | Connect GitHub |
 | `doctor [--lan <host:port>]` | Check rootless Docker, the sandbox and isolation |
 | `migrate [--cleanup]` | Move from boxen v1 |
-| `update` | Rebuild the base image and every build container |
+| `update` | Rebuild the base image and every build container (one with something running in it switches over by itself once it's idle) |
 | `self-update` | Update boxen and apply it |
 
 ## Build environments
@@ -132,6 +132,14 @@ boxen env apply                # rebuild after editing .boxen/ (errors are print
 boxen env show                 # containers, sidecars, GitHub repos
 boxen env logs postgres        # a sidecar's logs
 ```
+
+`boxen update` and a `self-update` that changes the base image rebuild
+every build container, which ends whatever runs in it. So a container with
+something running (a build, a server, a shell) gets its new image built but
+keeps running the old one; a timer (`boxen-rebuild`, every 2 minutes)
+switches it over once nothing has run in it for two checks in a row.
+`boxen env show` says when one is pending, `boxen up <name>` switches now,
+and `~/.config/boxen/rebuild.log` records each switch.
 
 Only the project folder and the download caches (`/root/.cache`, where pip,
 npm, go and cargo's caches are pointed) survive a rebuild; everything else
