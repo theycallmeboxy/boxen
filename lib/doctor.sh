@@ -51,12 +51,46 @@ doctor_docker() {
   fi
   if docker run --rm --network none --user 1000:1000 -v "$tmp:/t" "$ENV_IMAGE" sh -c 'echo x > /t/user-file' >/dev/null 2>&1; then
     other=$(stat -c %u "$tmp/user-file" 2>/dev/null || echo "?")
-    d_ok "(for reference: container uid 1000 writes as uid $other on the VM, so build as root)"
+    d_ok "(for reference: a second user in a container, uid 1000, writes as uid $other on the VM; boxen run --user is how to build as non-root)"
   fi
+  doctor_nonroot "$tmp"
   # Files the test container made may belong to a subordinate ID: remove
   # them from inside.
   docker run --rm --network none -v "$tmp:/t" "$ENV_IMAGE" sh -c 'rm -rf /t/*' >/dev/null 2>&1 || true
   rmdir "$tmp" 2>/dev/null || true
+}
+
+# boxen run --user: uid 1000 in a user namespace of its own must write as
+# you, with the seccomp profile `boxen nonroot` gives a project. On Ubuntu,
+# AppArmor's restriction on unprivileged user namespaces applies inside
+# containers too; install.sh adds a profile for boxen's unshare.
+doctor_nonroot() {
+  local tmp=$1 out owner last restrict
+  restrict=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)
+  if ! docker run --rm --network none "$ENV_IMAGE" test -x /usr/local/bin/boxen-user >/dev/null 2>&1; then
+    d_warn "the base image predates boxen run --user (boxen update rebuilds it)"
+    return
+  fi
+  if ! write_seccomp; then d_fail "couldn't write $SECCOMP_USERNS"; return; fi
+  out=$(docker run --rm --network none --security-opt no-new-privileges:true --security-opt "seccomp=$SECCOMP_USERNS" \
+          -e BOXEN_NONROOT=1 -v "$tmp:/t" "$ENV_IMAGE" boxen-user sh -c 'id -u; echo x > /t/nonroot-file' 2>&1) || true
+  if [[ "$(head -n 1 <<<"$out")" == 1000 && -f "$tmp/nonroot-file" ]]; then
+    owner=$(stat -c %u "$tmp/nonroot-file" 2>/dev/null || echo "?")
+    if [[ "$owner" == "$(id -u)" ]]; then
+      d_ok "boxen run --user works: uid 1000 in the container, its files yours on the VM (in projects with boxen nonroot on)"
+    else
+      d_fail "boxen run --user wrote a file owned by uid $owner on the VM, not you ($(id -u))"
+    fi
+    return
+  fi
+  last=$(tail -n 1 <<<"$out")
+  if [[ "$restrict" == 1 && ! -f /etc/apparmor.d/boxen-userns ]]; then
+    d_warn "boxen run --user doesn't work here: AppArmor restricts user namespaces and boxen's profile for it is missing (re-run install.sh)"
+  elif [[ "$restrict" == 1 ]]; then
+    d_warn "boxen run --user doesn't work here (${last:-no output}), though AppArmor has boxen's profile for it. If AppArmor is what stops it, the way out is lifting its restriction for the whole VM: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 (and a file in /etc/sysctl.d to keep it)"
+  else
+    d_warn "boxen run --user doesn't work here: ${last:-no output}"
+  fi
 }
 
 doctor_rootful() {

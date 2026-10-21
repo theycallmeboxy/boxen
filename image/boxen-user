@@ -1,0 +1,27 @@
+#!/bin/sh
+# boxen-user cmd...: what `boxen run --user` runs. The command runs as uid
+# 1000 (the image's first user: "ubuntu", unless the project's Dockerfile
+# changed it), for tools that refuse to run as root (LibreELEC, Yocto,
+# initdb...). It's in a user namespace of its own in which uid 1000 is this
+# container's root, so everything it writes is still owned by root here,
+# which is you on the VM: no chmod, no files the VM can't delete. Files
+# owned by any other uid here show up as nobody (65534) to it. It can't
+# become root again; packages go in .boxen/Dockerfile.
+#
+# Needs the project's non-root runs on (boxen nonroot <name> on: a seccomp
+# profile that lets it create a user namespace, nothing more), and on
+# Ubuntu, AppArmor's leave for the unshare below (install.sh adds it).
+set -u
+u=/usr/local/libexec/boxen/unshare
+[ $# -gt 0 ] || { echo "usage: boxen run --user cmd..." >&2; exit 2; }
+if ! "$u" --map-user=1000 --map-group=1000 true 2>/dev/null; then
+  if [ "${BOXEN_NONROOT:-}" != 1 ]; then
+    echo "boxen run --user: non-root runs aren't on for this project. The user turns them on with: boxen nonroot ${BOXEN_PROJECT:-<name>} on" >&2
+  else
+    echo "boxen run --user: this VM doesn't let the build container make a user namespace; the user can check with: boxen doctor" >&2
+  fi
+  exit 126
+fi
+name=$(getent passwd 1000 | cut -d: -f1)
+name=${name:-builder}
+exec "$u" --map-user=1000 --map-group=1000 -- env HOME=/root USER="$name" LOGNAME="$name" "$@"

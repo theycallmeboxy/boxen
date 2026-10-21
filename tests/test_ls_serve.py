@@ -88,10 +88,11 @@ def test_ls_serve_states(vm):
     (vm.pdir("alpha") / "serve").write_text("")
     (vm.pdir("beta") / "serve").write_text("")
     (vm.fake / "tmux-session").write_text("")
-    (vm.fake / "tmux-windows.json").write_text(json.dumps(["dashboard", "alpha", "alpha~serve", "beta"]))
+    (vm.fake / "tmux-windows.json").write_text(json.dumps(["dashboard", "alpha", "beta"]))
+    (vm.fake / "tmux-serve.json").write_text(json.dumps(["alpha~serve"]))
     doc = ls_json(vm)
     assert [p["serve"] for p in doc["projects"]] == ["on", "stopped"]
-    assert ["-L", "boxen", "list-windows", "-t", "boxen:", "-F", "#{window_name}"] in vm.tmux_calls()
+    assert ["-L", "boxen", "list-windows", "-t", "=serve:", "-F", "#{window_name}"] in vm.tmux_calls()
 
 
 @pytest.fixture
@@ -170,15 +171,17 @@ def test_serve_on_off(vm):
     assert (vm.pdir("alpha") / "serve").exists()
     assert "alpha: Remote Control server running (tmux window alpha~serve)" in r.stdout
     calls = vm.tmux_calls(clear=True)
-    # no tmux server yet: a session, started with its window
+    # no serve session yet: the hidden one, started with its window
     assert calls[-1] == ["-L", "boxen", "-f", os.path.join(REPO, "ui", "tmux.conf"), "new-session", "-d",
-                         "-s", "boxen", "-n", "alpha~serve", "-c", a, BOXEN, "serve-run", "alpha"]
+                         "-s", "serve", "-n", "alpha~serve", "-c", a, BOXEN, "serve-run", "alpha"]
+    assert json.loads((vm.fake / "tmux-serve.json").read_text()) == ["alpha~serve"]
+    assert not (vm.fake / "tmux-session").exists()          # never a tab in the user's session
     # started again: it's running, nothing new
     vm.ok("serve", "alpha")
     assert not any(c[2] in ("new-window", "new-session") for c in vm.tmux_calls(clear=True))
     # another project, with the server up: a window
     vm.ok("serve", "beta")
-    assert vm.tmux_calls()[-1] == ["-L", "boxen", "new-window", "-d", "-t", "boxen:", "-n", "beta~serve",
+    assert vm.tmux_calls()[-1] == ["-L", "boxen", "new-window", "-d", "-t", "=serve:", "-n", "beta~serve",
                                    "-c", str(vm.src / "beta"), BOXEN, "serve-run", "beta"]
     r = vm.ok("serve")
     assert r.stdout == "%-24s on\n%-24s on\n" % ("alpha", "beta")
@@ -186,7 +189,7 @@ def test_serve_on_off(vm):
     r = vm.ok("serve", "alpha", "--off")
     assert r.stdout == "alpha: serve off\n"
     assert not (vm.pdir("alpha") / "serve").exists()
-    assert ["-L", "boxen", "kill-window", "-t", "boxen:=alpha~serve"] in vm.tmux_calls()
+    assert ["-L", "boxen", "kill-window", "-t", "=serve:=alpha~serve"] in vm.tmux_calls()
     r = vm.ok("serve")
     assert r.stdout == "%-24s on\n" % "beta"
     # tmux never sees boxen's DOCKER_HOST
@@ -196,8 +199,7 @@ def test_serve_on_off(vm):
 def test_serving_reads_all_of_tmuxs_output(vm):
     """The window is found even when tmux has more to write after it (grep
     -q exiting first would break tmux's pipe, which pipefail counts)."""
-    (vm.fake / "tmux-session").write_text("")
-    (vm.fake / "tmux-windows.json").write_text(json.dumps(["alpha~serve"] + ["w%d" % i for i in range(300)]))
+    (vm.fake / "tmux-serve.json").write_text(json.dumps(["alpha~serve"] + ["w%d" % i for i in range(300)]))
     r = vm.fn("for i in $(seq 30); do serving alpha || echo MISSED; done")
     assert r.returncode == 0 and "MISSED" not in r.stdout
 
@@ -312,3 +314,24 @@ def test_ls_counts_sessions_by_executable(vm):
         for p in procs:
             p.kill()
             p.wait()
+
+
+def test_serve_windows_move_out_of_the_tab_bar(vm):
+    """Serve windows from before they had a session of their own (tabs in
+    "boxen") move to "serve", still running; a shown one (in both) stays."""
+    (vm.pdir("alpha") / "serve").write_text("")
+    (vm.pdir("beta") / "serve").write_text("")
+    (vm.fake / "tmux-session").write_text("")
+    (vm.fake / "tmux-windows.json").write_text(json.dumps(["dashboard", "alpha", "alpha~serve", "beta~serve"]))
+    vm.ok("serve", "--restore")
+    assert json.loads((vm.fake / "tmux-windows.json").read_text()) == ["dashboard", "alpha"]
+    assert json.loads((vm.fake / "tmux-serve.json").read_text()) == ["alpha~serve", "beta~serve"]
+    # nothing new started: they were running already; the placeholder is gone
+    assert not any(c[2] in ("new-window",) and "serve-run" in c for c in vm.tmux_calls())
+    assert ["-L", "boxen", "kill-window", "-t", "=serve:=boxen-placeholder"] in vm.tmux_calls()
+    # shown (linked into boxen too): left where it is
+    (vm.fake / "tmux-windows.json").write_text(json.dumps(["dashboard", "alpha~serve"]))
+    vm.clear_logs()
+    vm.ok("serve", "--restore")
+    assert json.loads((vm.fake / "tmux-windows.json").read_text()) == ["dashboard", "alpha~serve"]
+    assert not any(c[2] == "move-window" for c in vm.tmux_calls())

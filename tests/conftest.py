@@ -148,6 +148,10 @@ if a[:1] == ["info"]:
         done(0, "systemd\n")
     done(0, "")
 
+if a[:2] == ["system", "df"]:
+    done(0, json.dumps(st.get("system_df") or {"Images": [], "Containers": [], "Volumes": [],
+                                               "BuildCache": []}) + "\n")
+
 if a[:1] == ["compose"]:
     if a[1:2] == ["version"]:
         done(0, "Docker Compose version v5.5.0\n")
@@ -277,43 +281,72 @@ done(1, err="fake docker: unhandled %r\n" % a)
 '''
 
 FAKE_TMUX = r'''#!PYTHON
-"""Fake tmux: argv to tmux.jsonl (with DOCKER_HOST, which must be unset);
-a session while $FAKE_DIR/tmux-session exists; window names in
-tmux-windows.json."""
+"""Fake tmux: argv to tmux.jsonl (with DOCKER_HOST, which must be unset).
+Two sessions: "boxen" exists while $FAKE_DIR/tmux-session does, its window
+names in tmux-windows.json; "serve" exists while tmux-serve.json (its
+window names) does. A window in both is linked (window_linked 1)."""
 import json, os, sys
 d = os.environ["FAKE_DIR"]
 argv = sys.argv[1:]
 with open(os.path.join(d, "tmux.jsonl"), "a") as f:
     f.write(json.dumps({"argv": argv, "docker_host": os.environ.get("DOCKER_HOST")}) + "\n")
 wp = os.path.join(d, "tmux-windows.json")
-wins = json.load(open(wp)) if os.path.exists(wp) else []
+sp = os.path.join(d, "tmux-serve.json")
+flag = os.path.join(d, "tmux-session")
+S = {}
+if os.path.exists(flag):
+    S["boxen"] = json.load(open(wp)) if os.path.exists(wp) else []
+if os.path.exists(sp):
+    S["serve"] = json.load(open(sp))
+def save():
+    if "boxen" in S:
+        open(flag, "w").close()
+        json.dump(S["boxen"], open(wp, "w"))
+    if "serve" in S and S["serve"]:
+        json.dump(S["serve"], open(sp, "w"))
+    elif os.path.exists(sp):
+        os.unlink(sp)                  # a session ends with its last window
 args = argv[2:] if argv[:1] == ["-L"] else argv
 if args[:2] == ["-f", args[1] if len(args) > 1 else ""]:
     args = args[2:]
 cmd = args[0] if args else ""
 def opt(n):
     return args[args.index(n) + 1] if n in args else None
-has = os.path.exists(os.path.join(d, "tmux-session"))
+def target(t):
+    sess, _, win = (t or "").partition(":")
+    return sess.lstrip("="), win.lstrip("=")
 if cmd == "-V":
     print("tmux 3.4"); sys.exit(0)
 if cmd == "has-session":
-    sys.exit(0 if has else 1)
+    sys.exit(0 if target(opt("-t"))[0] in S else 1)
 if cmd == "list-windows":
-    if not has:
-        sys.stderr.write("no server running\n"); sys.exit(1)
-    for w in wins:
-        print(w, flush=True)       # a line at a time, as a tmux client may write
+    sess = target(opt("-t"))[0]
+    if sess not in S:
+        sys.stderr.write("can't find session: %s\n" % sess); sys.exit(1)
+    linked = "#{window_linked}" in (opt("-F") or "")
+    for w in S[sess]:
+        n = sum(w in v for v in S.values())
+        print(w + (" %d" % (n > 1) if linked else ""), flush=True)   # a line at a time, as a tmux client may write
     sys.exit(0)
-if cmd in ("new-window", "new-session"):
-    open(os.path.join(d, "tmux-session"), "w").close()
-    wins.append(opt("-n"))
-    json.dump(wins, open(wp, "w"))
-    sys.exit(0)
+if cmd == "new-window":
+    S.setdefault(target(opt("-t"))[0], []).append(opt("-n"))
+    save(); sys.exit(0)
+if cmd == "new-session":
+    S[opt("-s")] = [opt("-n")]
+    save(); sys.exit(0)
 if cmd == "kill-window":
-    t = opt("-t")
-    wins = [w for w in wins if "boxen:=" + w != t]
-    json.dump(wins, open(wp, "w"))
-    sys.exit(0)
+    w = target(opt("-t"))[1]
+    for v in S.values():
+        if w in v:
+            v.remove(w)
+    save(); sys.exit(0)
+if cmd == "move-window":
+    (fs, fw), (ts, _) = target(opt("-s")), target(opt("-t"))
+    if fs not in S or fw not in S[fs] or ts not in S:
+        sys.exit(1)
+    S[fs].remove(fw)
+    S[ts].append(fw)
+    save(); sys.exit(0)
 sys.exit(0)
 '''
 

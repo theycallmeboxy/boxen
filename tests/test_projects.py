@@ -86,7 +86,8 @@ def test_project_of_dir(vm):
 def test_help(vm):
     r = vm.ok("help")
     assert r.stdout.startswith("Usage: boxen <command> [args]")
-    for c in ("new <name>", "run [-C dir] cmd...", "env apply", "migrate", "serve", "repos <name>"):
+    for c in ("new <name>", "run [-C dir] [-u] cmd...", "env apply", "migrate", "serve", "repos <name>",
+              "nonroot <name> [on|off]", "df [<name>] [--json]"):
         assert c in r.stdout
     r = vm.boxen("frobnicate")
     assert r.returncode == 1 and "Usage: boxen" in r.stderr
@@ -585,11 +586,11 @@ def test_claude_session_in_tmux(vm):
     (vm.fake / "tmux-session").write_text("")
     with_tty(vm, "claude", "alpha")
     calls = vm.tmux_calls(clear=True)
-    assert calls[-2:] == [["-L", "boxen", "new-window", "-t", "boxen:", "-n", "alpha", "-c", a] + CLAUDE_SH,
-                          ["-L", "boxen", "attach-session", "-t", "boxen"]]
+    assert calls[-2:] == [["-L", "boxen", "new-window", "-t", "=boxen:", "-n", "alpha", "-c", a] + CLAUDE_SH,
+                          ["-L", "boxen", "attach-session", "-t", "=boxen"]]
     # inside boxen's tmux: just the window
     with_tty(vm, "claude", "alpha", env={"TMUX": "/tmp/tmux-0/boxen,1,0"})
-    assert vm.tmux_calls() == [["-L", "boxen", "new-window", "-t", "boxen:", "-n", "alpha", "-c", a] + CLAUDE_SH]
+    assert vm.tmux_calls() == [["-L", "boxen", "new-window", "-t", "=boxen:", "-n", "alpha", "-c", a] + CLAUDE_SH]
 
 
 def test_claude_window_command(vm, tmp_path):

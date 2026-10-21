@@ -84,6 +84,25 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
 EOF
   sudo systemctl reload apparmor
 fi
+# The same leave for `boxen run --user`: the copy of unshare in boxen's build
+# images (a path nothing on the VM itself has) may create a user namespace.
+# AppArmor's restriction applies inside containers too. Docker's seccomp
+# profile still blocks it except in projects with `boxen nonroot` on.
+# (boxen doctor checks whether it works.)
+if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" == 1 ]] \
+   && [[ ! -f /etc/apparmor.d/boxen-userns ]]; then
+  info "adding an AppArmor profile so boxen run --user can create a user namespace in a build container"
+  sudo tee /etc/apparmor.d/boxen-userns >/dev/null <<'PROFILE'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile boxen-userns /usr/local/libexec/boxen/unshare flags=(unconfined) {
+  userns,
+  include if exists <local/boxen-userns>
+}
+PROFILE
+  sudo systemctl reload apparmor
+fi
 
 # 2. Docker CE with the rootless extras, from Docker's own apt repo.
 mapfile -t missing < <(apt_missing docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
