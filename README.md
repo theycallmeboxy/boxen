@@ -61,6 +61,7 @@ boxen new myproj https://github.com/you/myproj   # or no URL for an empty folder
 boxen claude myproj        # a session in the project, in a tmux window (also in the app)
 boxen ui                   # the dashboard: projects, sessions, files, terminals
 boxen ls                   # build containers, sessions, serve, GitHub tokens
+boxen df                   # disk use: each project, what they share, leftovers, free space
 ```
 
 Sessions live in a tmux server of boxen's own (`tmux -L boxen`), so they keep
@@ -78,8 +79,12 @@ boxen serve myproj         # a server in tmux window myproj~serve; back after re
 boxen serve myproj --off
 ```
 
-The first time, the server asks to trust the folder and to enable Remote
-Control: answer in `boxen ui`.
+Servers run in a tmux session of their own that nobody attaches to, so they
+aren't tabs next to your sessions. The first time, a server asks to trust
+the folder and to enable Remote Control: open it from the dashboard's
+Sessions tab to answer, then hide it again (`x` on it there, or Ctrl+B h
+inside it). Hiding never stops it; `boxen serve myproj --off` (or `S` in the
+dashboard) does.
 
 ### Commands
 
@@ -94,10 +99,12 @@ Control: answer in `boxen ui`.
 | `up <name\|all>` / `down <name\|all>` | Start (applying changes) / stop build containers and sidecars |
 | `rm <name> [--yes]` | Remove the build container, image, sidecars and their data; the code stays |
 | `repos <name> [add\|rm <owner/repo>...]` | The GitHub repos a project's tokens cover |
+| `df [<name>] [--json]` | Disk use per project (code, image, container changes, volumes, Claude history), shared images, build cache, leftovers, free space |
+| `nonroot <name> [on\|off]` | Let the project's agent run commands as a non-root user (`boxen run --user`) |
 | `github` | Connect GitHub |
 | `doctor [--lan <host:port>]` | Check rootless Docker, the sandbox and isolation |
 | `migrate [--cleanup]` | Move from boxen v1 |
-| `update` | Rebuild the base image and every build container |
+| `update` | Rebuild the base image and every build container (one with something running in it switches over by itself once it's idle) |
 | `self-update` | Update boxen and apply it |
 
 ## Build environments
@@ -120,10 +127,20 @@ From the project folder (this is what agents run):
 boxen run make test            # in the build container, same folder, same path
 boxen run -C api npm ci        # in a subfolder
 boxen run -d web npm run dev   # in the background; --logs web, --stop web, --ps
+boxen run --user make          # as a non-root user (needs boxen nonroot <name> on; see below)
 boxen env apply                # rebuild after editing .boxen/ (errors are printed; nothing changes on a failure)
 boxen env show                 # containers, sidecars, GitHub repos
 boxen env logs postgres        # a sidecar's logs
 ```
+
+`boxen update` and a `self-update` that changes the base image rebuild
+every build container, which ends whatever runs in it. So a container with
+something running (a build, a server, a shell) gets its new image built but
+keeps running the old one. A timer (`boxen-rebuild`, every 2 minutes)
+switches it over once no `boxen run` is running or has started in it for
+15 minutes and nothing else runs in it (a server started with `-d` keeps
+it waiting). `boxen env show` says when one is pending, `boxen up <name>`
+switches now, and `~/.config/boxen/rebuild.log` records each switch.
 
 Only the project folder and the download caches (`/root/.cache`, where pip,
 npm, go and cargo's caches are pointed) survive a rebuild; everything else
@@ -135,6 +152,49 @@ sidecar's name; see the `.example` next to it): ports to the VM or LAN, host
 folders, memory and CPU limits. Agents can't write there. Additions for every
 project's base image: `~/.config/boxen/env.local.Dockerfile`, starting with
 `FROM boxen-env:core`, then `boxen update`.
+
+### Tools that won't run as root
+
+Some builds refuse root (LibreELEC, Yocto, PostgreSQL's `initdb`). A second
+user in the container is the wrong fix under rootless Docker: only the
+container's root is you on the VM, so that user's files belong to an ID from
+your subordinate range (around 100999), which you can't edit or delete
+without going through the container. Instead, `boxen run --user cmd` runs
+the command as uid 1000 in a user namespace of its own, in which uid 1000 is
+the container's root: the tool sees a normal user, and every file it writes
+is yours. It can't become root again (packages go in the Dockerfile).
+
+Making that namespace takes a syscall Docker's default seccomp profile
+blocks, so it's off until you turn it on per project:
+
+```bash
+boxen nonroot myproj on     # recreates its build container; off undoes it
+```
+
+That runs the project's build container (not its sidecars) with Docker's
+own profile plus one rule: `unshare` of a user namespace and nothing else
+(mount, network and the rest stay blocked). Docker's profile is vendored in
+`image/seccomp/`. On Ubuntu, AppArmor also restricts user namespaces, inside
+containers too: `install.sh` adds a profile for boxen's copy of `unshare`
+in the image, and `boxen doctor` checks that the whole thing works. If it
+says it doesn't, the remaining way is lifting AppArmor's restriction for the
+whole VM (`kernel.apparmor_restrict_unprivileged_userns=0`), which is your
+call. Files a second user made before: `boxen run chown -R 0:0 <path>` gives
+them back.
+
+## Disk use
+
+`boxen df` shows what boxen keeps on disk: per project, its folder (build
+output included), its build image beyond the shared base, what's been
+written inside its containers (lost when they're recreated), its volumes
+(download cache, sidecar data) and its Claude history; then the shared base
+image, sidecar images, Docker's build cache and old images left by rebuilds
+(with the command that frees each), anything left over from removed
+projects, what else is in your rootless Docker, and free space.
+`boxen df <name>` adds the project's biggest folders. The dashboard shows a
+project's total and breakdown, measured every 10 minutes (ctrl+r measures
+again); `g` → Disk usage prints the whole report. Docker reports its sizes
+rounded, so those are close, not exact.
 
 ## Connect GitHub
 
@@ -289,7 +349,10 @@ What boxen promises, and what it doesn't:
 - **Sidecars and build containers** get the project folder (build container
   only), named volumes of their project, and its own network: no host paths,
   published ports, privileges, capabilities or devices unless you add them
-  in your override. A symlinked `.boxen/` file is refused.
+  in your override. A symlinked `.boxen/` file is refused. They run with
+  Docker's default seccomp profile; a project with `boxen nonroot` on gives
+  its build container one more syscall (creating a user namespace), which
+  is more kernel to reach from it, so it's per project and off by default.
 - **GitHub:** tokens last an hour and cover only the repos you listed.
 - **Network:** build containers and sidecars reach anything the VM can,
   including your LAN. Give the VM its own VLAN and block RFC1918 except what
@@ -318,6 +381,16 @@ needs a real session.
   has the timer's failures. The VM's clock must be right.
 - **Limits (`mem_limit`, `cpus`) are ignored:** cgroup delegation applies
   after a reboot; `boxen doctor` shows the driver.
+- **Files in a project you can't edit or delete (owned by a number like
+  100999):** something in the container ran as a second user. Give them
+  back with `boxen run chown -R 0:0 <path>` from the project folder; for the
+  build that needed it, `boxen run --user` (see above).
+- **Getting out of a session without ending it:** F1 (fn+F1 on a Mac
+  keyboard) or Ctrl+B 0 goes back to the dashboard, clicking the dashboard
+  tab at the bottom does too, and Ctrl+B d or closing the terminal detaches.
+  Everything keeps running in tmux on the VM. A server's tab (`<name>~serve`)
+  can be hidden without stopping it: Ctrl+B h in it, or `x` on it in the
+  Sessions tab.
 
 ## Network egress (VLAN allowlist)
 

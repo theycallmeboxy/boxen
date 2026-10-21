@@ -48,6 +48,15 @@ boxen run --ps                      list background processes
 - The container starts on its own the first time. Its shell is a login
   shell. Builds and first starts can take minutes: give such commands a
   long timeout.
+- A tool that refuses to run as root (LibreELEC, Yocto, PostgreSQL's
+  initdb...): `boxen run --user cmd` (`-d NAME --user cmd` for a long one)
+  runs it as uid 1000, whose files are still the user's on the VM. Never
+  add a second user and `su`/`chmod` your way around it: that user's files
+  belong to an ID the VM doesn't know, so neither you nor the user can edit
+  or delete them outside the container. `--user` needs non-root runs on for
+  the project (`boxen env show` says); if they're off, ask the user to run
+  `boxen nonroot <project> on`. Files a second user made earlier: give them
+  back with `boxen run chown -R 0:0 <path>`.
 - Persists: the project folder, and the download caches in `/root/.cache`.
   Everything else in the container (anything installed at run time,
   background processes) is gone when it's recreated (`boxen env apply`,
@@ -61,7 +70,7 @@ boxen run --ps                      list background processes
 
 - `.boxen/Dockerfile`: the project's toolchain, `FROM boxen-env:latest`,
   built as root (`RUN apt-get update && apt-get install -y ...`, no USER
-  lines needed). Put every system package and SDK the project needs here.
+  lines or extra users needed; see `--user` above). Put every system package and SDK the project needs here.
   Set paths and variables with `ENV` (`ENV PATH=/opt/node/bin:$PATH`):
   shell startup files like `~/.bashrc` aren't read for commands. rustup
   installs to `/opt/cargo` (already on PATH). It may `COPY` other files
@@ -73,7 +82,7 @@ boxen run --ps                      list background processes
   the container and sidecars, printing every error (nothing changes on a
   failure: fix and run it again). Tell the user what you're applying first.
 - `boxen env show`: container and sidecar status, GitHub repos this project
-  can push to, the files above. `boxen env logs <sidecar> [--tail N]`.
+  can push to, whether non-root runs are on, the files above. `boxen env logs <sidecar> [--tail N]`.
 - Ports to the VM or LAN, host folders, memory/CPU limits: only the user can
   add these, in `~/.config/boxen/projects/<project>/compose.override.yaml`.
   Give them the exact snippet (service `env`, or a sidecar's name).

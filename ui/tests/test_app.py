@@ -63,7 +63,7 @@ async def job_done(pilot, app, n=1):
 def new_window(w, i=0):
     """The i-th new-window call as (name, start folder, script)."""
     nw = w.tmux_calls("new-window")[i]
-    assert nw[:5] == ["-L", "boxen", "new-window", "-t", "boxen:"] and nw[-3:-1] == ["sh", "-c"]
+    assert nw[:5] == ["-L", "boxen", "new-window", "-t", "=boxen:"] and nw[-3:-1] == ["sh", "-c"]
     return nw[nw.index("-n") + 1], nw[nw.index("-c") + 1], nw[-1]
 
 
@@ -191,7 +191,7 @@ async def test_claude_session_windows(world):
         # now there is one: c switches to it
         await pilot.press("c")
         await wait_for(pilot, lambda: w.tmux_calls("select-window"), what="select-window")
-        assert w.tmux_calls("select-window")[0][-2:] == ["-t", "@1"]
+        assert w.tmux_calls("select-window")[0][-2:] == ["-t", "=boxen:@1"]
         assert len(w.tmux_calls("new-window")) == 1
         # C starts another beside it
         await pilot.press("C")
@@ -200,7 +200,7 @@ async def test_claude_session_windows(world):
         # c picks the last one started
         await pilot.press("c")
         await wait_for(pilot, lambda: len(w.tmux_calls("select-window")) == 2, what="select the last")
-        assert w.tmux_calls("select-window")[1][-1] == "@2"
+        assert w.tmux_calls("select-window")[1][-1] == "=boxen:@2"
         assert w.boxen_calls() == [] and w.docker_calls() == []
 
 
@@ -234,7 +234,7 @@ async def test_shell_windows(world):
         # s again: the running window is selected, not opened again
         await pilot.press("s")
         await wait_for(pilot, lambda: w.tmux_calls("select-window"), what="select")
-        assert w.tmux_calls("select-window")[0][-1] == "@1"
+        assert w.tmux_calls("select-window")[0][-1] == "=boxen:@1"
         # v: a shell on the VM, in the project folder
         await pilot.press("v")
         await wait_for(pilot, lambda: len(w.tmux_calls("new-window")) == 2, what="vm shell")
@@ -350,7 +350,7 @@ async def test_sessions_tab_lists_the_projects_windows(world):
         t.focus()
         await pilot.press("enter")
         await wait_for(pilot, lambda: w.tmux_calls("select-window"), what="select")
-        assert w.tmux_calls("select-window")[0][-1] == "@3"
+        assert w.tmux_calls("select-window")[0][-1] == "=boxen:@3"
         # x closes the selected window, after asking
         await pilot.press("x")
         await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="close asks")
@@ -1171,7 +1171,7 @@ async def test_served_sessions_shown_and_warned_about(world):
     doc["projects"][0]["served"] = 3                # the server and two sessions started from the app
     doc["projects"][1]["served"] = 1                # beta: only a server (serve off, window still up)
     w = world(ls=doc)
-    w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@4", "name": "caulker~serve"}])
+    w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@4", "name": "caulker~serve", "sessions": ["serve"]}])
     app = BoxenApp(env=w.env)
     async with app.run_test(size=SIZE) as pilot:
         await started(pilot, app)
@@ -1187,10 +1187,9 @@ async def test_served_sessions_shown_and_warned_about(world):
         app.dashboard.action_sessions_tab()
         await wait_for(pilot, lambda: rows(app, "#win-list") == ["@4"], what="serve window")
         app.dashboard.query_one("#win-list").focus()
-        await pilot.press("x")
-        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="close asks")
-        assert "stop with it (2 running now)" in str(app.screen._message)
-        await pilot.press("n")
+        await pilot.press("x")                      # a serve window: x hides it, never asks to end it
+        await pilot.pause(0.3)
+        assert not isinstance(app.screen, ConfirmScreen) and w.tmux_calls("kill-window") == []
         app.dashboard.query_one("#projects").focus()
         await pilot.press("down")
         await wait_for(pilot, lambda: app.dashboard.selected == "beta", what="beta")
@@ -1264,3 +1263,282 @@ async def test_job_gets_a_grace_period(world, tmp_path):
         await pilot.press("y")
         await wait_for(pilot, lambda: not app.is_running, what="exit", timeout=10)
     assert mark.exists()
+
+
+# ---------------------------------------------------------------- disk use
+
+def df_doc(docker=True):
+    """`boxen df --json` for caulker (built, a sidecar) and beta (no image)."""
+    return {"version": 1, "docker": docker, "projects": [
+        {"name": "caulker", "path": "/x/caulker", "total": 3 * 2**30, "code": 2**30, "claude": 4 * 2**20,
+         "claude_path": "/x/c", "image": {"name": "boxen-env-caulker:latest", "size": 500 * 2**20},
+         "containers": [{"name": "boxen.caulker.env", "size": 12 * 2**20},
+                        {"name": "boxen.caulker.postgres", "size": 2**20}],
+         "volumes": [{"name": "boxen.caulker.cache", "size": 300 * 2**20},
+                     {"name": "boxen.caulker.pgdata", "size": 40 * 2**20}]},
+        {"name": "beta", "path": "/x/beta", "total": 5 * 2**20, "code": 5 * 2**20, "claude": None,
+         "claude_path": "/x/b", "image": None, "containers": [], "volumes": []}],
+        "shared": {}, "other": {}, "leftovers": [], "filesystems": [], "total": 0}
+
+
+def ov_disk(app):
+    return str(app.dashboard.query_one("#ov-disk").render())
+
+
+@aio
+async def test_disk_column_and_overview(world, monkeypatch):
+    import boxen_ui.app as appmod
+    monkeypatch.setattr(appmod, "DF_FIRST", 60)          # not measured yet at first
+    w = world()
+    w.write("df.json", json.dumps(df_doc()))
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        t = app.dashboard.query_one("#projects")
+        assert [c.value for c in t.columns] == ["name", "ctr", "sess", "serve", "cpu", "mem", "disk", "gh"]
+        assert t.get_cell("caulker", "disk").plain == "-"
+        assert ov_disk(app) == "measuring…"
+        assert not [c for c in w.boxen_calls(skip_ls=False) if c["args"][:1] == ["df"]]
+        app.dashboard.refresh_df()
+        await wait_for(pilot, lambda: app.dashboard.disk is not None, what="df")
+        await pilot.pause(0.1)
+        assert [t.get_cell(k, "disk").plain for k in ("caulker", "beta", "gamma")] == ["3.0G", "5.0M", "-"]
+        line = ov_disk(app)
+        assert line.startswith("3.0G  code 1.0G · image 500M · changes 13M · volumes 340M · claude 4.0M")
+        assert "(just now)" in line
+        await pilot.press("down")
+        assert ov_disk(app).startswith("5.0M  code 5.0M · image - · changes 0B · volumes 0B · claude ?")
+        await pilot.press("down")
+        assert ov_disk(app) == "not measured yet"          # gamma isn't in the report
+
+
+@aio
+async def test_disk_without_docker_shows_unknowns(world):
+    w = world()
+    doc = df_doc(docker=False)
+    doc["projects"][0]["image"] = None
+    w.write("df.json", json.dumps(doc))
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: app.dashboard.disk is not None, what="df")
+        await pilot.pause(0.1)
+        line = ov_disk(app)
+        assert "image ? · changes ? · volumes ?" in line and "Docker wasn't answering" in line
+
+
+@aio
+async def test_disk_refresh_cadence(world, monkeypatch):
+    import boxen_ui.app as appmod
+    monkeypatch.setattr(appmod, "DF_FIRST", 0)
+    monkeypatch.setattr(appmod, "DF_EVERY", 1)
+    w = world()
+    # each measurement takes 1.5 s: longer than DF_EVERY
+    w.rules([{"args": ["df", "--json"], "out": [json.dumps(df_doc())], "sleep": 1.5}])
+    calls = lambda: len([c for c in w.boxen_calls(skip_ls=False) if c["args"] == ["df", "--json"]])  # noqa: E731
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: calls() == 1, what="the first df")
+        await pilot.pause(1.2)
+        assert calls() == 1                                # never two at once
+        await wait_for(pilot, lambda: app.dashboard.disk is not None, what="the first result")
+        await wait_for(pilot, lambda: calls() == 2, timeout=4, what="the next one")
+        w.write("detached", "")                            # nobody attached: no more
+        await wait_for(pilot, lambda: not app.dashboard.tmux.attached, what="detach seen")
+        await wait_for(pilot, lambda: "df" not in app.dashboard._busy, what="the running one to finish")
+        n = calls()
+        await pilot.pause(2.5)
+        assert calls() == n
+        # ctrl+r: only when the last one is older than DF_MIN_AGE
+        os.unlink(os.path.join(w.fake, "detached"))
+        monkeypatch.setattr(appmod, "DF_EVERY", 600)
+        await wait_for(pilot, lambda: app.dashboard.tmux.attached, what="reattach seen")
+        await wait_for(pilot, lambda: "df" not in app.dashboard._busy, what="idle")
+        n = calls()
+        await pilot.press("ctrl+r")
+        await pilot.pause(0.5)
+        assert calls() == n
+        monkeypatch.setattr(appmod, "DF_MIN_AGE", 0)
+        await pilot.press("ctrl+r")
+        await wait_for(pilot, lambda: calls() == n + 1, what="ctrl+r measuring again")
+
+
+@aio
+async def test_disk_failure_keeps_old_data(world, monkeypatch):
+    import boxen_ui.app as appmod
+    monkeypatch.setattr(appmod, "DF_MIN_AGE", 0)
+    w = world()
+    w.write("df.json", json.dumps(df_doc()))
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: app.dashboard.disk is not None, what="df")
+        old = app.dashboard.disk
+        w.write("df.fail", "")
+        await wait_for(pilot, lambda: "df" not in app.dashboard._busy, what="idle")
+        await pilot.press("ctrl+r")
+        await wait_for(pilot, lambda: app.dashboard.disk_error, what="the failure")
+        await pilot.pause(0.1)
+        assert app.dashboard.disk is old
+        cell = app.dashboard.query_one("#projects").get_cell("caulker", "disk")
+        assert cell.plain == "3.0G" and "dim" in str(cell.style)
+        assert "last try failed: boxen: something broke in df" in ov_disk(app)
+        # garbage instead of the report: the same
+        os.unlink(os.path.join(w.fake, "df.fail"))
+        w.rules([{"args": ["df", "--json"], "out": ["not json " + INJECT_LINK]}])
+        app.dashboard.disk_error = None
+        await pilot.press("ctrl+r")
+        await wait_for(pilot, lambda: app.dashboard.disk_error, what="the parse failure")
+        assert app.dashboard.disk is old
+        # recovers
+        w.rules([])
+        await wait_for(pilot, lambda: "df" not in app.dashboard._busy, what="idle")
+        await pilot.press("ctrl+r")
+        await wait_for(pilot, lambda: app.dashboard.disk_error is None, what="recovery")
+        assert "failed" not in ov_disk(app)
+
+
+@aio
+async def test_disk_first_failure_says_so(world):
+    w = world()
+    w.write("df.fail", "")
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: app.dashboard.disk_error, what="the failure")
+        await pilot.pause(0.1)
+        assert ov_disk(app) == "boxen df failed: boxen: something broke in df"
+        assert app.dashboard.query_one("#projects").get_cell("caulker", "disk").plain == "-"
+
+
+@aio
+async def test_disk_usage_is_in_the_global_menu(world):
+    from boxen_ui.screens import GLOBAL_ACTIONS
+    w = world()
+    w.rules([{"args": ["df"], "out": ["PROJECT  TOTAL", "Shared by the projects", "  build cache  1.8G"]}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        assert "disk" in [k for k, _t, _d in GLOBAL_ACTIONS]
+        await pilot.press("g")
+        await wait_for(pilot, lambda: isinstance(app.screen, GlobalMenuScreen), what="the menu")
+        ol = app.screen.query_one("#global-options")
+        ol.highlighted = [k for k, _t, _d in GLOBAL_ACTIONS].index("disk")
+        await pilot.press("enter")
+        await job_done(pilot, app)
+        assert [c["args"] for c in w.boxen_calls()] == [["df"]]
+        assert not app.dashboard.jobs.jobs[0].is_global          # read-only: holds nothing up
+        assert "build cache  1.8G" in screen_text(app)
+
+
+# ------------------------------------------------------- serve windows: hide/show
+
+def binding_for(app, key):
+    b = app.screen.active_bindings.get(key)
+    return b.binding.action if b else None
+
+
+@aio
+async def test_hidden_serve_window_is_listed_and_shown(world):
+    w = world()
+    w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@3", "name": "caulker", "sessions": ["boxen"]},
+               {"id": "@4", "name": "caulker~serve", "sessions": ["serve"]},
+               {"id": "@5", "name": "beta~serve", "sessions": ["serve"]}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        await wait_for(pilot, lambda: "hidden: Sessions tab, Enter shows it" in
+                       str(app.dashboard.query_one("#ov-serve").render()), what="overview says hidden")
+        assert ["-L", "boxen", "list-windows", "-t", "=serve:"] in [c[:5] for c in w.tmux_calls("list-windows")]
+        assert all(c[4] in ("=boxen:", "=serve:") for c in w.tmux_calls("list-windows"))
+        app.dashboard.action_sessions_tab()
+        await wait_for(pilot, lambda: rows(app, "#win-list") == ["@3", "@4"], what="both windows, not beta's")
+        t = app.dashboard.query_one("#win-list")
+        assert t.get_cell("@4", "state").plain == "running, hidden"
+        assert t.get_cell("@3", "state").plain == "running"
+        t.focus()
+        assert binding_for(app, "x") == "window_close"           # a Claude session: Close
+        await pilot.press("down")
+        await wait_for(pilot, lambda: binding_for(app, "x") == "window_hide", what="x is Hide")
+        assert "Hide" in screen_text(app)
+        # Enter shows it: linked into your session, then selected
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: w.tmux_calls("link-window"), what="link")
+        assert w.tmux_calls("link-window")[0] == ["-L", "boxen", "link-window", "-d", "-s", "=serve:@4",
+                                                   "-t", "=boxen:"]
+        await wait_for(pilot, lambda: ["-t", "=boxen:@4"] == w.tmux_calls("select-window")[-1][-2:],
+                       what="select")
+        await wait_for(pilot, lambda: t.get_cell("@4", "state").plain == "running, shown", what="shown")
+        # x hides it again: unlinked from your session, never killed, no question asked
+        await pilot.press("x")
+        await wait_for(pilot, lambda: w.tmux_calls("unlink-window"), what="unlink")
+        assert w.tmux_calls("unlink-window")[0] == ["-L", "boxen", "unlink-window", "-t", "=boxen:@4"]
+        await wait_for(pilot, lambda: t.get_cell("@4", "state").plain == "running, hidden", what="hidden")
+        assert w.tmux_calls("kill-window") == [] and not isinstance(app.screen, ConfirmScreen)
+        assert any(x["name"] == "caulker~serve" and x["sessions"] == ["serve"]
+                   for x in json.load(open(os.path.join(w.fake, "windows.json"))))
+        # x on a hidden one: nothing to do
+        n = len(w.tmux_calls())
+        await pilot.press("x")
+        await pilot.pause(0.3)
+        assert [c for c in w.tmux_calls()[n:] if "unlink-window" in c or "kill-window" in c] == []
+        # a Claude session window: x still asks to close it
+        await pilot.press("up")
+        await wait_for(pilot, lambda: binding_for(app, "x") == "window_close", what="x is Close")
+        await pilot.press("x")
+        await wait_for(pilot, lambda: isinstance(app.screen, ConfirmScreen), what="close asks")
+
+
+@aio
+async def test_hiding_a_serve_window_only_in_your_session_is_refused(world):
+    """An older serve window (in `boxen` only): tmux won't unlink it, so it
+    keeps running, and the dashboard says how to move it."""
+    w = world()
+    w.windows([{"id": "@0", "name": "dashboard"}, {"id": "@4", "name": "caulker~serve"}])
+    app = BoxenApp(env=w.env)
+    async with app.run_test(size=SIZE) as pilot:
+        await started(pilot, app)
+        app.dashboard.action_sessions_tab()
+        await wait_for(pilot, lambda: rows(app, "#win-list") == ["@4"], what="serve window")
+        app.dashboard.query_one("#win-list").focus()
+        await pilot.press("x")
+        await wait_for(pilot, lambda: w.tmux_calls("unlink-window"), what="unlink tried")
+        await wait_for(pilot, lambda: any("boxen ui --restart moves serve windows" in n.message
+                                          for n in app._notifications), what="the notice")
+        assert w.tmux_calls("kill-window") == []
+        assert [x["id"] for x in json.load(open(os.path.join(w.fake, "windows.json")))] == ["@0", "@4"]
+
+
+def test_tmux_conf_hide_key(tmp_path):
+    """C-b h and the status hint, in a real tmux (skipped without one)."""
+    import shutil
+    import subprocess
+    if not shutil.which("tmux"):
+        pytest.skip("no tmux")
+    conf = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmux.conf")
+    sock = "bxt%d" % os.getpid()
+    t = ["tmux", "-L", sock]
+
+    def tm(*a):
+        return subprocess.run(t + list(a), capture_output=True, text=True, timeout=10)
+    try:
+        assert tm("-f", conf, "new-session", "-d", "-s", "boxen", "-n", "dashboard", "sleep", "60").returncode == 0
+        assert tm("new-session", "-d", "-s", "serve", "-n", "caulker~serve", "sleep", "60").returncode == 0
+        keys = tm("list-keys", "-T", "prefix", "h").stdout
+        assert "unlink-window -t =boxen:" in keys and "select-window -t =boxen:=dashboard" in keys
+        right = tm("show", "-gv", "status-right").stdout.strip()
+        tm("link-window", "-d", "-s", "=serve:=caulker~serve", "-t", "=boxen:")
+        tm("select-window", "-t", "=boxen:=caulker~serve")
+        assert tm("display-message", "-p", "-t", "=boxen:", right).stdout.startswith("#[fg=colour244]C-b h hide")
+        tm("select-window", "-t", "=boxen:=dashboard")
+        assert "C-b h" not in tm("display-message", "-p", "-t", "=boxen:", right).stdout
+        # what the key runs, with its target: the serve window leaves your tabs and keeps running
+        tm("select-window", "-t", "=boxen:=caulker~serve")
+        cmd = keys.split(" h ", 1)[1].strip()
+        assert tm("if-shell", "-t", "=boxen:", "-F", "#{m:*~serve,#{window_name}}",
+                  "unlink-window -t =boxen: ; select-window -t =boxen:=dashboard").returncode == 0, cmd
+        names = lambda s: tm("list-windows", "-t", "=%s:" % s, "-F", "#{window_name}").stdout.split()  # noqa: E731
+        assert names("boxen") == ["dashboard"] and names("serve") == ["caulker~serve"]
+    finally:
+        tm("kill-server")

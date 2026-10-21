@@ -34,9 +34,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # boxen-exec: what `boxen run` runs (so an interrupted run can end its
-# command); boxen-bg: `boxen run -d/--logs/--stop/--ps`.
-COPY boxen-exec boxen-bg /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/boxen-exec /usr/local/bin/boxen-bg
+# command); boxen-bg: `boxen run -d/--logs/--stop/--ps`; boxen-user:
+# `boxen run --user`, through its own copy of unshare (the path the VM's
+# AppArmor profile for it names; what limits it is the seccomp profile of
+# projects with `boxen nonroot` on, not the path).
+COPY boxen-exec boxen-bg boxen-user /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/boxen-exec /usr/local/bin/boxen-bg /usr/local/bin/boxen-user \
+ && install -D -m 0755 /usr/bin/unshare /usr/local/libexec/boxen/unshare
 
 WORKDIR /root
 CMD ["sleep", "infinity"]

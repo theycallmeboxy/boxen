@@ -256,12 +256,16 @@ def test_bg_ps_empty(bg):
 
 def test_image_installs_boxen_exec_and_bg():
     text = open(os.path.join(REPO, "image", "Dockerfile")).read()
-    assert "COPY boxen-exec boxen-bg /usr/local/bin/" in text
-    assert "RUN chmod 0755 /usr/local/bin/boxen-exec /usr/local/bin/boxen-bg" in text
+    assert "COPY boxen-exec boxen-bg boxen-user /usr/local/bin/" in text
+    assert "RUN chmod 0755 /usr/local/bin/boxen-exec /usr/local/bin/boxen-bg /usr/local/bin/boxen-user" in text
+    # boxen run --user's own copy of unshare, at the path the AppArmor profile names
+    assert "install -D -m 0755 /usr/bin/unshare /usr/local/libexec/boxen/unshare" in text
+    inst = open(os.path.join(REPO, "install.sh")).read()
+    assert "profile boxen-userns /usr/local/libexec/boxen/unshare flags=(unconfined)" in inst
     # caches on the cache volume, toolchains in the image
     assert "XDG_CACHE_HOME=/root/.cache" in text and "CARGO_HOME=/opt/cargo" in text
     assert "RUSTUP_HOME=/opt/rustup" in text and "PATH=/opt/cargo/bin:" in text
-    for f in (BG, EXEC):
+    for f in (BG, EXEC, os.path.join(REPO, "image", "boxen-user")):
         assert open(f).readline() == "#!/bin/sh\n"
 
 

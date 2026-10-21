@@ -38,10 +38,10 @@ from .docker_api import DockerAPI, DockerError, cpu_percent, health_of, memory
 from .jobs import FAILED, OK, RUNNING, STOPPED, Busy, JobManager, fmt_elapsed
 from .jobs import GRACE as JOB_GRACE
 from .model import (AMBER, GREEN, GREY, HEALTH_STYLE, RED, RUNNING_JOB, container_short, container_style,
-                    github_short, parse_ls, repo_state, serve_short, sessions_short, state_style)
+                    github_short, parse_df, parse_ls, repo_state, serve_short, sessions_short, state_style)
 from .screens import ConfirmScreen, GlobalMenuScreen, HelpScreen, NewProjectScreen, ReposScreen
 from .textutil import ansi_text, clean_line, text
-from .tmux import GLOBAL, Tmux, in_boxen_tmux, kind_of, serve_window, window_name
+from .tmux import GLOBAL, Tmux, in_boxen_tmux, is_serve_window, kind_of, serve_window, window_name
 
 UI_DIR = os.path.dirname(PKG_DIR)
 HIST = 60
@@ -49,6 +49,12 @@ HIST_FORGET = 300           # drop a container's series after it's been gone thi
 JOB_STYLE = {RUNNING: RUNNING_JOB, OK: GREEN, FAILED: RED, STOPPED: GREY}
 LS_ACTIVE, LS_IDLE, STATS_EVERY, SYS_EVERY = 5, 60, 3, 5
 DUE_SLACK = 0.05
+# `boxen df --json` walks every project folder and asks Docker to size its
+# volumes: slow on big trees, so rarely, and never two at once.
+DF_FIRST = 2                # after the dashboard starts (and the first ls is in)
+DF_EVERY = 600              # then this often, while a client is attached
+DF_MIN_AGE = 30             # ctrl+r measures again only if the last one is older
+DF_TIMEOUT = 300
 SUGGEST_EVERY = 30          # `boxen repos NAME --suggest` for the selected project, at most this often
 # A Claude session, as `boxen claude` starts one. The tmux server was started
 # without DOCKER_HOST (bin/boxen), and this makes sure of it: nothing an
@@ -117,6 +123,14 @@ def editor_argv(env=None):
     return ["vim"] if shutil.which("vim", path=env.get("PATH")) else ["vi"]
 
 
+def _window_state(w, kind):
+    if w.finished:
+        return Text("exited", style=GREY)
+    if kind == "serve":
+        return Text("running, hidden", style=GREY) if w.hidden else Text("running, shown", style=GREEN)
+    return Text("running", style=GREEN)
+
+
 def window_what(kind):
     if kind in WINDOW_WHAT:
         return WINDOW_WHAT[kind]
@@ -129,6 +143,14 @@ def window_what(kind):
 
 def _plural(n, word, words=None):
     return "%d %s" % (n, word if n == 1 else (words or word + "s"))
+
+
+def _ago(secs):
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return "%d min ago" % (secs // 60)
+    return "%d h ago" % (secs // 3600)
 
 
 def _serve_sessions_note(p):
@@ -214,6 +236,8 @@ class Dashboard(Screen):
         Binding("J", "toggle_jobs", "Jobs"),
         Binding("f", "follow_logs", "Follow"),
         Binding("x", "window_close", "Close"),
+        # x on a serve window only takes it out of your tabs: the server keeps running
+        Binding("x", "window_hide", "Hide"),
         Binding("a", "repo_add_found", "Add repo"),
         Binding("G", "repos", "Repos"),
         Binding("e", "edit_file", "Edit"),
@@ -223,7 +247,8 @@ class Dashboard(Screen):
         Binding("Q", "quit_all", "Quit", show=False),
     ]
     # Keys that only mean something on one tab: shown (and live) only there.
-    TAB_ACTIONS = {"follow_logs": ("logs",), "window_close": ("sessions-tab",), "edit_file": ("files-tab",),
+    TAB_ACTIONS = {"follow_logs": ("logs",), "window_close": ("sessions-tab",), "window_hide": ("sessions-tab",),
+                   "edit_file": ("files-tab",),
                    "repo_add_found": ("overview",)}
 
     def __init__(self, cfg, env):
@@ -262,6 +287,11 @@ class Dashboard(Screen):
         self.suggest = {}           # project -> (monotonic time, [found repo, ...]) from repos --suggest
         self._repo_rows = []        # Overview's repos table: ("listed" | "found", repo) by row
         self._loaded = {}           # tab -> project it shows
+        self.disk = None            # the last DiskReport from `boxen df --json`
+        self.disk_at = None         # when it came (monotonic)
+        self.disk_error = None      # why the last measurement failed (the old report stays)
+        self._df_started = None     # when the last one started (monotonic)
+        self._mounted_at = time.monotonic()
         self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="boxen-ui")
 
     # ------------------------------------------------------------ layout
@@ -280,7 +310,7 @@ class Dashboard(Screen):
                             yield Static(Text(""), id="getting-started")
                             with Vertical(id="ov-content"):
                                 with Grid(id="ov-grid"):
-                                    for key in ("container", "sessions", "serve", "folder"):
+                                    for key in ("container", "sessions", "serve", "folder", "disk"):
                                         yield Label(key, classes="k")
                                         yield Static(Text(""), classes="v", id="ov-" + key)
                                 with Horizontal(classes="spark-row"):
@@ -379,6 +409,10 @@ class Dashboard(Screen):
             self.refresh_sys()
         if self._is_due("git", 60):
             self._refresh_git()
+        if self._df_due():
+            self.refresh_df()
+        elif self._ticks % 30 == 0:
+            self._render_disk_line()            # "(3 min ago)" moves on
         self._check_edits()
         # tmux windows: every second on the Sessions tab, else every 3 s
         # (the attach state, the self-update lock, Overview's window count).
@@ -394,6 +428,8 @@ class Dashboard(Screen):
         self._due["ls"] = time.monotonic()
         self.refresh_ls()
         self.refresh_stats()
+        if self._df_started is None or time.monotonic() - self._df_started > DF_MIN_AGE:
+            self.refresh_df()
         self._load_active_tab(force=True)
 
     # ------------------------------------------------------------ header
@@ -572,6 +608,79 @@ class Dashboard(Screen):
         finally:
             self._busy.discard("ls")
 
+    # ------------------------------------------------------------ disk use
+
+    def _df_due(self):
+        if "df" in self._busy or not self.ls_loaded:
+            return False
+        now = time.monotonic()
+        if self._df_started is None:
+            return now - self._mounted_at >= DF_FIRST - DUE_SLACK
+        return self.tmux.attached and now - self._df_started >= DF_EVERY - DUE_SLACK
+
+    def refresh_df(self):
+        if "df" in self._busy:
+            return
+        self._busy.add("df")
+        self._df_started = time.monotonic()
+        self.run_worker(self._df_worker(), group="df", exit_on_error=False)
+
+    async def _df_worker(self):
+        try:
+            rc, out, err = await procs.run([self.cfg.boxen, "df", "--json"], env=self.jobs.env, timeout=DF_TIMEOUT)
+            if rc != 0:
+                lines = [ln for ln in (err or out).strip().splitlines() if ln.strip()]
+                self.disk_error = lines[-1] if lines else "exit %d" % rc
+            else:
+                try:
+                    self.disk = parse_df(out)
+                except ValueError as e:      # json's errors are ValueErrors too
+                    self.disk_error = str(e)
+                else:
+                    self.disk_error = None
+                    self.disk_at = time.monotonic()
+            self._render_projects()
+            self._render_disk_line()
+        finally:
+            self._busy.discard("df")
+
+    def _disk_of(self, p):
+        return self.disk.projects.get(p.name) if self.disk is not None else None
+
+    def _disk_cell(self, p):
+        d = self._disk_of(p)
+        if d is None or d.total is None:
+            return Text("-", style=GREY)
+        return Text(sysinfo.human_bytes(d.total), style="dim" if self.disk_error else "")
+
+    def _render_disk_line(self):
+        p = self.current()
+        if p is None:
+            return
+        v = Text(no_wrap=True, overflow="ellipsis")
+        d = self._disk_of(p)
+        if d is None:
+            if self.disk_error:
+                v.append("boxen df failed: %s" % clean_line(self.disk_error)[:120], style=GREY)
+            elif self.disk is None:
+                v.append("measuring…", style=GREY)
+            else:
+                v.append("not measured yet", style=GREY)
+        else:
+            hb = sysinfo.human_bytes
+            docker = self.disk.docker
+            image = hb(d.image) if d.image is not None else ("-" if docker else "?")
+            v.append(hb(d.total), style="bold")
+            v.append("  code %s · image %s · changes %s · volumes %s · claude %s"
+                     % (hb(d.code), image, hb(d.changes), hb(d.volumes), hb(d.claude)))
+            if self.disk_at is not None:
+                v.append("  (%s)" % _ago(time.monotonic() - self.disk_at), style=GREY)
+            if not docker:
+                v.append("  Docker wasn't answering", style=GREY)
+            if self.disk_error:
+                v.append("  last try failed: %s" % clean_line(self.disk_error)[:80], style=AMBER)
+        self.query_one("#ov-disk", Static).update(v)
+
     def _stale_changed(self):
         stale = bool(self.ls_error)
         changed = getattr(self, "_was_stale", False) != stale
@@ -592,7 +701,7 @@ class Dashboard(Screen):
                 ("CTR" if compact else "CONTAINER", "ctr"), ("SESS", "sess"), ("SERVE", "serve"),
                 ("CPU", "cpu"), ("MEM", "mem")]
         if not compact:
-            cols.append(("GITHUB", "gh"))
+            cols += [("DISK", "disk"), ("GITHUB", "gh")]
         for label, key in cols:
             t.add_column(Text(label, style="bold"), key=key)
         sc = self.query_one("#sidecars", DataTable)
@@ -633,6 +742,7 @@ class Dashboard(Screen):
         st = self.stats.get(p.env_container, {}) if self._env_running(p) else {}
         cells = [name, ctr_t, sess_t, Text(sv, style=sv_style), _fmt_cpu(st.get("cpu")), _fmt_mem(st.get("mem"))]
         if not self.compact:
+            cells.append(self._disk_cell(p))
             g, style = github_short(p)
             cells.append(Text(clean_line(g), style=style))
         if stale:
@@ -723,14 +833,20 @@ class Dashboard(Screen):
                 Text("  %s" % clean_line(p.env_container), style=GREY))
         self._render_sessions_line()
         if p.serve == "on":
+            sw = next((w for w in self.windows if w.name == serve_window(p.name)), None)
+            where = ("hidden: Sessions tab, Enter shows it" if sw is not None and sw.hidden
+                     else "among your tabs; x in the Sessions tab, or C-b h in it, hides it" if sw is not None
+                     else "")
             val("serve", Text("on", style=GREEN), ": start sessions from the Claude app",
-                Text("  (window %s)" % clean_line(serve_window(p.name)), style=GREY))
+                Text("  (window %s%s)" % (clean_line(serve_window(p.name)), ", " + where if where else ""),
+                     style=GREY))
         elif p.serve == "stopped":
             val("serve", Text("stopped", style=AMBER), ": on, but its window isn't running; S starts it again")
         else:
             val("serve", Text("off", style=GREY), Text("  S keeps a Remote Control server up, to start sessions "
                                                      "from the Claude app", style=GREY))
         val("folder", clean_line(p.path))
+        self._render_disk_line()
         self._render_repos()
         self._load_suggest(p)
         self._render_stats()
@@ -987,9 +1103,13 @@ class Dashboard(Screen):
         tabs = self.TAB_ACTIONS.get(action)
         if tabs is not None:
             try:
-                return self.active_tab() in tabs
+                if self.active_tab() not in tabs:
+                    return False
             except Exception:
                 return False
+            if action in ("window_close", "window_hide"):
+                # one key, x: Hide on a serve window, Close on the others
+                return self._selected_is_serve() == (action == "window_hide")
         return True
 
     # sessions: the project's tmux windows
@@ -1013,17 +1133,16 @@ class Dashboard(Screen):
             return
         mine = [(w, kind_of(p, w.name)) for w in self.windows] if p else []
         mine = [(w, k) for w, k in mine if k]
-        rows = [(w.id, w.name, w.finished) for w, _k in mine]
+        rows = [(w.id, w.name, w.finished, w.hidden) for w, _k in mine]
         if self._win_rows != rows:
             self._win_rows = rows
             cur = table.cursor_row
             table.clear()
             for w, k in mine:
-                table.add_row(text(w.name), text(window_what(k)),
-                              Text("exited" if w.finished else "running", style=GREY if w.finished else GREEN),
-                              key=w.id)
+                table.add_row(text(w.name), text(window_what(k)), _window_state(w, k), key=w.id)
             if mine:
                 table.move_cursor(row=min(max(cur, 0), len(mine) - 1))
+            self.refresh_bindings()
         proj = self.current()
         if not mine:
             msg = "No windows for this project. c starts a Claude session, s a shell in its build container, " \
@@ -1033,7 +1152,9 @@ class Dashboard(Screen):
             status.update(Text(msg, style=GREY))
             preview.update(Text(""))
             return
-        status.update(Text("Enter switches to the window · x closes it · F1 (or C-b 0) comes back here", style=GREY))
+        status.update(Text("Enter switches to the window (a hidden ~serve one: shows it among your tabs) · "
+                           "x closes it (a ~serve one: hides it; it keeps running, S stops it) · "
+                           "F1 (or C-b 0) comes back here", style=GREY))
         wid = self._selected_window()
         if wid is None:
             return
@@ -1055,30 +1176,80 @@ class Dashboard(Screen):
         except Exception:
             return None
 
+    def _window_by_id(self, wid):
+        return next((x for x in self.windows if x.id == wid), None) if wid else None
+
+    def _selected_is_serve(self):
+        try:
+            w = self._window_by_id(self._selected_window())
+        except Exception:
+            return False
+        return w is not None and is_serve_window(w.name)
+
+    @on(DataTable.RowHighlighted, "#win-list")
+    def _window_highlighted(self, _ev):
+        self.refresh_bindings()
+
     @on(DataTable.RowSelected, "#win-list")
     def _window_selected(self, ev):
         wid = ev.row_key.value if ev.row_key is not None else None
-        if wid:
+        if not wid:
+            return
+        w = self._window_by_id(wid)
+        if w is not None and w.hidden:
+            self.run_worker(self._show_window(wid), exit_on_error=False)
+        else:
             self.run_worker(self._select_window(wid), exit_on_error=False)
+
+    async def _show_window(self, wid):
+        ok, err = await self.tmux.show(wid)
+        if not ok:
+            self.notify("tmux: %s" % (err or "couldn't show it"), severity="error", markup=False)
+        self._win_rows = None
+        await self._refresh_windows()
 
     async def _select_window(self, wid):
         ok, err = await self.tmux.select(wid)
         if not ok:
             self.notify("tmux: %s" % (err or "couldn't switch"), severity="error", markup=False)
 
+    def action_window_hide(self):
+        """Take the selected serve window out of your tabs. Never ends it:
+        it keeps running in the hidden serve session (S turns serve off)."""
+        p, wid = self.current(), self._selected_window()
+        w = self._window_by_id(wid)
+        if p is None or w is None or kind_of(p.name, w.name) != "serve":
+            return
+        if w.hidden:
+            self.notify("%s is already hidden: it runs in the background. Enter shows it; S turns serve off."
+                        % clean_line(w.name), markup=False)
+            return
+
+        async def go():
+            ok, err = await self.tmux.hide(wid)
+            if not ok:
+                # e.g. an older serve window that's only in your session: boxen ui --restart moves it
+                self.notify("Couldn't hide %s: %s. It keeps running; boxen ui --restart moves serve windows to "
+                            "the background." % (clean_line(w.name), err or "tmux said no"),
+                            severity="error", markup=False)
+            self._win_rows = None
+            await self._refresh_windows()
+        self.run_worker(go(), exit_on_error=False)
+
     def action_window_close(self):
         p, wid = self.current(), self._selected_window()
         if p is None or wid is None:
             return
-        w = next((x for x in self.windows if x.id == wid), None)
+        w = self._window_by_id(wid)
         kind = kind_of(p.name, w.name) if w else None
         if w is None or kind is None:
             return
+        if kind == "serve":
+            # x never ends a server; S does (boxen serve --off)
+            self.action_window_hide()
+            return
         if kind == "claude":
             msg = "Ends that Claude session (its conversation is kept: claude --resume in the folder picks it up)."
-        elif kind == "serve":
-            msg = ("Stops the Remote Control server until it's started again (S, or the next boot while serve "
-                   "is on). %s To turn serve off for good: S." % _serve_sessions_note(p))
         else:
             msg = "Ends what runs in it."
         name = clean_line(w.name)
@@ -1090,7 +1261,7 @@ class Dashboard(Screen):
             await self._refresh_windows()
             self.refresh_ls()
         self._confirm("Close window %s?" % name, msg, lambda: self.run_worker(go(), exit_on_error=False),
-                      warn=kind in ("claude", "serve"), yes="Close")
+                      warn=kind == "claude", yes="Close")
 
     # logs: the sidecars'
 
@@ -1568,6 +1739,11 @@ class Dashboard(Screen):
         if not self._busy_check(is_global=True):
             self.query_one("#jobs").remove_class("collapsed")
             self.start_job(["doctor"], is_global=True)
+
+    def action_global_disk(self):
+        # Read-only: an ordinary job, so it doesn't hold up project actions.
+        self.query_one("#jobs").remove_class("collapsed")
+        self.start_job(["df"])
 
     def action_global_migrate(self):
         if not self._busy_check(is_global=True):

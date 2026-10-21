@@ -1,5 +1,11 @@
-"""The `boxen` tmux server (tmux -L boxen): the dashboard's own session and
-the windows in it. bin/boxen names a project's Claude sessions "<project>"
+"""The `boxen` tmux server (tmux -L boxen): two sessions. `boxen` is yours:
+the dashboard and the windows you work in, the tabs at the bottom. `serve`
+is hidden (nobody attaches to it): bin/boxen keeps each project's Remote
+Control server there, and the dashboard shows one in `boxen` only while you
+want to see it (link-window: the window is then in both sessions) and hides
+it again (unlink-window: it keeps running in `serve`). Sessions are always
+targeted exactly (`=boxen:`): a plain `boxen:` would also match a session
+whose name starts with it. bin/boxen names a project's Claude sessions "<project>"
 (boxen claude; the dashboard's c too) and its Remote Control server
 "<project>~serve"; the dashboard's other windows are "<project>/<kind>"
 ("+global/<kind>" for the rest). "~", "/" and "+" can't be in a project
@@ -9,7 +15,7 @@ folder (-c) unless they're meant to work in the project's folder (Claude,
 a VM shell there)."""
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import procs
 
@@ -30,6 +36,7 @@ class Window:
     active: bool
     dead: bool
     done: bool = False
+    hidden: bool = False     # a serve window that's only in the hidden session, not among your tabs
 
     @property
     def finished(self):
@@ -43,6 +50,10 @@ def window_name(project, kind):
 
 def serve_window(project):
     return "%s~serve" % project
+
+
+def is_serve_window(name):
+    return name.endswith("~serve")
 
 
 def kind_of(project, name):
@@ -78,11 +89,16 @@ def in_boxen_tmux(env=None):
     return bool(t) and os.path.basename(t.split(",", 1)[0]) == "boxen"
 
 
+WINDOW_FORMAT = ("#{window_id}\t#{window_index}\t#{session_attached}\t#{window_active}\t#{pane_dead}"
+                 "\t#{@boxen_done}\t#{window_name}")
+
+
 class Tmux:
-    def __init__(self, exe="tmux", socket="boxen", session="boxen", env=None, home=None):
+    def __init__(self, exe="tmux", socket="boxen", session="boxen", env=None, home=None, serve_session="serve"):
         self.exe = exe
         self.socket = socket
         self.session = session
+        self.serve_session = serve_session
         self.env = env
         self.home = home or os.path.expanduser("~")
         self.attached = True          # whether any client is attached (from list_windows)
@@ -93,13 +109,15 @@ class Tmux:
     async def run(self, *args, timeout=10.0):
         return await procs.run(self.argv(*args), env=self.env, timeout=timeout)
 
-    async def list_windows(self):
-        rc, out, _err = await self.run(
-            "list-windows", "-t", self.session + ":",
-            "-F", "#{window_id}\t#{window_index}\t#{session_attached}\t#{window_active}\t#{pane_dead}"
-                  "\t#{@boxen_done}\t#{window_name}")
+    def target(self, win_id=""):
+        """A window (by id) in your session, or the session itself."""
+        return "=%s:%s" % (self.session, win_id)
+
+    async def _list(self, session):
+        """(windows, whether a client is attached or None) of one session."""
+        rc, out, _err = await self.run("list-windows", "-t", "=%s:" % session, "-F", WINDOW_FORMAT)
         if rc != 0:
-            return []
+            return [], None
         wins = []
         attached = None
         for line in out.split("\n"):
@@ -108,9 +126,18 @@ class Tmux:
                 continue
             attached = f[2] not in ("", "0")
             wins.append(Window(f[0], f[1], f[6], f[3] == "1", f[4] == "1", f[5] == "1"))
+        return wins, attached
+
+    async def list_windows(self):
+        """Your session's windows, then the serve windows that aren't among
+        them (hidden)."""
+        wins, attached = await self._list(self.session)
         if attached is not None:
             self.attached = attached
-        return wins
+        have = {w.id for w in wins}
+        serve, _ = await self._list(self.serve_session)
+        return wins + [replace(w, hidden=True, active=False) for w in serve
+                       if w.id not in have and is_serve_window(w.name)]
 
     async def find(self, name):
         for w in await self.list_windows():
@@ -119,7 +146,23 @@ class Tmux:
         return None
 
     async def select(self, win_id):
-        rc, _out, err = await self.run("select-window", "-t", win_id)
+        rc, _out, err = await self.run("select-window", "-t", self.target(win_id))
+        return rc == 0, err.strip()
+
+    async def show(self, win_id):
+        """Put a hidden serve window among your tabs (it stays in the serve
+        session too) and switch to it."""
+        rc, _out, err = await self.run("link-window", "-d", "-s", "=%s:%s" % (self.serve_session, win_id),
+                                       "-t", self.target())
+        if rc != 0:
+            return False, err.strip()
+        return await self.select(win_id)
+
+    async def hide(self, win_id):
+        """Take a serve window out of your tabs; it keeps running in the
+        serve session. tmux refuses when that's the only session it's in
+        (so this never ends it)."""
+        rc, _out, err = await self.run("unlink-window", "-t", self.target(win_id))
         return rc == 0, err.strip()
 
     async def find_last(self, name):
@@ -144,7 +187,7 @@ class Tmux:
             if w is not None:
                 await self.run("kill-window", "-t", w.id)
         rc, _out, err = await self.run(
-            "new-window", "-t", self.session + ":", "-c", cwd or self.home, "-n", name,
+            "new-window", "-t", self.target(), "-c", cwd or self.home, "-n", name,
             "sh", "-c", hold_script(argv, lock=lock))
         return rc == 0, "opened", err.strip()
 

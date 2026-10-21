@@ -198,7 +198,7 @@ class Env:
 
     def boxen_calls(self, skip_ls=True):
         return [c for c in self._calls("boxen.jsonl")
-                if not (skip_ls and (c["args"] == ["ls", "--json"]
+                if not (skip_ls and (c["args"] in (["ls", "--json"], ["df", "--json"])
                                      or (c["args"][:1] == ["repos"] and c["args"][-1:] == ["--suggest"])))]
 
     def tmux_calls(self, cmd=None):

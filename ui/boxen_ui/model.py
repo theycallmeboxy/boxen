@@ -121,6 +121,67 @@ def parse_ls(text, src_root):
     return Listing(projects, doc.get("docker") is not False, v1)
 
 
+DF_VERSION = 1
+
+
+@dataclass
+class DiskUse:
+    """One project's disk use, from `boxen df --json`: bytes, or None where
+    it couldn't be measured (Docker's parts, when Docker isn't answering)."""
+    total: object
+    code: object
+    image: object
+    changes: object
+    volumes: object
+    claude: object
+
+
+@dataclass
+class DiskReport:
+    docker: bool
+    projects: dict       # name -> DiskUse
+
+
+def _bytes(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+def _sum_sizes(items):
+    """The sizes of a list of {"name", "size"}; None if one can't be read."""
+    if not isinstance(items, list):
+        return None
+    total = 0
+    for it in items:
+        n = _bytes(it.get("size")) if isinstance(it, dict) else None
+        if n is None:
+            return None
+        total += n
+    return total
+
+
+def parse_df(text):
+    """A DiskReport from `boxen df --json`. Raises ValueError when it isn't
+    that document."""
+    doc = json.loads(text)
+    if not isinstance(doc, dict) or not isinstance(doc.get("projects"), list):
+        raise ValueError("unexpected output from boxen df --json")
+    if doc.get("version") != DF_VERSION:
+        raise ValueError("boxen df --json is version %s; this dashboard reads %d: restart it (boxen ui --restart)"
+                         % (str(doc.get("version"))[:10], DF_VERSION))
+    docker = doc.get("docker") is not False
+    out = {}
+    for d in doc["projects"]:
+        if not isinstance(d, dict) or not isinstance(d.get("name"), str) or not d["name"]:
+            continue
+        img = d.get("image")
+        # None: not built yet (or, without Docker, not known)
+        image = _bytes(img.get("size")) if isinstance(img, dict) else None
+        changes, volumes = (_sum_sizes(d.get("containers")), _sum_sizes(d.get("volumes"))) if docker else (None, None)
+        out[d["name"]] = DiskUse(_bytes(d.get("total")), _bytes(d.get("code")), image, changes, volumes,
+                                 _bytes(d.get("claude")))
+    return DiskReport(docker, out)
+
+
 STATE_STYLE = {"running": GREEN, "restarting": RED, "exited": GREY, "dead": RED,
                "created": GREY, "paused": AMBER, "removing": GREY}
 HEALTH_STYLE = {"healthy": GREEN, "unhealthy": RED, "starting": GREY}

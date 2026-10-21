@@ -225,6 +225,8 @@ GLOBAL_ACTIONS = [
     ("tokens", "Refresh GitHub tokens", "mint fresh tokens for every project now"),
     ("github", "Connect GitHub", "set up your GitHub App and commit identity (in a terminal)"),
     ("doctor", "Check this VM", "boxen doctor: rootless Docker, the sandbox and isolation"),
+    ("disk", "Disk usage", "boxen df: each project's code, image, volumes and Claude history; shared images, "
+                           "build cache, leftovers, free space"),
     ("migrate", "Move from boxen v1", "boxen migrate: bring v1 projects (agent in a container) over (in a terminal)"),
 ]
 
@@ -264,18 +266,20 @@ HELP = [
     ("Tabs", [
         ("l", "Logs tab"),
         ("ctrl+r  F5", "refresh (the list, and the tab shown)"),
-        ("Enter", "Sessions: switch to the window"),
-        ("x", "Sessions: close the window (asks first)"),
+        ("Enter", "Sessions: switch to the window; a hidden ~serve one is shown among your tabs first"),
+        ("x", "Sessions: close the window (asks first); on a ~serve window: Hide, which takes it out of "
+              "your tabs and leaves the server running (S stops it)"),
         ("f", "Logs: follow a sidecar's log in a terminal window"),
         ("a", "Overview: add the selected found repo (asks)"),
         ("e", "Files: edit a copy in vim; saved back when you quit vim"),
     ]),
     ("Everything", [
-        ("g", "global menu: update all, self-update, tokens, GitHub, doctor, migrate"),
+        ("g", "global menu: update all, self-update, tokens, GitHub, doctor, disk usage, migrate"),
         ("J", "show / hide the jobs panel"),
         ("ctrl+p", "command palette: every action"),
         ("F1  C-b 0", "back to this dashboard (from any window)"),
         ("F2 F3", "previous / next window (or C-b p / C-b n)"),
+        ("C-b h", "in a ~serve window: hide it (it keeps running) and come back here"),
         ("q", "detach: everything keeps running; `boxen ui` comes back"),
         ("Q  ctrl+q", "quit the dashboard (asks); sessions and other windows keep running"),
         ("?", "this help"),

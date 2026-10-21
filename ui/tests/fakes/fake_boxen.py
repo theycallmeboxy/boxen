@@ -8,8 +8,10 @@ line in $FAKE_DIR/boxen.jsonl, then answers from $FAKE_DIR/boxen.json:
 The first rule whose "args" equals the call's arguments (or, with
 "prefix": true, starts them) wins; a rule with "once" is used up. Without
 a rule: `ls --json` prints $FAKE_DIR/ls.json (exit 1 with a message if
-$FAKE_DIR/ls.fail exists); `repos NAME --suggest` prints nothing; anything
-else prints one line and exits 0.
+$FAKE_DIR/ls.fail exists); `df --json` prints $FAKE_DIR/df.json (exit 1
+if $FAKE_DIR/df.fail exists; with neither, a report with no projects);
+`repos NAME --suggest` prints nothing; anything else prints one line and
+exits 0.
 """
 import json
 import os
@@ -51,6 +53,15 @@ if args == ["ls", "--json"]:
         sys.exit(1)
     with open(os.path.join(d, "ls.json")) as f:
         sys.stdout.write(f.read())
+    sys.exit(0)
+
+if args == ["df", "--json"]:
+    if os.path.exists(os.path.join(d, "df.fail")):
+        sys.stderr.write("boxen: something broke in df\n")
+        sys.exit(1)
+    p = os.path.join(d, "df.json")
+    sys.stdout.write(open(p).read() if os.path.exists(p) else
+                     json.dumps({"version": 1, "docker": True, "projects": []}))
     sys.exit(0)
 
 if args[:1] == ["repos"] and args[-1:] == ["--suggest"]:
