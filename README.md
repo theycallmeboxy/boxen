@@ -25,9 +25,8 @@ Owner must enable Remote Control).
 ## Install
 
 ```bash
-sudo apt install -y gh git
-gh auth login                                   # this repo is private
-gh repo clone theycallmeboxy/boxen ~/boxen
+sudo apt install -y git
+git clone https://github.com/theycallmeboxy/boxen ~/boxen
 ~/boxen/install.sh
 ```
 
@@ -226,9 +225,14 @@ about 3 minutes:
 
 It also sets the commit identity for repos under `~/src` to your GitHub name
 and no-reply address (`ID+username@users.noreply.github.com`), unless one is
-set already. Don't run `gh auth setup-git` on the VM: it puts gh's own
-credential helper after boxen's; `boxen doctor` catches it and re-running
-`install.sh` fixes it.
+set already.
+
+A `gh auth login` of your own on the VM is optional. `boxen github` uses it
+only to read your GitHub username (without one, it asks), and outside
+`~/src` `gh` is the plain GitHub CLI with your login, for your own use.
+In a project, `gh` and git never use it. If you do log in, don't run
+`gh auth setup-git`: it puts gh's own credential helper after boxen's;
+`boxen doctor` catches it and re-running `install.sh` fixes it.
 
 ### Which repos a project can push to
 
