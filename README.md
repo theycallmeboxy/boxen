@@ -41,8 +41,12 @@ Claude Code sandbox rules as managed settings,
 `/etc/claude-code/managed-settings.d/boxen.json` (see [Security](#security)).
 
 Then: run `claude` once and `/login`, `boxen github`, `boxen new <name>`,
-and `boxen doctor` to check the whole setup. Coming from boxen v1? See
-[Moving from v1](#moving-from-v1).
+and `boxen doctor` to check the whole setup.
+
+To update later: `boxen self-update` pulls this repo (the `main` branch) and
+applies it: the installer again, then a rebuild of the build containers if
+the base image changed (see [Build environments](#build-environments) for
+what happens to a busy one), and a restart of the dashboard.
 
 ## Layout
 
@@ -103,7 +107,7 @@ dashboard) does.
 | `nonroot <name> [on\|off]` | Let the project's agent run commands as a non-root user (`boxen run --user`) |
 | `github` | Connect GitHub |
 | `doctor [--lan <host:port>]` | Check rootless Docker, the sandbox and isolation |
-| `migrate [--cleanup]` | Move from boxen v1 |
+| `migrate [--cleanup]` | Move an old boxen v1 install over (see [History](#history)) |
 | `update` | Rebuild the base image and every build container (one with something running in it switches over by itself once it's idle) |
 | `self-update` | Update boxen and apply it |
 
@@ -214,11 +218,7 @@ about 3 minutes:
 1. It prints a link that pre-fills a new GitHub App (private, no webhook,
    permissions: Contents, Pull requests, Issues, Workflows write; Actions,
    Checks, Statuses read). Click **Create GitHub App**, copy the **Client
-   ID**, and click **Generate a private key** (a `.pem` downloads). An app
-   made by v1 has no Workflows permission, so pushes that touch
-   `.github/workflows/` fail: add it in the app's settings on GitHub
-   (Permissions, Workflows: Read and write) and accept it on the
-   installation.
+   ID**, and click **Generate a private key** (a `.pem` downloads).
 2. Paste the Client ID, then the `.pem` file's contents (not echoed; a `*`
    per line). If the file is on the VM: `boxen github --key /path/to/file.pem`.
 3. It prints the app's install link. Choose **All repositories** so repos you
@@ -263,50 +263,15 @@ full, in parts. Transcripts aren't changed, and boxen keeps them for 365
 days (Claude Code's default is 30; a `cleanupPeriodDays` you've set is left
 alone). For an exact replay instead, `claude --resume` in the project folder.
 
-## Moving from v1
+## Bringing work from a Mac
 
-boxen v1 ran each project's Claude inside its container. To move:
-
-```bash
-cd ~/boxen && git pull && ./install.sh   # installs v2 beside v1 (the system Docker daemon stays on)
-boxen migrate                            # stops v1 (asks first), brings everything across
-boxen doctor
-boxen migrate --cleanup                  # later, once you're happy: deletes v1's leftovers
-```
-
-Between `install.sh` and `migrate`, v1's containers keep running, but their
-own `boxen` command (and the supervisor) stops working: the install removes
-v1's agent service.
-
-`migrate`, in order:
-
-- stops v1's containers (it lists them and asks first; `--yes` doesn't);
-- copies v1's shared Claude config into `~/.claude`: login, settings except
-  permissions (those were for a container; the whole file is kept as
-  `settings.json.v1`), every session and memory. v1 used the same paths, so
-  `claude --resume` in a project finds its sessions;
-- takes the commit identity from `boxen.env` and turns
-  `base.local.Dockerfile` into `env.local.Dockerfile`;
-- per project: copies its sidecar volumes to rootless Docker first (if one
-  fails, the project is left as it was, for another `migrate`); turns its
-  `env/` folder into `~/src/<project>/.boxen/` (every file, with the
-  Dockerfile's `FROM` now naming `boxen-env` and its `USER` lines gone,
-  shown as a diff); keeps its repo list and tokens; builds its container.
-
-Not carried over: tool installs in v1's per-project home volumes (put what a
-project needs in its Dockerfile), `project.env` (named in the output; the
-agent runs on the VM now) and v1's `compose.override.yaml` (v2's service is
-`env`). Those stay in `~/.config/boxen/projects/<project>/v1/`. The
-supervisor project is gone.
-
-`--cleanup` refuses while a v1 sidecar volume has no copy in rootless Docker.
-Otherwise it deletes v1's containers (sidecars included), their images,
-volumes and build cache, and v1's files in `~/.config/boxen`; turns the
-system Docker daemon and containerd off; and takes you out of the `docker`
-group. It lists what it keeps for you: `~/.claude/settings.json.v1` and, if
-there, `~/.claude.json.before-migrate`, `CLAUDE.md.v1` and `~/src/supervisor`.
-
-To bring Claude Code work over from a Mac, see `tools/mac-to-boxen --help`.
+`tools/mac-to-boxen` (one standalone script, run on both ends) packs the
+folders you used Claude Code in on a Mac, with their auto memory, session
+transcripts and your personal Claude config, from a plan you can edit. It
+pushes that over SSH into its import on the VM (so the VM never connects to
+the Mac), which checks the archive, files sessions and memory under the new
+`~/src/<name>` paths, and never overwrites anything. Nothing on the Mac
+changes. `tools/mac-to-boxen --help` has the steps.
 
 ## Security
 
@@ -329,14 +294,14 @@ What boxen promises, and what it doesn't:
 - **The VM:** nothing an agent builds or installs lands on the VM: build
   containers run under rootless Docker, where root is your own user, so even
   a container escape isn't root. boxen never uses the system Docker daemon,
-  and `migrate --cleanup` takes you out of the `docker` group (which is root
-  in all but name).
+  and `boxen doctor` warns if it's running or you're in the `docker` group
+  (which is root in all but name).
 - **Team and Enterprise plans:** settings your organization manages from
   claude.ai can take the place of boxen's managed file on the VM. Check with
   `/status` in a session ("Setting sources").
 - **Settings boxen keeps:** managed settings in
   `/etc/claude-code/managed-settings.d/boxen.json`, which outrank every
-  settings file (yours, a project's, a migrated v1 config): sandbox on and
+  settings file (yours, a project's): sandbox on and
   required (`failIfUnavailable`), no unsandboxed retries, `boxen run *` and
   `boxen env *` excluded and allowed, network to GitHub only, nothing of
   `$XDG_RUNTIME_DIR` (rootless Docker, systemd, D-Bus), the tmux sockets or
@@ -379,6 +344,10 @@ needs a real session.
 - **Clone, push or `gh` fails with an auth error:** `boxen repos <name>`
   shows whether the repo is listed and its state. `~/.config/boxen/tokens.log`
   has the timer's failures. The VM's clock must be right.
+- **Pushes that touch `.github/workflows/` fail:** the GitHub App has no
+  Workflows permission (apps made by boxen v1 don't). Add it in the app's
+  settings on GitHub (Permissions, Workflows: Read and write) and accept it
+  on the installation.
 - **Limits (`mem_limit`, `cpus`) are ignored:** cgroup delegation applies
   after a reboot; `boxen doctor` shows the driver.
 - **Files in a project you can't edit or delete (owned by a number like
@@ -412,3 +381,34 @@ your projects' builds use.
 
 Don't set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: it disables Remote
 Control.
+
+## Working on boxen
+
+`main` is the only branch, and it's what the VM runs (`boxen self-update`
+pulls it). The tests fake Docker, tmux, systemd and GitHub, so they run on
+any Linux with bash, jq, git and Python 3:
+
+```bash
+(cd tests && python3 -m pytest -q)                # the CLI, about 2 minutes
+python3 -m venv /tmp/ui-test && /tmp/ui-test/bin/pip install -r ui/requirements.txt pytest
+/tmp/ui-test/bin/python -m pytest -q ui/tests     # the dashboard, about 3 minutes
+```
+
+## History
+
+boxen v1 ran each project's Claude inside its own container (with a
+supervisor project); it's kept as the `v1` tag. v2, now `main`, runs the
+agents on the VM and only the builds in containers. An install still on v1
+moves over with:
+
+```bash
+cd ~/boxen && git fetch origin && git switch main && git pull --ff-only && ./install.sh
+boxen migrate            # stops v1 (asks first), brings sessions, memory, projects and sidecar data across
+boxen doctor
+boxen migrate --cleanup  # later: deletes v1's containers, images and files, turns the system Docker daemon off
+```
+
+`migrate` keeps what it doesn't carry over (v1's settings, home-volume tool
+installs, per-project overrides) under `~/.config/boxen/projects/<project>/v1/`
+and `~/.claude/settings.json.v1`, and says so; the comments at the top of
+`lib/migrate.sh` have the details.
